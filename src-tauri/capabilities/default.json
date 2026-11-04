@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the search pane",
+  "windows": ["pane"],
+  "permissions": ["core:default"]
+}
