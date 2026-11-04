@@ -236,7 +236,10 @@ fn load_library(app: &AppHandle) {
     if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
         eprintln!("[memeity] couldn't allow asset scope: {e}");
     }
-    *state.library.write().unwrap() = Library::scan(&dir);
+    let cache = state.library.read().unwrap().dims_cache();
+    let mut lib = Library::scan(&dir);
+    lib.fill_dims(&cache);
+    *state.library.write().unwrap() = lib;
     // Replacing the watcher drops (and stops) the old one.
     *state.watcher.lock().unwrap() = watcher::watch(app.clone(), dir);
     let _ = app.emit("library-changed", ());
@@ -247,7 +250,9 @@ pub fn refresh_library(app: &AppHandle) {
     let state = app.state::<AppState>();
     let root = state.library.read().unwrap().root.clone();
     if let Some(root) = root {
-        let fresh = Library::scan(&root);
+        let cache = state.library.read().unwrap().dims_cache();
+        let mut fresh = Library::scan(&root);
+        fresh.fill_dims(&cache);
         let mut lib = state.library.write().unwrap();
         if lib.root.as_ref() == Some(&root) {
             *lib = fresh;
@@ -301,7 +306,7 @@ async fn copy_meme(app: AppHandle, path: String) -> Result<(), String> {
     if !known {
         return Err("That file isn't in your meme folder.".into());
     }
-    clipboard::copy_image(&path)?;
+    clipboard::copy(&path)?;
     hide_pane(&app);
     Ok(())
 }

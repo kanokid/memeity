@@ -8,12 +8,13 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
 
-/// Still images only for now. GIFs are indexed, but copying one gives a static
-/// first frame (GIF/video support is an open decision in the handoff).
+/// Image formats only (no video yet). Animated GIF/WebP copy as files so they keep
+/// their animation; see `clipboard.rs`.
 const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 pub struct Meme {
@@ -23,7 +24,13 @@ pub struct Meme {
     /// What the fuzzy matcher scores against: `rel` without the extension.
     haystack: String,
     pub modified: SystemTime,
+    /// Pixel size, read from the file header. Lets the pane lay out its masonry grid
+    /// before images load. `None` until `fill_dims` runs (or if the header is unreadable).
+    dims: Option<(u32, u32)>,
 }
+
+/// Previously-read dimensions, keyed by path, valid while the mtime is unchanged.
+pub type DimsCache = HashMap<PathBuf, (SystemTime, (u32, u32))>;
 
 #[derive(Default)]
 pub struct Library {
@@ -37,6 +44,8 @@ pub struct Hit {
     pub path: String,
     pub name: String,
     pub rel: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -58,6 +67,8 @@ impl From<&Meme> for Hit {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             rel: m.rel.clone(),
+            width: m.dims.map(|d| d.0),
+            height: m.dims.map(|d| d.1),
         }
     }
 }
@@ -100,11 +111,33 @@ impl Library {
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(UNIX_EPOCH);
-                Meme { path, rel, haystack, modified }
+                Meme { path, rel, haystack, modified, dims: None }
             })
             .collect();
         memes.sort_by(|a, b| b.modified.cmp(&a.modified));
         Library { root: Some(root.to_path_buf()), memes }
+    }
+
+    /// Snapshot of known dimensions, to carry over into a fresh scan.
+    pub fn dims_cache(&self) -> DimsCache {
+        self.memes
+            .iter()
+            .filter_map(|m| Some((m.path.clone(), (m.modified, m.dims?))))
+            .collect()
+    }
+
+    /// Fills in image dimensions, reusing `cache` for unchanged files and reading
+    /// just the header (not the whole image) for new or changed ones.
+    pub fn fill_dims(&mut self, cache: &DimsCache) {
+        for m in &mut self.memes {
+            m.dims = match cache.get(&m.path) {
+                Some((modified, dims)) if *modified == m.modified => Some(*dims),
+                _ => image::ImageReader::open(&m.path)
+                    .ok()
+                    .and_then(|r| r.with_guessed_format().ok())
+                    .and_then(|r| r.into_dimensions().ok()),
+            };
+        }
     }
 
     pub fn search(&self, query: &str, limit: usize, matcher: &mut Matcher) -> SearchResult {

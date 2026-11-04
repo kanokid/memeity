@@ -124,19 +124,32 @@
 <svelte:window onkeydown={onKeydown} />
 
 <div class="setup">
-  <ol class="rail" aria-label="Setup steps">
-    {#each steps as s, i}
-      <li>
-        <button class:active={i === index} class:done={i < index} onclick={() => go(i)}>
-          <span class="dot">{i < index ? "✓" : i + 1}</span>
-          <span class="label">{s.title}</span>
-        </button>
-      </li>
-    {/each}
-  </ol>
+  <nav class="rail" aria-label="Setup steps">
+    <p class="brand">memeity</p>
+    <p class="sub">Connect Google Drive</p>
+    <ol>
+      {#each steps as s, i}
+        <li>
+          <button class:active={i === index} class:done={i < index} onclick={() => go(i)}>
+            <span class="num">
+              {#if i < index}
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+              {:else}
+                {i + 1}
+              {/if}
+            </span>
+            <span class="label">{s.title}</span>
+          </button>
+        </li>
+      {/each}
+    </ol>
+  </nav>
 
   <section class="step">
-    <p class="count">Step {index + 1} of {steps.length} · Connect memeity to Google Drive</p>
+    <div class="progress" aria-hidden="true">
+      <div class="bar" style:width="{((index + 1) / steps.length) * 100}%"></div>
+    </div>
+    <p class="count">Step {index + 1} of {steps.length}</p>
     <h2>{step.title}</h2>
     <p class="why">{@html step.why}</p>
 
@@ -148,13 +161,17 @@
 
     <div class="actions">
       {#if last}
-        <button class="primary" onclick={onLoad} disabled={busy}>Choose client JSON <kbd>↵</kbd></button>
+        <button class="btn primary" onclick={onLoad} disabled={busy}>Choose client JSON <kbd>↵</kbd></button>
       {:else if step.link}
-        <button class="primary" onclick={openLink}>{step.link.label} ↗ <kbd>↵</kbd></button>
+        <button class="btn primary" onclick={openLink}>
+          {step.link.label}
+          <svg class="ext" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10" /></svg>
+          <kbd>↵</kbd>
+        </button>
       {/if}
       <span class="spacer"></span>
-      <button onclick={() => go(index - 1)} disabled={index === 0}>Back <kbd>←</kbd></button>
-      {#if !last}<button onclick={() => go(index + 1)}>Next <kbd>→</kbd></button>{/if}
+      <button class="btn ghost" onclick={() => go(index - 1)} disabled={index === 0}>Back <kbd>←</kbd></button>
+      {#if !last}<button class="btn outline" onclick={() => go(index + 1)}>Next <kbd>→</kbd></button>{/if}
     </div>
     {#if step.link}
       <p class="url">{step.link.url}</p>
@@ -170,14 +187,34 @@
     min-height: 0;
   }
 
+  /* ---------- step rail ---------- */
+
   .rail {
+    width: 220px;
+    flex-shrink: 0;
+    padding: 18px 10px;
+    border-right: 1px solid var(--border);
+    background: var(--bar);
+    overflow-y: auto;
+  }
+
+  .brand {
+    margin: 0 8px;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .sub {
+    margin: 0 8px 14px;
+    font-size: 12px;
+    color: var(--muted-fg);
+  }
+
+  .rail ol {
     list-style: none;
     margin: 0;
-    padding: 14px 8px;
-    width: 210px;
-    flex-shrink: 0;
-    border-right: 1px solid var(--border);
-    overflow-y: auto;
+    padding: 0;
   }
 
   .rail button {
@@ -187,92 +224,144 @@
     width: 100%;
     padding: 7px 8px;
     border: none;
-    border-radius: 8px;
+    border-radius: 6px;
     background: none;
-    color: var(--muted);
-    font-size: 12px;
+    color: var(--muted-fg);
+    font-size: 12.5px;
     text-align: left;
     cursor: pointer;
   }
 
-  .rail button.active {
-    background: var(--accent-soft);
-    color: var(--text);
+  .rail button:hover {
+    color: var(--fg);
   }
 
-  .dot {
+  .rail button.active {
+    background: var(--accent);
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  .num {
     display: grid;
     place-items: center;
     width: 20px;
     height: 20px;
     flex-shrink: 0;
+    border: 1px solid var(--border-strong);
     border-radius: 50%;
-    border: 1px solid var(--border);
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
+    font: 500 10.5px/1 "Geist Mono Variable", ui-monospace, monospace;
   }
 
-  .active .dot {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
+  .active .num {
+    border-color: var(--primary);
+    background: var(--primary);
+    color: var(--primary-fg);
   }
 
-  .done .dot {
-    color: var(--text);
+  .done .num {
+    border-color: var(--border-strong);
+    color: var(--fg);
+  }
+
+  .num svg {
+    width: 12px;
+    height: 12px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .label {
     line-height: 1.3;
   }
 
+  /* ---------- step body ---------- */
+
   .step {
     flex: 1;
     min-width: 0;
-    padding: 18px 22px;
+    padding: 0 28px 20px;
     overflow-y: auto;
-    color: var(--muted);
+    color: var(--muted-fg);
+  }
+
+  .progress {
+    height: 2px;
+    margin: 0 -28px 22px;
+    background: var(--border);
+  }
+
+  .bar {
+    height: 100%;
+    background: var(--primary);
+    transition: width 200ms ease;
   }
 
   .count {
-    margin: 0 0 4px;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    margin: 0 0 6px;
+    font: 500 11px/1 "Geist Mono Variable", ui-monospace, monospace;
+    letter-spacing: 0.02em;
   }
 
   h2 {
     margin: 0 0 6px;
-    font-size: 18px;
+    font-size: 20px;
     font-weight: 600;
-    color: var(--text);
+    letter-spacing: -0.025em;
+    color: var(--fg);
   }
 
   .why {
-    margin: 0 0 14px;
+    margin: 0 0 16px;
+    font-size: 13px;
   }
 
   .todo {
-    margin: 0 0 14px;
-    padding-left: 20px;
-    color: var(--text);
+    margin: 0 0 16px;
+    padding: 0;
+    list-style: none;
+    counter-reset: todo;
+    color: var(--fg);
+    font-size: 13px;
   }
 
   .todo li {
-    margin-bottom: 7px;
+    position: relative;
+    margin-bottom: 8px;
+    padding-left: 26px;
+    counter-increment: todo;
+  }
+
+  .todo li::before {
+    content: counter(todo);
+    position: absolute;
+    left: 0;
+    top: 1px;
+    display: grid;
+    place-items: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    background: var(--muted);
+    color: var(--muted-fg);
+    font: 500 10.5px/1 "Geist Mono Variable", ui-monospace, monospace;
   }
 
   .tip {
-    margin: 0 0 16px;
-    padding: 8px 10px;
+    margin: 0 0 18px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: var(--tile);
+    background: var(--muted);
     font-size: 12px;
   }
 
   .step :global(b) {
-    color: var(--text);
-    font-weight: 600;
+    color: var(--fg);
+    font-weight: 500;
   }
 
   .actions {
@@ -285,34 +374,70 @@
     flex: 1;
   }
 
-  .actions button {
+  .btn {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 7px 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--bg-raised);
-    color: var(--text);
-    cursor: pointer;
+    height: 34px;
+    padding: 0 14px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
     white-space: nowrap;
+    cursor: pointer;
   }
 
-  .actions button.primary {
+  .btn.primary {
+    background: var(--primary);
+    color: var(--primary-fg);
+  }
+
+  .btn.primary:hover:not(:disabled) {
+    opacity: 0.9;
+  }
+
+  .btn.primary kbd {
+    border-color: transparent;
+    background: color-mix(in srgb, currentColor 15%, transparent);
+    color: inherit;
+  }
+
+  .btn.outline {
+    border-color: var(--border);
+    background: var(--bg);
+    color: var(--fg);
+  }
+
+  .btn.outline:hover,
+  .btn.ghost:hover:not(:disabled) {
     background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
+    color: var(--fg);
   }
 
-  .actions button:disabled {
-    opacity: 0.45;
+  .btn.ghost {
+    background: none;
+    color: var(--muted-fg);
+  }
+
+  .btn:disabled {
+    opacity: 0.4;
     cursor: default;
   }
 
+  .ext {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
   .url {
-    margin: 8px 0 0;
-    font-size: 11px;
-    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    margin: 10px 0 0;
+    font: 11px/1.4 "Geist Mono Variable", ui-monospace, monospace;
     word-break: break-all;
     user-select: text;
     -webkit-user-select: text;
@@ -320,23 +445,7 @@
 
   .err {
     margin: 8px 0 0;
-    color: var(--danger);
+    color: var(--destructive);
     font-size: 12px;
-  }
-
-  kbd {
-    font: inherit;
-    font-size: 11px;
-    padding: 0 5px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--tile);
-    color: var(--text);
-  }
-
-  .primary kbd {
-    background: rgba(255, 255, 255, 0.2);
-    border-color: transparent;
-    color: #fff;
   }
 </style>

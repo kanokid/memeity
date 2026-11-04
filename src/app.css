@@ -1,27 +1,40 @@
+/* shadcn/ui "zinc" palette. Dark is the default look; light follows the OS. */
 :root {
-  --bg: #1c1c1f;
-  --bg-raised: #26262a;
-  --tile: #2d2d32;
-  --border: #36363c;
-  --text: #ececf0;
-  --muted: #8e8e96;
-  --accent: #ff6b4a;
-  --accent-soft: rgba(255, 107, 74, 0.18);
-  --danger: #ff5c5c;
+  --bg: #09090b;
+  --fg: #fafafa;
+  --muted: #18181b;
+  --muted-fg: #a1a1aa;
+  --accent: #27272a;
+  --border: #27272a;
+  --border-strong: #3f3f46;
+  --ring: #e4e4e7;
+  --primary: #fafafa;
+  --primary-fg: #18181b;
+  --destructive: #ef4444;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --popover: #09090b;
+  --bar: #0c0c0e;
   color-scheme: dark;
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f7f7f8;
-    --bg-raised: #ffffff;
-    --tile: #ececef;
-    --border: #dcdce0;
-    --text: #18181b;
-    --muted: #6b6b73;
-    --accent: #e8502e;
-    --accent-soft: rgba(232, 80, 46, 0.14);
-    --danger: #d12f2f;
+    --bg: #ffffff;
+    --fg: #09090b;
+    --muted: #f4f4f5;
+    --muted-fg: #71717a;
+    --accent: #f4f4f5;
+    --border: #e4e4e7;
+    --border-strong: #d4d4d8;
+    --ring: #18181b;
+    --primary: #18181b;
+    --primary-fg: #fafafa;
+    --destructive: #dc2626;
+    --success: #16a34a;
+    --warning: #d97706;
+    --popover: #ffffff;
+    --bar: #fafafa;
     color-scheme: light;
   }
 }
@@ -40,8 +53,10 @@ body,
 
 body {
   background: var(--bg);
-  color: var(--text);
-  font: 14px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--fg);
+  font: 14px/1.45 "Geist Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
   user-select: none;
   -webkit-user-select: none;
   cursor: default;
@@ -49,4 +64,42 @@ body {
 
 button {
   font: inherit;
+  color: inherit;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* Key caps, Raycast/shadcn style. */
+kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--muted);
+  color: var(--muted-fg);
+  font: 500 10.5px/1 "Geist Mono Variable", ui-monospace, "Cascadia Mono", monospace;
+}
+
+kbd + kbd {
+  margin-left: -2px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--border-strong) padding-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
 }

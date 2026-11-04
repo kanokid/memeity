@@ -44,8 +44,10 @@ pub fn watch(app: AppHandle, root: PathBuf) -> Option<RecommendedWatcher> {
                 }
             }
 
-            let fresh = Library::scan(&root);
             let state = app.state::<AppState>();
+            let cache = state.library.read().unwrap().dims_cache();
+            let mut fresh = Library::scan(&root);
+            fresh.fill_dims(&cache);
             {
                 let mut lib = state.library.write().unwrap();
                 // The user may have switched folders while we were scanning.
