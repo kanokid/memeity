@@ -4,8 +4,12 @@
 mod clipboard;
 mod config;
 mod google;
+mod index;
 mod library;
+mod ocr;
+mod sidecar;
 mod sync;
+mod textindex;
 mod watcher;
 
 use config::{Config, DriveFolder};
@@ -43,6 +47,12 @@ pub struct AppState {
     /// Serializes sync passes and deletes.
     pub sync_lock: tokio::sync::Mutex<()>,
     pub sync_status: Mutex<SyncStatus>,
+    /// Per-device SQLite/FTS5 index of text in images. None if it couldn't be opened
+    /// (search then falls back to filenames only).
+    pub index: Mutex<Option<index::Index>>,
+    /// Wakes the background OCR/indexing worker.
+    pub text_tx: std::sync::mpsc::Sender<()>,
+    pub ocr_status: Mutex<textindex::OcrStatus>,
     config: Mutex<Config>,
     matcher: Mutex<Matcher>,
     watcher: Mutex<Option<RecommendedWatcher>>,
@@ -100,6 +110,7 @@ struct Status {
     shortcut: &'static str,
     shortcut_error: Option<String>,
     sync: SyncStatus,
+    ocr: textindex::OcrStatus,
     client_file: Option<String>,
 }
 
@@ -157,6 +168,7 @@ fn status(app: &AppHandle) -> Status {
         shortcut: SHORTCUT_LABEL,
         shortcut_error: state.shortcut_error.lock().unwrap().clone(),
         sync: state.sync_status.lock().unwrap().clone(),
+        ocr: state.ocr_status.lock().unwrap().clone(),
         client_file: app.path().app_config_dir().ok().map(|d| d.join(CLIENT_FILE).to_string_lossy().into_owned()),
     }
 }
@@ -243,6 +255,16 @@ fn load_library(app: &AppHandle) {
     // Replacing the watcher drops (and stops) the old one.
     *state.watcher.lock().unwrap() = watcher::watch(app.clone(), dir);
     let _ = app.emit("library-changed", ());
+    textindex::trigger(app);
+}
+
+/// Opens (or creates) the per-device search index in the app-data dir.
+fn open_index(app: &AppHandle) -> Option<index::Index> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    index::Index::open(&dir.join("index.sqlite"))
+        .inspect_err(|e| eprintln!("[memeity] couldn't open search index: {e}"))
+        .ok()
 }
 
 /// Rescan the current library (after a sync or delete).
@@ -259,6 +281,7 @@ pub fn refresh_library(app: &AppHandle) {
         }
     }
     let _ = app.emit("library-changed", ());
+    textindex::trigger(app);
 }
 
 // ---------- actions shared by commands and the tray ----------
@@ -294,9 +317,22 @@ fn get_status(app: AppHandle) -> Status {
 
 #[tauri::command]
 fn search(state: State<'_, AppState>, query: String, limit: usize) -> SearchResult {
+    /// How many image-text matches to consider for ranking.
+    const TEXT_HITS: usize = 500;
+    let text_hits = if query.trim().is_empty() {
+        Vec::new()
+    } else {
+        state
+            .index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|idx| idx.search(&query, TEXT_HITS).ok())
+            .unwrap_or_default()
+    };
     let lib = state.library.read().unwrap();
     let mut matcher = state.matcher.lock().unwrap();
-    lib.search(&query, limit, &mut matcher)
+    lib.search(&query, limit, &mut matcher, &text_hits)
 }
 
 #[tauri::command]
@@ -309,6 +345,38 @@ async fn copy_meme(app: AppHandle, path: String) -> Result<(), String> {
     clipboard::copy(&path)?;
     hide_pane(&app);
     Ok(())
+}
+
+#[derive(Serialize)]
+struct MemeText {
+    /// "read" (text below, possibly empty), "pending" (not read yet), "failed" (couldn't read the image)
+    state: &'static str,
+    text: Option<String>,
+    lang: Option<String>,
+    /// When it was read (RFC 3339).
+    at: Option<String>,
+}
+
+/// What OCR found in a meme, from its sidecar.
+#[tauri::command]
+fn meme_text(app: AppHandle, path: String) -> Result<MemeText, String> {
+    let (_, root) = sync_target(&app).ok_or("No Drive folder selected.")?;
+    let path = PathBuf::from(path);
+    let rel = path
+        .strip_prefix(&root)
+        .map_err(|_| "That file isn't in your meme folder.".to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let state = app.state::<AppState>();
+    let entry = state.index.lock().unwrap().as_ref().and_then(|idx| idx.lookup(&rel).ok().flatten());
+    let pending = MemeText { state: "pending", text: None, lang: None, at: None };
+    let Some(entry) = entry else { return Ok(pending) };
+    match sidecar::read(&root, &entry.md5).and_then(|sc| sc.ocr) {
+        Some(ocr) => Ok(MemeText { state: "read", text: Some(ocr.text), lang: ocr.lang, at: ocr.at }),
+        // Indexed without a sidecar means the image couldn't be decoded/read.
+        None if entry.indexed => Ok(MemeText { state: "failed", ..pending }),
+        None => Ok(pending),
+    }
 }
 
 /// Trash a meme on Drive and remove it from this device.
@@ -476,6 +544,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (text_tx, text_rx) = std::sync::mpsc::channel();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -493,6 +562,7 @@ pub fn run() {
             get_status,
             search,
             copy_meme,
+            meme_text,
             delete_meme,
             load_client_file,
             sign_in,
@@ -519,6 +589,9 @@ pub fn run() {
                 sync_tx,
                 sync_lock: tokio::sync::Mutex::new(()),
                 sync_status: Mutex::new(SyncStatus { state: "off", ..Default::default() }),
+                index: Mutex::new(open_index(app.handle())),
+                text_tx,
+                ocr_status: Mutex::new(textindex::OcrStatus { state: "idle", ..Default::default() }),
                 config: Mutex::new(Config::load(&config_dir)),
                 matcher: Mutex::new(Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths())),
                 watcher: Mutex::new(None),
@@ -565,6 +638,7 @@ pub fn run() {
             std::thread::spawn(move || load_library(&h));
 
             sync::spawn_loop(handle.clone(), sync_rx);
+            textindex::spawn(handle.clone(), text_rx);
             sync::trigger(&handle);
 
             // Draft build: pop the pane on launch so there's something to look at.

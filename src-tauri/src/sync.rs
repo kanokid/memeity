@@ -9,11 +9,16 @@
 //!   re-downloads on the next sync. Real deletes go through memeity's pane
 //!   (which trashes on Drive) or Drive's own UI.
 //!
+//! - Sidecars (`.meta/<md5>.json`, see `sidecar.rs`) sync like memes, so text read on
+//!   one device is reused everywhere. On a sidecar conflict Drive's copy wins (they're
+//!   regenerable metadata, not user files worth keeping twice).
+//!
 //! Per-device bookkeeping (`sync-state.json`) lives in the app-data dir, never in
 //! the synced folder.
 
 use crate::google::{DriveItem, Google, FOLDER_MIME};
 use crate::library::{is_meme_name, Library};
+use crate::sidecar::{self, META_DIR};
 use crate::{refresh_library, sync_target, AppState};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -223,6 +228,9 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
             // Same bytes already here (e.g. first sync, or state was lost). Just adopt it.
             st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
             false
+        } else if sidecar::is_sidecar_rel(rel) {
+            // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy.
+            true
         } else {
             // A different local file with the same name: keep it under a new name
             // (it'll upload in step 3) and download Drive's version.
@@ -243,10 +251,10 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
         }
     }
 
-    // 3. Upload local files Drive doesn't know about.
+    // 3. Upload local files (memes and sidecars) Drive doesn't know about.
     let mut folders = remote.folders;
     let now = SystemTime::now();
-    for meme in Library::scan(root).memes {
+    for meme in local_files(root) {
         if st.files.contains_key(&meme.rel) {
             continue;
         }
@@ -403,17 +411,26 @@ async fn remote_tree(g: &Google, root_id: &str) -> Result<RemoteTree, String> {
         items.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic duplicate naming
         for item in items {
             let name = sanitize(&item.name);
-            if name.is_empty() || name.starts_with('.') {
+            let is_folder = item.mime_type == FOLDER_MIME;
+            let in_meta = dir == META_DIR;
+            // Dot-names are skipped, except the top-level `.meta` sidecar folder.
+            let meta_root = dir.is_empty() && name == META_DIR && is_folder;
+            if name.is_empty() || (name.starts_with('.') && !meta_root) || (in_meta && is_folder) {
                 continue;
             }
             let rel = join(&dir, &name);
-            if item.mime_type == FOLDER_MIME {
+            let wanted = if in_meta { name.ends_with(".json") } else { is_meme_name(&name) };
+            if is_folder {
                 if taken.insert(rel.to_lowercase()) {
                     tree.folders.insert(rel.clone(), item.id.clone());
                     queue.push((rel, item.id));
                 }
-            } else if is_meme_name(&name) && !item.mime_type.starts_with("application/vnd.google-apps.") {
-                let rel = if taken.contains(&rel.to_lowercase()) { dedupe(&rel, &item.id) } else { rel };
+            } else if wanted && !item.mime_type.starts_with("application/vnd.google-apps.") {
+                let duplicate = taken.contains(&rel.to_lowercase());
+                if duplicate && in_meta {
+                    continue; // two devices uploaded the same sidecar at once; one is enough
+                }
+                let rel = if duplicate { dedupe(&rel, &item.id) } else { rel };
                 taken.insert(rel.to_lowercase());
                 tree.files.insert(rel, item);
             }
@@ -493,7 +510,33 @@ fn conflict_path(path: &Path) -> PathBuf {
         .expect("some name is free")
 }
 
-fn file_md5(path: &Path) -> std::io::Result<String> {
+/// A local file that sync may upload: a meme, or a sidecar in `.meta/`.
+struct LocalFile {
+    rel: String,
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+fn local_files(root: &Path) -> Vec<LocalFile> {
+    let mut files: Vec<LocalFile> = Library::scan(root)
+        .memes
+        .into_iter()
+        .map(|m| LocalFile { rel: m.rel, path: m.path, modified: m.modified })
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(root.join(META_DIR)) {
+        for entry in entries.flatten() {
+            let rel = format!("{META_DIR}/{}", entry.file_name().to_string_lossy());
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_file() && sidecar::is_sidecar_rel(&rel) {
+                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+                files.push(LocalFile { rel, path: entry.path(), modified });
+            }
+        }
+    }
+    files
+}
+
+pub(crate) fn file_md5(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(format!("{:x}", Md5::digest(&bytes)))
 }
@@ -505,6 +548,7 @@ fn mime_for(name: &str) -> &'static str {
         ".gif" => "image/gif",
         ".webp" => "image/webp",
         ".bmp" => "image/bmp",
+        ".json" => "application/json",
         _ => "application/octet-stream",
     }
 }

@@ -57,8 +57,9 @@ pub fn watch(app: AppHandle, root: PathBuf) -> Option<RecommendedWatcher> {
                 *lib = fresh;
             }
             let _ = app.emit("library-changed", ());
-            // New local files should head up to Drive.
+            // New local files should head up to Drive, and get their text read.
             sync::trigger(&app);
+            crate::textindex::trigger(&app);
         }
     });
 

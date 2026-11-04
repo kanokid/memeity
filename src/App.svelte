@@ -22,7 +22,14 @@
     shortcut: string;
     shortcut_error: string | null;
     sync: SyncStatus;
+    ocr: OcrStatus;
     client_file: string | null;
+  };
+  type OcrStatus = {
+    state: "idle" | "reading" | "unavailable";
+    done: number;
+    total: number;
+    message: string | null;
   };
 
   /** GIF-picker style: a few big columns of images, no captions. */
@@ -49,6 +56,50 @@
   /** Actions menu (right-click on a tile, or Ctrl+K), positioned in window coordinates. */
   let menu = $state<{ x: number; y: number; index: number } | null>(null);
   let menuSel = $state(0);
+
+  /** Details view (Ctrl+I): big preview + the text OCR read from the selected meme. */
+  type MemeText = { state: "read" | "pending" | "failed"; text: string | null; lang: string | null; at: string | null };
+  let showDetails = $state(false);
+  let details = $state<MemeText | null>(null);
+  let copiedText = $state(false);
+  let detailsSeq = 0;
+
+  // Follow the selection while the details view is open, and re-check while OCR is
+  // still working through the queue (so "Not read yet" updates by itself).
+  $effect(() => {
+    const path = current?.path;
+    const ocrProgress = status?.ocr.done;
+    if (!showDetails || !path) return;
+    void ocrProgress;
+    const seq = ++detailsSeq;
+    invoke<MemeText>("meme_text", { path })
+      .then((t) => {
+        if (seq === detailsSeq) details = t;
+      })
+      .catch((e) => {
+        if (seq === detailsSeq) error = String(e);
+      });
+  });
+
+  function toggleDetails(open = !showDetails) {
+    if (open && !current) return;
+    showDetails = open;
+    details = null;
+    copiedText = false;
+  }
+
+  async function copyText() {
+    if (!details?.text) return;
+    await navigator.clipboard.writeText(details.text);
+    copiedText = true;
+    setTimeout(() => (copiedText = false), 1500);
+  }
+
+  function formatWhen(at: string | null) {
+    if (!at) return "";
+    const d = new Date(at);
+    return isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  }
 
   // folder stage
   let trail = $state<DriveFolder[]>([{ id: "root", name: "My Drive" }]);
@@ -262,9 +313,18 @@
   // ---------- actions menu ----------
 
   const MENU_W = 230;
-  const MENU_H = 92;
+  const MENU_H = 124;
   const actions = [
     { label: "Copy to Clipboard", keys: "↵", danger: false, run: (i: number) => copy(i) },
+    {
+      label: "Show Text",
+      keys: "Ctrl I",
+      danger: false,
+      run: (i: number) => {
+        select(i);
+        toggleDetails(true);
+      },
+    },
     {
       label: "Delete Meme…",
       keys: "Ctrl ⌫",
@@ -335,6 +395,7 @@
     if (key === "Escape") {
       e.preventDefault();
       if (confirmDelete) confirmDelete = null;
+      else if (showDetails) toggleDetails(false);
       else if (stage === "ready") invoke("hide"); // the setup window doesn't vanish on Esc
       return;
     }
@@ -366,6 +427,7 @@
         return;
       }
       if (ctrl && key.toLowerCase() === "k") { e.preventDefault(); openActions(); return; }
+      if (ctrl && key.toLowerCase() === "i") { e.preventDefault(); toggleDetails(); return; }
       switch (key) {
         case "ArrowRight": e.preventDefault(); move("right"); break;
         case "ArrowLeft":  e.preventDefault(); move("left"); break;
@@ -397,6 +459,10 @@
       }),
       listen("library-changed", () => refresh()),
       listen("sync-status", () => refresh()),
+      listen("ocr-status", async () => {
+        // Progress ticks often; only refresh the status, not the search results.
+        status = await invoke<Status>("get_status");
+      }),
     ];
     const timer = setInterval(() => (now = Date.now()), 5000);
     refresh(true).then(() => input?.focus());
@@ -451,7 +517,7 @@
         placeholder={stage === "folder"
           ? `Search folders in ${here.name}…`
           : status?.count
-            ? `Search ${status.count} memes…`
+            ? `Search ${status.count} memes by name or text…`
             : "Search memes…"}
         spellcheck="false"
         autocomplete="off"
@@ -597,6 +663,45 @@
         </div>
       {/if}
     {/if}
+
+    {#if stage === "ready" && showDetails && current}
+      <div class="details">
+        <div class="preview">
+          <img src={convertFileSrc(current.path)} alt={current.name} draggable="false" />
+        </div>
+        <aside class="info">
+          <p class="label">File</p>
+          <p class="filename" title={current.rel}>{current.rel}</p>
+
+          <p class="label">Text in image</p>
+          {#if !details}
+            <div class="ocr-text skeleton-text"></div>
+          {:else if details.state === "read" && details.text}
+            <div class="ocr-text">{details.text}</div>
+          {:else if details.state === "read"}
+            <p class="note">No text found in this image.</p>
+          {:else if details.state === "pending"}
+            <p class="note">
+              {status?.ocr.state === "unavailable" ? "Text recognition isn't available on this device." : "Not read yet. It's in the queue."}
+            </p>
+          {:else}
+            <p class="note">Couldn't read this image.</p>
+          {/if}
+
+          {#if details?.state === "read"}
+            <p class="meta">Read {formatWhen(details.at)}{details.lang ? ` · ${details.lang}` : ""}</p>
+          {/if}
+
+          <div class="info-actions">
+            <button class="btn outline sm" disabled={!details?.text} onclick={copyText}>
+              {copiedText ? "Copied" : "Copy Text"}
+            </button>
+            <span class="spacer"></span>
+            <button class="btn ghost sm" onclick={() => toggleDetails(false)}>Close <kbd>Esc</kbd></button>
+          </div>
+        </aside>
+      </div>
+    {/if}
   </section>
 
   <footer>
@@ -617,6 +722,15 @@
         >
           <i class="dot"></i>{syncLabel(status.sync)}
         </span>
+        {#if status.ocr.state === "reading"}
+          <span class="divider"></span>
+          <span class="status busy" title="Reading the text in your memes so you can search it">
+            <i class="dot"></i>Reading text · {status.ocr.done}/{status.ocr.total}
+          </span>
+        {:else if status.ocr.state === "unavailable"}
+          <span class="divider"></span>
+          <span class="status err" title={status.ocr.message ?? ""}><i class="dot"></i>Text search unavailable</span>
+        {/if}
       {:else if stage === "folder"}
         <span class="status muted">Choose the Drive folder that holds your memes</span>
       {:else if status?.account}
@@ -794,9 +908,100 @@
   }
 
   .body {
+    position: relative;
     flex: 1;
     min-height: 0;
     display: flex;
+  }
+
+  /* ---------- details view (Ctrl+I) ---------- */
+
+  .details {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: grid;
+    grid-template-columns: 1fr 280px;
+    background: var(--bg);
+  }
+
+  .preview {
+    display: grid;
+    place-items: center;
+    min-width: 0;
+    min-height: 0;
+    padding: 20px;
+    background: var(--bar);
+  }
+
+  .preview img {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 8px;
+    object-fit: contain;
+  }
+
+  .info {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 18px 18px 14px;
+    border-left: 1px solid var(--border);
+  }
+
+  .label {
+    margin: 0 0 4px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted-fg);
+  }
+
+  .filename {
+    margin: 0 0 16px;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ocr-text {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--muted);
+    font: 12.5px/1.55 "Geist Mono Variable", ui-monospace, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+  }
+
+  .skeleton-text {
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
+  .note {
+    flex: 1;
+    margin: 0;
+    font-size: 13px;
+    color: var(--muted-fg);
+  }
+
+  .meta {
+    margin: 8px 0 0;
+    font-size: 11px;
+    color: var(--muted-fg);
+  }
+
+  .info-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 12px;
   }
 
   /* ---------- masonry ---------- */

@@ -1,9 +1,8 @@
 //! In-memory index of the meme folder plus fzf-style fuzzy search via nucleo.
 //!
-//! Indexes the local mirror of the Drive folder. Milestone 1 only searches
-//! filenames, so a plain Vec rescanned from disk is enough and stays
-//! sub-millisecond. The per-device SQLite/FTS5 index from the handoff arrives
-//! with tags (M2) and OCR text (M3).
+//! Indexes the local mirror of the Drive folder. Filenames are fuzzy-matched here
+//! in memory (sub-millisecond); text found in images (and tags, later) comes from the
+//! SQLite FTS5 index (`index.rs`) and is merged into the ranking by `search`.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
@@ -28,6 +27,11 @@ pub struct Meme {
     /// before images load. `None` until `fill_dims` runs (or if the header is unreadable).
     dims: Option<(u32, u32)>,
 }
+
+/// Score bonus for memes whose image text matched (nucleo filename scores for a good
+/// match are typically ~50-300, so a text hit competes with a decent filename hit).
+const TEXT_BONUS_BASE: u32 = 100;
+const TEXT_BONUS_SPAN: u32 = 100;
 
 /// Previously-read dimensions, keyed by path, valid while the mtime is unchanged.
 pub type DimsCache = HashMap<PathBuf, (SystemTime, (u32, u32))>;
@@ -140,7 +144,9 @@ impl Library {
         }
     }
 
-    pub fn search(&self, query: &str, limit: usize, matcher: &mut Matcher) -> SearchResult {
+    /// `text_hits` are memes whose image text/tags matched the query, best first (from
+    /// the FTS index). A meme can match by filename, by text, or both (ranks highest).
+    pub fn search(&self, query: &str, limit: usize, matcher: &mut Matcher, text_hits: &[String]) -> SearchResult {
         let start = Instant::now();
         let query = query.trim();
 
@@ -153,15 +159,26 @@ impl Library {
         }
 
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+        // Text matches earn a bonus on top of any filename score: the best text hit gets
+        // TEXT_BONUS_BASE + TEXT_BONUS_SPAN, tapering to TEXT_BONUS_BASE for the last.
+        let n = text_hits.len().max(1) as u32;
+        let bonus: HashMap<&str, u32> = text_hits
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| (rel.as_str(), TEXT_BONUS_BASE + TEXT_BONUS_SPAN * (n - i as u32) / n))
+            .collect();
         let mut buf = Vec::new();
         let mut scored: Vec<(u32, usize)> = self
             .memes
             .iter()
             .enumerate()
             .filter_map(|(i, m)| {
-                pattern
-                    .score(Utf32Str::new(&m.haystack, &mut buf), matcher)
-                    .map(|score| (score, i))
+                let fuzzy = pattern.score(Utf32Str::new(&m.haystack, &mut buf), matcher);
+                let text = bonus.get(m.rel.as_str()).copied();
+                if fuzzy.is_none() && text.is_none() {
+                    return None;
+                }
+                Some((fuzzy.unwrap_or(0) + text.unwrap_or(0), i))
             })
             .collect();
         // Stable sort: equal scores keep newest-first order.
@@ -200,11 +217,18 @@ mod tests {
         assert_eq!(lib.memes.len(), 2, "skips non-images and dot-folders");
 
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
-        let res = lib.search("spika", 10, &mut m);
+        let res = lib.search("spika", 10, &mut m, &[]);
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
-        assert_eq!(lib.search("", 10, &mut m).hits.len(), 2);
-        assert_eq!(lib.search("zzzz", 10, &mut m).hits.len(), 0);
+        assert_eq!(lib.search("", 10, &mut m, &[]).hits.len(), 2);
+        assert_eq!(lib.search("zzzz", 10, &mut m, &[]).hits.len(), 0);
+
+        // A text-only match (filename doesn't match) still shows up...
+        let res = lib.search("zzzz", 10, &mut m, &["this is fine.png".to_string()]);
+        assert_eq!(res.hits.len(), 1);
+        // ...and a text hit lifts a meme above a filename-only match.
+        let res = lib.search("i", 10, &mut m, &["reactions/surprised pikachu.jpg".to_string()]);
+        assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
