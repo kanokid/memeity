@@ -1,12 +1,14 @@
 <h1 align="center">
-  <img src="./src/assets/logo.png" alt="Logo" width="200" />
+  <img src="./src/assets/logo.png" alt="logo" width="200" />
   <br />memeity
 </h1>
 <h3 align="center">a meme folder for the modern era.</h3>
 
 <p align="center"><i>hey, it's me, it's memeity</i></p>
 
-![screenshot](https://github.com/user-attachments/assets/86f236ac-758f-42f6-ad31-b3b42370664d)
+<div align="center">
+  <img width="770" height="495" alt="screenshot" src="https://github.com/user-attachments/assets/7b1b1057-98df-4f05-b510-83d8097307c0" />
+</div>
 
 ## What is this?
 Picture this: you're chatting with your friends, when all of a sudden, you've thought of the perfect meme for the occasion! Quickly, you search your downloads folder, only to realize that you've forgotten the filename! (or worse, that the meme is on your other computer!)
