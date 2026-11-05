@@ -2,7 +2,9 @@
   <img src="./src/assets/logo.png" alt="Logo" width="200" />
   <br />memeity
 </h1>
-<h3 align="center">hey, it's me, it's memeity</h3>
+<h3 align="center">a meme folder for the modern era.</h3>
+
+<p align="center"><i>hey, it's me, it's memeity</i></p>
 
 ## What is this?
 Picture this: you're chatting with your friends, when all of a sudden, you've thought of the perfect meme for the occasion! Quickly, you search your downloads folder, only to realize that you've forgotten the filename! (or worse, that the meme is on your other computer!)
