@@ -31,7 +31,7 @@ memeity aims to fix this issue by hosting all of your memes on Google Drive - sy
 Grab the [latest release](https://github.com/purestellenium/memeity/releases/latest) for your platform, and install normally following the wizard / DMG file.
 
 ## AI Declaration
-memeity is completely and wholly vibecoded. I would say unapologetically, but I'm a little embarrassed by it. My techstack is not nearly strong enough for this project, so I had Claude Opus 5.5 help me out a bit.
+I used AI heavily (Claude Opus 5.5) in the development of memeity- I just wanted something that worked, and so using AI was the quickest way to make this happen.
 
 ## Contributing
 As always, PRs welcome!
