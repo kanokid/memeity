@@ -337,6 +337,13 @@
       return;
     }
 
+    // Ctrl+, (Cmd+, on Mac) opens the Settings window, from any screen.
+    if (ctrl && key === ",") {
+      e.preventDefault();
+      invoke("open_settings");
+      return;
+    }
+
     if (stage === "setup") {
       // Setup.svelte handles arrows/Enter for its own steps.
       if (ctrl && key.toLowerCase() === "o") {
@@ -446,11 +453,28 @@
         autocomplete="off"
       />
       {#if stage === "ready" && status?.drive_folder}
-        <span class="badge" title={status.local_folder ?? ""}>
+        <button
+          class="badge"
+          title={`Open ${status.local_folder ?? "the meme folder"}`}
+          onmousedown={(e) => e.preventDefault()}
+          onclick={() => invoke("open_folder")}
+        >
           {@render folderIcon()}
           {status.drive_folder.name}
-        </span>
+        </button>
       {/if}
+      <button
+        class="icon-btn"
+        title="Settings (Ctrl+,)"
+        aria-label="Settings"
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => invoke("open_settings")}
+      >
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+          <circle cx="12" cy="12" r="3" />
+        </svg>
+      </button>
     </header>
   {/if}
 
@@ -714,16 +738,44 @@
     align-items: center;
     gap: 6px;
     max-width: 200px;
-    height: 24px;
+    height: 26px;
     padding: 0 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
+    background: none;
     color: var(--muted-fg);
     font-size: 12px;
     font-weight: 500;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    cursor: pointer;
+    transition: background 100ms ease, color 100ms ease;
+  }
+
+  .badge:hover {
+    background: var(--accent);
+    color: var(--fg);
+  }
+
+  .icon-btn {
+    display: grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted-fg);
+    cursor: pointer;
+    transition: background 100ms ease, color 100ms ease;
+  }
+
+  .icon-btn:hover {
+    background: var(--accent);
+    color: var(--fg);
   }
 
   .badge .icon {

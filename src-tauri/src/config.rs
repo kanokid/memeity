@@ -19,6 +19,9 @@ pub struct Config {
     /// changes, the sign-in is dropped and redone (see `migrate_auth_scope`).
     #[serde(default)]
     pub auth_scope: Option<String>,
+    /// The pane's global shortcut, e.g. "control+alt+KeyM". None = the default.
+    #[serde(default)]
+    pub shortcut: Option<String>,
 }
 
 impl Config {

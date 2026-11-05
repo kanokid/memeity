@@ -1,0 +1,248 @@
+//! The Settings window (a normal, decorated window, unlike the pane) and the
+//! per-device preferences it controls: the global shortcut, launch at login,
+//! re-reading text, and links out.
+
+#[cfg(target_os = "macos")]
+use crate::is_ready;
+use crate::{config, hide_pane, status, textindex, update_config, AppState, Status};
+use std::sync::atomic::Ordering;
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Modifiers, Shortcut};
+use tauri_plugin_opener::OpenerExt;
+
+pub const WINDOW: &str = "settings";
+/// Ctrl+Alt+M (Ctrl+Option+M on macOS).
+pub const DEFAULT_SHORTCUT: &str = "control+alt+KeyM";
+/// Passed by the login item so a login launch stays quietly in the tray.
+pub const AUTOSTART_ARG: &str = "--autostart";
+
+// ---------- window ----------
+
+/// Opens the Settings window, or focuses it if it's already open.
+pub fn open(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window(WINDOW) {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        return;
+    }
+    hide_pane(app);
+    app.state::<AppState>().settings_open.store(true, Ordering::SeqCst);
+    update_activation_policy(app);
+
+    let built = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("index.html".into()))
+        .title("memeity Settings")
+        .inner_size(700.0, 500.0)
+        .min_inner_size(620.0, 440.0)
+        .center()
+        .focused(true)
+        .build();
+    match built {
+        Ok(win) => {
+            let handle = app.clone();
+            win.on_window_event(move |event| {
+                if matches!(event, WindowEvent::Destroyed) {
+                    handle.state::<AppState>().settings_open.store(false, Ordering::SeqCst);
+                    update_activation_policy(&handle);
+                }
+            });
+        }
+        Err(e) => {
+            eprintln!("[memeity] couldn't open settings: {e}");
+            app.state::<AppState>().settings_open.store(false, Ordering::SeqCst);
+            update_activation_policy(app);
+        }
+    }
+}
+
+/// macOS: memeity is a menu-bar-only app (no Dock icon, not in Cmd+Tab) except while a
+/// "real" window is up: the Settings window, or the pane in its setup/sign-in mode.
+#[cfg(target_os = "macos")]
+pub fn update_activation_policy(app: &AppHandle) {
+    let regular = !is_ready(app) || app.state::<AppState>().settings_open.load(Ordering::SeqCst);
+    let _ = app.set_activation_policy(if regular {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn update_activation_policy(_app: &AppHandle) {}
+
+// ---------- shortcut ----------
+
+/// The shortcut currently opening the pane.
+pub fn current(app: &AppHandle) -> Shortcut {
+    *app.state::<AppState>().shortcut.lock().unwrap()
+}
+
+/// Human-friendly label, e.g. "Ctrl+Alt+M" (or "Ctrl+Option+M" on macOS).
+pub fn label(shortcut: &Shortcut) -> String {
+    let mac = cfg!(target_os = "macos");
+    let mut parts: Vec<String> = Vec::new();
+    if shortcut.mods.contains(Modifiers::CONTROL) {
+        parts.push("Ctrl".into());
+    }
+    if shortcut.mods.contains(Modifiers::ALT) {
+        parts.push(if mac { "Option" } else { "Alt" }.into());
+    }
+    if shortcut.mods.contains(Modifiers::SHIFT) {
+        parts.push("Shift".into());
+    }
+    if shortcut.mods.contains(Modifiers::SUPER) {
+        parts.push(if mac { "Cmd" } else { "Win" }.into());
+    }
+    let code = shortcut.key.to_string();
+    let key = match code.as_str() {
+        "ArrowUp" => "↑".to_string(),
+        "ArrowDown" => "↓".to_string(),
+        "ArrowLeft" => "←".to_string(),
+        "ArrowRight" => "→".to_string(),
+        "Backquote" => "`".to_string(),
+        "Comma" => ",".to_string(),
+        "Period" => ".".to_string(),
+        "Slash" => "/".to_string(),
+        "Semicolon" => ";".to_string(),
+        "Quote" => "'".to_string(),
+        "Minus" => "-".to_string(),
+        "Equal" => "=".to_string(),
+        "BracketLeft" => "[".to_string(),
+        "BracketRight" => "]".to_string(),
+        "Backslash" => "\\".to_string(),
+        other => other.strip_prefix("Key").or_else(|| other.strip_prefix("Digit")).unwrap_or(other).to_string(),
+    };
+    parts.push(key);
+    parts.join("+")
+}
+
+fn parse(accelerator: &str) -> Result<Shortcut, String> {
+    let shortcut: Shortcut = accelerator.parse().map_err(|e| format!("That's not a valid shortcut: {e}"))?;
+    let has_main_modifier = shortcut.mods.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER);
+    if !has_main_modifier {
+        return Err("Include Ctrl, Alt or Win (Cmd/Option on Mac), so it doesn't clash with typing.".into());
+    }
+    Ok(shortcut)
+}
+
+/// Registers the saved (or default) shortcut at startup.
+pub fn register_initial(app: &AppHandle) {
+    let saved = config(app).shortcut.and_then(|s| parse(&s).ok());
+    let shortcut = saved.unwrap_or_else(|| parse(DEFAULT_SHORTCUT).expect("default shortcut is valid"));
+    *app.state::<AppState>().shortcut.lock().unwrap() = shortcut;
+    if let Err(e) = app.global_shortcut().register(shortcut) {
+        let msg = format!("Couldn't register {} (another app may own it): {e}", label(&shortcut));
+        eprintln!("[memeity] {msg}");
+        *app.state::<AppState>().shortcut_error.lock().unwrap() = Some(msg);
+    }
+    refresh_shortcut_labels(app);
+}
+
+/// Swaps in a new shortcut. If it can't be registered, the old one stays active.
+fn apply(app: &AppHandle, next: Shortcut) -> Result<(), String> {
+    let old = current(app);
+    if next == old {
+        return Ok(());
+    }
+    let gs = app.global_shortcut();
+    let _ = gs.unregister(old);
+    if let Err(e) = gs.register(next) {
+        let _ = gs.register(old);
+        return Err(format!("{} is already used by another app or Windows. Try another combination. ({e})", label(&next)));
+    }
+    *app.state::<AppState>().shortcut.lock().unwrap() = next;
+    *app.state::<AppState>().shortcut_error.lock().unwrap() = None;
+    update_config(app, |c| c.shortcut = Some(next.into_string()));
+    refresh_shortcut_labels(app);
+    Ok(())
+}
+
+/// The tray menu and tooltip mention the shortcut; keep them in sync.
+fn refresh_shortcut_labels(app: &AppHandle) {
+    let text = label(&current(app));
+    if let Some(item) = app.state::<AppState>().open_item.lock().unwrap().as_ref() {
+        let _ = item.set_text(format!("Open memeity ({text})"));
+    }
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(format!("memeity ({text})")));
+    }
+}
+
+// ---------- commands ----------
+
+#[tauri::command]
+pub async fn open_settings(app: AppHandle) {
+    open(&app);
+}
+
+/// `accelerator` uses the browser's key codes, e.g. "control+alt+KeyM".
+#[tauri::command]
+pub fn set_shortcut(app: AppHandle, accelerator: String) -> Result<Status, String> {
+    apply(&app, parse(&accelerator)?)?;
+    Ok(status(&app))
+}
+
+#[tauri::command]
+pub fn reset_shortcut(app: AppHandle) -> Result<Status, String> {
+    apply(&app, parse(DEFAULT_SHORTCUT).expect("default shortcut is valid"))?;
+    Ok(status(&app))
+}
+
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<Status, String> {
+    let launcher = app.autolaunch();
+    let result = if enabled { launcher.enable() } else { launcher.disable() };
+    result.map_err(|e| format!("Couldn't change launch at login: {e}"))?;
+    Ok(status(&app))
+}
+
+pub fn autostart_enabled(app: &AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Re-run text recognition on every meme (e.g. after installing a new OCR language).
+#[tauri::command]
+pub fn reread_all_text(app: AppHandle) {
+    app.state::<AppState>().reread_text.store(true, Ordering::SeqCst);
+    textindex::trigger(&app);
+}
+
+/// Opens one of a fixed set of links in the browser (never an arbitrary URL).
+#[tauri::command]
+pub fn open_link(app: AppHandle, target: String) -> Result<(), String> {
+    let url = match target.as_str() {
+        "website" => "https://memeity.stelle.codes".to_string(),
+        "privacy" => "https://memeity.stelle.codes/privacy/".to_string(),
+        "source" => "https://github.com/purestellenium/memeity".to_string(),
+        "drive" => {
+            let folder = config(&app).drive_folder.ok_or("No Drive folder yet.")?;
+            format!("https://drive.google.com/drive/folders/{}", folder.id)
+        }
+        _ => return Err("Unknown link.".into()),
+    };
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_browser_key_codes_and_labels_them() {
+        let s = parse("control+alt+KeyM").unwrap();
+        assert_eq!(s, parse(DEFAULT_SHORTCUT).unwrap());
+        let expected = if cfg!(target_os = "macos") { "Ctrl+Option+M" } else { "Ctrl+Alt+M" };
+        assert_eq!(label(&s), expected);
+        assert_eq!(label(&parse("control+shift+Digit1").unwrap()), "Ctrl+Shift+1");
+        assert_eq!(label(&parse("alt+Space").unwrap()).rsplit('+').next(), Some("Space"));
+        assert_eq!(label(&parse("control+ArrowUp").unwrap()), "Ctrl+↑");
+    }
+
+    #[test]
+    fn rejects_shortcuts_that_would_clash_with_typing() {
+        assert!(parse("KeyM").is_err());
+        assert!(parse("shift+KeyM").is_err());
+        assert!(parse("nonsense+KeyM").is_err());
+    }
+}

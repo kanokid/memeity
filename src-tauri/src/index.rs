@@ -123,6 +123,13 @@ impl Index {
         Ok(())
     }
 
+    /// How many memes have had their text indexed.
+    pub fn indexed_count(&self) -> rusqlite::Result<usize> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM memes WHERE indexed = 1", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)
+    }
+
     /// Memes whose text or tags match every word of `query` (as prefixes), best first.
     pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<String>> {
         let Some(fts) = fts_query(query) else { return Ok(Vec::new()) };

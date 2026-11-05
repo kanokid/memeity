@@ -95,6 +95,9 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
         return Ok(()); // index unavailable; search falls back to filenames
     }
 
+    // "Re-read all memes" from Settings: OCR everything again, ignoring cached text.
+    let force = app.state::<AppState>().reread_text.swap(false, std::sync::atomic::Ordering::SeqCst);
+
     // 2. Work out what needs (re)indexing. Library order is newest first.
     let mut pending = Vec::new();
     let mut changed = false;
@@ -115,6 +118,10 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
 
         let sidecar_path = sidecar::path(&root, &md5);
         let sidecar_mtime = mtime_of(&sidecar_path);
+        if force {
+            pending.push(Pending { rel, path, md5 });
+            continue;
+        }
         if indexed && sidecar_mtime == seen_sidecar {
             continue; // up to date
         }

@@ -7,6 +7,7 @@ mod google;
 mod index;
 mod library;
 mod ocr;
+mod settings;
 mod sidecar;
 mod sync;
 mod textindex;
@@ -26,19 +27,14 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
 const PANE: &str = "pane";
-const SHORTCUT_LABEL: &str = "Ctrl+Alt+M";
 const CLIENT_FILE: &str = "google-client.json";
 /// Fixed content size of the window (Raycast's default), matching tauri.conf.json.
 const PANE_WIDTH: f64 = 750.0;
 const PANE_HEIGHT: f64 = 475.0;
-
-fn pane_shortcut() -> Shortcut {
-    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyM)
-}
 
 pub struct AppState {
     pub library: RwLock<Library>,
@@ -65,6 +61,14 @@ pub struct AppState {
     had_focus: AtomicBool,
     /// Which window mode is applied: Some(true) = search pane, Some(false) = setup window.
     window_mode: Mutex<Option<bool>>,
+    /// The global shortcut that opens the pane (configurable in Settings).
+    shortcut: Mutex<Shortcut>,
+    /// The tray's "Open memeity (...)" item, relabelled when the shortcut changes.
+    open_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// Whether the Settings window is open (macOS shows a Dock icon while it is).
+    settings_open: AtomicBool,
+    /// Asks the text worker to re-run OCR on every meme on its next pass.
+    pub reread_text: AtomicBool,
 }
 
 // ---------- config & paths ----------
@@ -107,11 +111,15 @@ struct Status {
     drive_folder: Option<DriveFolder>,
     local_folder: Option<String>,
     count: usize,
-    shortcut: &'static str,
+    /// How many memes have had their text read (for Settings > Text Search).
+    text_indexed: usize,
+    shortcut: String,
     shortcut_error: Option<String>,
     sync: SyncStatus,
     ocr: textindex::OcrStatus,
     client_file: Option<String>,
+    autostart: bool,
+    version: String,
 }
 
 /// True once memeity is fully set up (client loaded, signed in, Drive folder picked).
@@ -138,6 +146,8 @@ fn apply_window_mode(app: &AppHandle) {
     let _ = win.set_always_on_top(ready);
     let _ = win.set_skip_taskbar(ready);
     let _ = win.set_title(if ready { "memeity" } else { "memeity setup" });
+    // macOS: menu-bar only once set up; a regular Dock app during setup.
+    settings::update_activation_policy(app);
     lock_size(&win);
     if ready {
         position_pane(app, &win);
@@ -165,11 +175,20 @@ fn status(app: &AppHandle) -> Status {
         local_folder: sync_target(app).map(|(_, d)| d.to_string_lossy().into_owned()),
         drive_folder: cfg.drive_folder,
         count: state.library.read().unwrap().memes.len(),
-        shortcut: SHORTCUT_LABEL,
+        text_indexed: state
+            .index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|idx| idx.indexed_count().ok())
+            .unwrap_or(0),
+        shortcut: settings::label(&settings::current(app)),
         shortcut_error: state.shortcut_error.lock().unwrap().clone(),
         sync: state.sync_status.lock().unwrap().clone(),
         ocr: state.ocr_status.lock().unwrap().clone(),
         client_file: app.path().app_config_dir().ok().map(|d| d.join(CLIENT_FILE).to_string_lossy().into_owned()),
+        autostart: settings::autostart_enabled(app),
+        version: app.package_info().version.to_string(),
     }
 }
 
@@ -533,23 +552,40 @@ fn open_setup_link(app: AppHandle, url: String) -> Result<(), String> {
 
 // ---------- setup ----------
 
+/// macOS menu-bar icons are "template" images: black strokes on transparent, which
+/// macOS recolors for light/dark menu bars. Elsewhere the tray uses the full-colour app icon.
+#[cfg(target_os = "macos")]
+fn tray_builder(_app: &AppHandle) -> tauri::Result<TrayIconBuilder<tauri::Wry>> {
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?;
+    Ok(TrayIconBuilder::with_id("main").icon(icon).icon_as_template(true))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tray_builder(app: &AppHandle) -> tauri::Result<TrayIconBuilder<tauri::Wry>> {
+    Ok(TrayIconBuilder::with_id("main").icon(app.default_window_icon().cloned().expect("bundle has an icon")))
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", format!("Open memeity ({SHORTCUT_LABEL})"), true, None::<&str>)?;
+    // The shortcut in this label (and the tooltip) is filled in by settings::register_initial.
+    let open = MenuItem::with_id(app, "open", "Open memeity", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let sync_now = MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?;
     let local = MenuItem::with_id(app, "local", "Open local meme folder", true, None::<&str>)?;
     let signout = MenuItem::with_id(app, "signout", "Sign out of Google", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit memeity", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &sep1, &sync_now, &local, &signout, &sep2, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &settings_item, &sep1, &sync_now, &local, &signout, &sep2, &quit])?;
 
-    TrayIconBuilder::with_id("main")
-        .icon(app.default_window_icon().cloned().expect("bundle has an icon"))
-        .tooltip(format!("memeity ({SHORTCUT_LABEL})"))
+    *app.state::<AppState>().open_item.lock().unwrap() = Some(open.clone());
+
+    tray_builder(app)?
+        .tooltip("memeity")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_pane(app),
+            "settings" => settings::open(app),
             "sync" => sync::trigger(app),
             "local" => open_local_folder(app),
             "signout" => {
@@ -581,10 +617,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![settings::AUTOSTART_ARG]),
+        ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if event.state() == ShortcutState::Pressed && *shortcut == pane_shortcut() {
+                    if event.state() == ShortcutState::Pressed && *shortcut == settings::current(app) {
                         toggle_pane(app);
                     }
                 })
@@ -603,7 +643,13 @@ pub fn run() {
             sync_now,
             open_folder,
             open_setup_link,
-            hide
+            hide,
+            settings::open_settings,
+            settings::set_shortcut,
+            settings::reset_shortcut,
+            settings::set_autostart,
+            settings::reread_all_text,
+            settings::open_link
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -631,17 +677,16 @@ pub fn run() {
                 dialog_open: AtomicBool::new(false),
                 had_focus: AtomicBool::new(false),
                 window_mode: Mutex::new(None),
+                shortcut: Mutex::new(settings::DEFAULT_SHORTCUT.parse().expect("default shortcut is valid")),
+                open_item: Mutex::new(None),
+                settings_open: AtomicBool::new(false),
+                reread_text: AtomicBool::new(false),
             });
 
             migrate_auth_scope(&handle);
 
-            if let Err(e) = app.global_shortcut().register(pane_shortcut()) {
-                let msg = format!("Couldn't register {SHORTCUT_LABEL} (another app may own it): {e}");
-                eprintln!("[memeity] {msg}");
-                *app.state::<AppState>().shortcut_error.lock().unwrap() = Some(msg);
-            }
-
             setup_tray(&handle)?;
+            settings::register_initial(&handle);
 
             // Launcher behaviour: hide on blur, and closing just hides.
             let win = pane(&handle).expect("pane window is defined in tauri.conf.json");
@@ -675,9 +720,14 @@ pub fn run() {
             textindex::spawn(handle.clone(), text_rx);
             sync::trigger(&handle);
 
-            // Draft build: pop the pane on launch so there's something to look at.
-            // The real app will start silently in the tray.
-            show_pane(&handle);
+            // Opened by hand: show the pane so it's obvious memeity is running. Started at
+            // login: stay quietly in the tray/menu bar until the shortcut is pressed.
+            let at_login = std::env::args().any(|a| a == settings::AUTOSTART_ARG);
+            if !at_login || !is_ready(&handle) {
+                show_pane(&handle);
+            } else {
+                settings::update_activation_policy(&handle);
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
