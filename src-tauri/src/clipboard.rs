@@ -57,7 +57,7 @@ fn with_retries(
         match arboard::Clipboard::new().and_then(|mut cb| write(&mut cb)) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                eprintln!("[memeity] copy attempt {attempt}/{COPY_ATTEMPTS} for {} failed: {e}", path.display());
+                log::warn!("copy attempt {attempt}/{COPY_ATTEMPTS} for {} failed: {e}", path.display());
                 last_err = e.to_string();
                 std::thread::sleep(std::time::Duration::from_millis(60));
             }

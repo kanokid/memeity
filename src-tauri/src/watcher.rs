@@ -23,11 +23,11 @@ fn only_hidden(root: &Path, event: &Event) -> bool {
 pub fn watch(app: AppHandle, root: PathBuf) -> Option<RecommendedWatcher> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = notify::recommended_watcher(tx)
-        .inspect_err(|e| eprintln!("[memeity] watcher init failed: {e}"))
+        .inspect_err(|e| log::warn!("watcher init failed: {e}"))
         .ok()?;
     watcher
         .watch(&root, RecursiveMode::Recursive)
-        .inspect_err(|e| eprintln!("[memeity] can't watch {}: {e}", root.display()))
+        .inspect_err(|e| log::warn!("can't watch {}: {e}", root.display()))
         .ok()?;
 
     std::thread::spawn(move || {

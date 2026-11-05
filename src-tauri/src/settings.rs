@@ -21,17 +21,30 @@ pub const AUTOSTART_ARG: &str = "--autostart";
 
 /// Opens the Settings window, or focuses it if it's already open.
 pub fn open(app: &AppHandle) {
+    open_at(app, None);
+}
+
+/// Opens Settings at a section (e.g. "duplicates"), or wherever it was.
+pub fn open_at(app: &AppHandle, section: Option<&str>) {
     if let Some(win) = app.get_webview_window(WINDOW) {
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
+        if let Some(section) = section {
+            let _ = app.emit_to(WINDOW, "show-section", section);
+        }
         return;
     }
     hide_pane(app);
     app.state::<AppState>().settings_open.store(true, Ordering::SeqCst);
     update_activation_policy(app);
 
-    let built = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("index.html".into()))
+    // The section rides along as the URL fragment (read once at startup).
+    let url = match section {
+        Some(section) => format!("index.html#{section}"),
+        None => "index.html".into(),
+    };
+    let built = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App(url.into()))
         .title("memeity Settings")
         .inner_size(700.0, 500.0)
         .min_inner_size(620.0, 440.0)
@@ -49,7 +62,7 @@ pub fn open(app: &AppHandle) {
             });
         }
         Err(e) => {
-            eprintln!("[memeity] couldn't open settings: {e}");
+            log::warn!("couldn't open settings: {e}");
             app.state::<AppState>().settings_open.store(false, Ordering::SeqCst);
             update_activation_policy(app);
         }
@@ -154,7 +167,7 @@ pub fn register_initial(app: &AppHandle) {
     let shortcut = saved.unwrap_or_else(|| parse(DEFAULT_SHORTCUT).expect("default shortcut is valid"));
     *app.state::<AppState>().shortcut.lock().unwrap() = shortcut;
     if let Err(e) = app.global_shortcut().register(shortcut) {
-        eprintln!("[memeity] couldn't register {}: {e}", label(&shortcut));
+        log::warn!("couldn't register {}: {e}", label(&shortcut));
         *app.state::<AppState>().shortcut_error.lock().unwrap() = Some(taken_message(&shortcut));
     }
     refresh_shortcut_labels(app);
@@ -187,7 +200,7 @@ fn apply(app: &AppHandle, next: Shortcut) -> Result<(), String> {
         if old_registered {
             let _ = gs.register(old);
         }
-        eprintln!("[memeity] couldn't register {}: {e}", label(&next));
+        log::warn!("couldn't register {}: {e}", label(&next));
         return Err(format!("{} Try another combination.", taken_message(&next)));
     }
     *app.state::<AppState>().shortcut.lock().unwrap() = next;
@@ -212,8 +225,8 @@ fn refresh_shortcut_labels(app: &AppHandle) {
 // ---------- commands ----------
 
 #[tauri::command]
-pub async fn open_settings(app: AppHandle) {
-    open(&app);
+pub async fn open_settings(app: AppHandle, section: Option<String>) {
+    open_at(&app, section.as_deref());
 }
 
 /// `accelerator` uses the browser's key codes, e.g. "control+alt+KeyM".

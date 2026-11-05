@@ -22,7 +22,7 @@ use crate::sidecar::{self, META_DIR};
 use crate::{refresh_library, sync_target, AppState};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,7 +49,9 @@ const MTIME_SLACK: Duration = Duration::from_secs(5);
 pub(crate) trait Drive {
     async fn list_children(&self, parent: &str) -> Result<Vec<DriveItem>, String>;
     async fn download(&self, id: &str) -> Result<Vec<u8>, String>;
-    async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String>;
+    async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>, id: &str) -> Result<DriveItem, String>;
+    async fn generate_ids(&self, count: u32) -> Result<Vec<String>, String>;
+    async fn find(&self, id: &str) -> Result<Option<DriveItem>, String>;
     async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String>;
     async fn rename(&self, id: &str, new_name: &str, reparent: Option<(&str, &str)>) -> Result<DriveItem, String>;
     async fn update_content(&self, id: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String>;
@@ -63,8 +65,14 @@ impl Drive for Google {
     async fn download(&self, id: &str) -> Result<Vec<u8>, String> {
         Google::download(self, id).await
     }
-    async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
-        Google::upload(self, parent, name, mime, bytes).await
+    async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>, id: &str) -> Result<DriveItem, String> {
+        Google::upload(self, parent, name, mime, bytes, Some(id)).await
+    }
+    async fn generate_ids(&self, count: u32) -> Result<Vec<String>, String> {
+        Google::generate_ids(self, count).await
+    }
+    async fn find(&self, id: &str) -> Result<Option<DriveItem>, String> {
+        Google::find(self, id).await
     }
     async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String> {
         Google::create_folder(self, parent, name).await
@@ -137,7 +145,25 @@ struct SyncState {
     /// can't have been edited locally, so they aren't re-hashed.
     #[serde(default)]
     last_scan: Option<u64>,
+    /// Files whose upload may not match what's on disk (they changed while uploading).
+    /// Re-checked on every pass whatever their timestamps say.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    dirty: BTreeSet<String>,
+    /// New files whose upload may or may not have reached Drive (e.g. the connection
+    /// dropped before Drive answered), with the Drive id reserved for them. Retrying
+    /// with the same id can't create a second copy.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending: BTreeMap<String, PendingUpload>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PendingUpload {
+    id: String,
+    md5: String,
+}
+
+/// Reserved Drive ids, fetched in batches.
+const ID_BATCH: u32 = 50;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Synced {
@@ -161,6 +187,8 @@ impl SyncState {
                 files: BTreeMap::new(),
                 page_token: None,
                 last_scan: None,
+                dirty: BTreeSet::new(),
+                pending: BTreeMap::new(),
             })
     }
 
@@ -273,6 +301,19 @@ async fn run_once(app: &AppHandle, kind: SyncKind) {
 
     let report = cycle(&state.google, &folder.id, &root, &data_dir).await;
     let changed = report.counts.downloaded + report.counts.uploaded + report.counts.removed > 0;
+    if changed || !report.errors.is_empty() {
+        let c = report.counts;
+        log::info!(
+            "sync: {} down, {} up, {} removed, {} error(s)",
+            c.downloaded,
+            c.uploaded,
+            c.removed,
+            report.errors.len()
+        );
+    }
+    for e in report.errors.iter().take(20) {
+        log::warn!("sync: {e}");
+    }
     set_status(app, |s| {
         s.last = report.counts;
         s.last_synced = Some(now_ms());
@@ -356,7 +397,7 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
     for rel in gone {
         let path = rel_path(root, &rel);
         if path.exists()
-            && let Err(e) = trash::delete(&path)
+            && let Err(e) = to_recycle_bin(&path)
         {
             report.errors.push(format!("Couldn't remove {rel}: {e}"));
             continue;
@@ -364,6 +405,11 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
         st.files.remove(&rel);
         report.counts.removed += 1;
     }
+
+    // Contents Drive already has (under any name). A local file with one of these is
+    // never worth keeping a second "(this device)" copy of.
+    let on_drive: HashSet<String> = remote.files.values().filter_map(|f| f.md5_checksum.clone()).collect();
+    let backed_up = |md5: &Option<String>| md5.as_ref().is_some_and(|m| on_drive.contains(m));
 
     // 2. Download anything new, changed, or missing locally (incl. local deletes).
     for (rel, item) in &remote.files {
@@ -384,8 +430,8 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
                     // Both sides already have the same bytes.
                     st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
                     false
-                } else if local.is_some() && local == s.md5 {
-                    true // only Drive changed: take its copy
+                } else if (local.is_some() && local == s.md5) || backed_up(&local) {
+                    true // only Drive changed (or ours is on Drive anyway): take its copy
                 } else if is_sidecar {
                     match merge_sidecar(g, item, &path).await {
                         Ok(true) => {
@@ -410,21 +456,28 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
                     true
                 }
             }
-        } else if item.md5_checksum.is_some() && md5_of(&path).await.ok() == item.md5_checksum {
-            // Same bytes already here (e.g. first sync, or state was lost). Just adopt it.
-            st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
-            false
-        } else if is_sidecar {
-            // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy.
-            true
         } else {
-            // A different local file with the same name: keep it under a new name
-            // (it'll upload in step 3) and download Drive's version.
-            if let Err(e) = set_aside(&path) {
-                report.errors.push(format!("Couldn't set aside local {rel}: {e}"));
-                continue;
+            let local = md5_of(&path).await.ok();
+            if item.md5_checksum.is_some() && local == item.md5_checksum {
+                // Same bytes already here (e.g. first sync, or state was lost). Just adopt it.
+                st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
+                false
+            } else if is_sidecar {
+                // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy.
+                true
+            } else if backed_up(&local) {
+                // Different from Drive's file of this name, but identical to another file
+                // on Drive: nothing would be lost, so don't make (and upload) another copy.
+                true
+            } else {
+                // A different local file with the same name: keep it under a new name
+                // (it'll upload in step 3) and download Drive's version.
+                if let Err(e) = set_aside(&path) {
+                    report.errors.push(format!("Couldn't set aside local {rel}: {e}"));
+                    continue;
+                }
+                true
             }
-            true
         };
         if need {
             match download(g, item, root, &path).await {
@@ -442,12 +495,15 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
 
     // 3. Upload local files Drive doesn't know about, and local edits to ones it does.
     let mut folders = remote.folders;
+    let mut ids: Vec<String> = Vec::new();
     let now = SystemTime::now();
     for local in local_files(root).await {
         if held_back.contains(&local.rel) {
             continue;
         }
-        let settled = now.duration_since(local.modified).is_ok_and(|age| age >= SETTLE);
+        // `changed` is the newer of modified and created time: File Explorer keeps a copied
+        // file's original modified time, so that alone can't tell a copy still in progress.
+        let settled = !local.busy && now.duration_since(local.changed).is_ok_and(|age| age >= SETTLE);
         if let Some(synced) = st.files.get(&local.rel).cloned() {
             // Already on Drive. Push local edits (a re-read or retyped sidecar, an image
             // edited in place), but only while Drive still has the version we last
@@ -456,7 +512,8 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
                 .files
                 .get(&local.rel)
                 .is_some_and(|r| r.id == synced.id && r.md5_checksum == synced.md5);
-            let maybe_edited = edited_after.is_none_or(|t| local.modified >= t);
+            let maybe_edited =
+                st.dirty.contains(&local.rel) || edited_after.is_none_or(|t| local.changed >= t);
             if !remote_unchanged || !maybe_edited {
                 continue;
             }
@@ -475,6 +532,7 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
             .await;
             match result {
                 Ok(item) => {
+                    check_uploaded(&mut st, &mut report, &local, &item).await;
                     st.files.insert(local.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
                     report.counts.uploaded += 1;
                 }
@@ -486,21 +544,60 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
             report.retry_soon = true;
             continue;
         }
+        // A "(this device)" copy sync made earlier, whose contents Drive has anyway (e.g.
+        // the conflict resolved itself): uploading it would only add a duplicate.
+        if is_conflict_copy(&local.rel)
+            && let Ok(md5) = md5_of(&local.path).await
+            && on_drive.contains(&md5)
+        {
+            log::info!("sync: removing {}: identical to a file already on Drive", local.rel);
+            match to_recycle_bin(&local.path) {
+                Ok(()) => report.counts.removed += 1,
+                Err(e) => report.errors.push(format!("Couldn't remove duplicate {}: {e}", local.rel)),
+            }
+            continue;
+        }
         let (dir, name) = local.rel.rsplit_once('/').unwrap_or(("", &local.rel));
         let result = async {
             let parent = ensure_folder(g, &mut folders, dir).await?;
             let bytes = tokio::fs::read(&local.path).await.map_err(|e| e.to_string())?;
-            g.upload(&parent, name, mime_for(name), bytes).await
+            let md5 = format!("{:x}", Md5::digest(&bytes));
+            // Same file as an upload that may have gone through earlier: same id.
+            let id = match st.pending.get(&local.rel) {
+                Some(p) if p.md5 == md5 => p.id.clone(),
+                _ => {
+                    if ids.is_empty() {
+                        ids = g.generate_ids(ID_BATCH).await?;
+                    }
+                    ids.pop().ok_or("Drive didn't reserve an id")?
+                }
+            };
+            st.pending.insert(local.rel.clone(), PendingUpload { id: id.clone(), md5 });
+            match g.upload(&parent, name, mime_for(name), bytes, &id).await {
+                Ok(item) => Ok(item),
+                // It may have arrived anyway (or on an earlier try): then that's our file.
+                Err(e) => match g.find(&id).await {
+                    Ok(Some(item)) => {
+                        log::info!("sync: {} was already on Drive; not uploading it again", local.rel);
+                        Ok(item)
+                    }
+                    _ => Err(e),
+                },
+            }
         }
         .await;
         match result {
             Ok(item) => {
+                st.pending.remove(&local.rel);
+                check_uploaded(&mut st, &mut report, &local, &item).await;
                 st.files.insert(local.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
                 report.counts.uploaded += 1;
             }
             Err(e) => report.errors.push(format!("Upload {}: {e}", local.rel)),
         }
     }
+    st.dirty.retain(|rel| st.files.contains_key(rel));
+    st.pending.retain(|rel, _| !st.files.contains_key(rel) && rel_path(root, rel).is_file());
 
     // Only move the change-feed bookmark past this pass if it fully succeeded. Otherwise
     // the next 30-second check sees "changes" and retries the failures right away,
@@ -546,13 +643,43 @@ async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result
     Ok(true)
 }
 
+/// Sends a file to the Recycle Bin / Trash (tests delete it outright, so they don't
+/// fill up the real Trash).
+fn to_recycle_bin(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    return std::fs::remove_file(path).map_err(|e| e.to_string());
+    #[cfg(not(test))]
+    return trash::delete(path).map_err(|e| e.to_string());
+}
+
 /// Moves a local file out of the way (`cat.png` -> `cat (this device).png`).
 fn set_aside(path: &Path) -> std::io::Result<()> {
     let to = conflict_path(path);
     std::fs::rename(path, &to)?;
+    log::info!("sync: kept local {} as {}", path.display(), to.display());
     note_own_write(path);
     note_own_write(&to);
     Ok(())
+}
+
+/// After an upload: if the file on disk no longer matches what Drive got (it was still
+/// being written), mark it so the next pass uploads it again, whatever its timestamps.
+async fn check_uploaded(st: &mut SyncState, report: &mut Report, local: &LocalFile, item: &DriveItem) {
+    let now = md5_of(&local.path).await.ok();
+    if item.md5_checksum.is_some() && now != item.md5_checksum {
+        log::info!("sync: {} changed while uploading; will upload again", local.rel);
+        st.dirty.insert(local.rel.clone());
+        report.retry_soon = true;
+    } else {
+        st.dirty.remove(&local.rel);
+    }
+}
+
+/// A file sync renamed out of the way in a conflict: `cat (this device).png`,
+/// `cat (this device 2).png`, also after Drive added its own ` (1AbCdE)` suffix.
+fn is_conflict_copy(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name.contains(" (this device)") || name.contains(" (this device ")
 }
 
 /// True if a file with exactly this name (same letter case) exists. On case-insensitive
@@ -712,8 +839,8 @@ pub async fn rename(app: &AppHandle, from: &Path, to: &Path) -> Result<(), Strin
             st.files.insert(new_rel, Synced { id: item.id, md5: item.md5_checksum });
             st.save(&data_dir)?;
         }
-        Ok(Err(e)) => eprintln!("[memeity] rename on Drive failed, sync will retry: {e}"),
-        Err(_) => eprintln!("[memeity] rename on Drive timed out, sync will retry"),
+        Ok(Err(e)) => log::warn!("rename on Drive failed, sync will retry: {e}"),
+        Err(_) => log::warn!("rename on Drive timed out, sync will retry"),
     }
     Ok(())
 }
@@ -782,7 +909,7 @@ fn finalize(held: &Path) {
     if held.exists()
         && let Err(e) = trash::delete(held)
     {
-        eprintln!("[memeity] couldn't move {} to the Recycle Bin: {e}", held.display());
+        log::warn!("couldn't move {} to the Recycle Bin: {e}", held.display());
         return;
     }
     if let Some(dir) = held.parent() {
@@ -963,7 +1090,34 @@ fn conflict_path(path: &Path) -> PathBuf {
 struct LocalFile {
     rel: String,
     path: PathBuf,
-    modified: SystemTime,
+    /// The newer of its modified and created times.
+    changed: SystemTime,
+    /// Another program (e.g. File Explorer mid-copy) has it open for writing.
+    busy: bool,
+}
+
+fn local_file(rel: String, path: PathBuf, meta: &std::fs::Metadata) -> LocalFile {
+    let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+    let changed = meta.created().map_or(modified, |c| c.max(modified));
+    let busy = being_written(&path);
+    LocalFile { rel, path, changed, busy }
+}
+
+/// Windows: a file another program is still writing can't be opened exclusively.
+#[cfg(windows)]
+fn being_written(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .is_err_and(|e| e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+}
+
+#[cfg(not(windows))]
+fn being_written(_path: &Path) -> bool {
+    false
 }
 
 /// `Library::scan`, off the async runtime's worker threads.
@@ -981,15 +1135,17 @@ fn local_files_blocking(root: &Path) -> Vec<LocalFile> {
     let mut files: Vec<LocalFile> = Library::scan(root)
         .memes
         .into_iter()
-        .map(|m| LocalFile { rel: m.rel, path: m.path, modified: m.modified })
+        .filter_map(|m| {
+            let meta = std::fs::metadata(&m.path).ok()?;
+            Some(local_file(m.rel, m.path, &meta))
+        })
         .collect();
     if let Ok(entries) = std::fs::read_dir(root.join(META_DIR)) {
         for entry in entries.flatten() {
             let rel = format!("{META_DIR}/{}", entry.file_name().to_string_lossy());
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_file() && sidecar::is_sidecar_rel(&rel) {
-                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-                files.push(LocalFile { rel, path: entry.path(), modified });
+                files.push(local_file(rel, entry.path(), &meta));
             }
         }
     }
@@ -1111,6 +1267,16 @@ mod tests {
         next_id: Mutex<u32>,
         fail_downloads: bool,
         renames: Mutex<u32>,
+        /// Runs during an upload, e.g. to finish writing the local file meanwhile.
+        on_upload: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// This many uploads reach Drive but report an error (connection dropped).
+        lost_replies: Mutex<u32>,
+        /// `find` fails (offline) while set.
+        find_offline: Mutex<bool>,
+        /// Ids left out of listings, like Drive's listing lagging behind.
+        unlisted: Mutex<HashSet<String>>,
+        /// Upload attempts, successful or not.
+        uploads: Mutex<u32>,
     }
 
     impl FakeDrive {
@@ -1119,11 +1285,14 @@ mod tests {
             self.insert(FakeFile { parent: parent.into(), name: name.into(), mime: mime.into(), bytes: bytes.to_vec() })
         }
         fn insert(&self, f: FakeFile) -> String {
-            let mut n = self.next_id.lock().unwrap();
-            *n += 1;
-            let id = format!("id{n:06}");
+            let id = self.new_id();
             self.files.lock().unwrap().insert(id.clone(), f);
             id
+        }
+        fn new_id(&self) -> String {
+            let mut n = self.next_id.lock().unwrap();
+            *n += 1;
+            format!("id{n:06}")
         }
         fn item(id: &str, f: &FakeFile) -> DriveItem {
             let is_folder = f.mime == FOLDER_MIME;
@@ -1154,7 +1323,12 @@ mod tests {
     impl Drive for FakeDrive {
         async fn list_children(&self, parent: &str) -> Result<Vec<DriveItem>, String> {
             let files = self.files.lock().unwrap();
-            Ok(files.iter().filter(|(_, f)| f.parent == parent).map(|(id, f)| Self::item(id, f)).collect())
+            let unlisted = self.unlisted.lock().unwrap();
+            Ok(files
+                .iter()
+                .filter(|(id, f)| f.parent == parent && !unlisted.contains(*id))
+                .map(|(id, f)| Self::item(id, f))
+                .collect())
         }
         async fn download(&self, id: &str) -> Result<Vec<u8>, String> {
             if self.fail_downloads {
@@ -1162,10 +1336,31 @@ mod tests {
             }
             Ok(self.get(id).bytes)
         }
-        async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+        async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>, id: &str) -> Result<DriveItem, String> {
+            *self.uploads.lock().unwrap() += 1;
+            if let Some(hook) = self.on_upload.lock().unwrap().take() {
+                hook();
+            }
+            if self.files.lock().unwrap().contains_key(id) {
+                return Err("409: a file already exists with the provided id".into());
+            }
             let f = FakeFile { parent: parent.into(), name: name.into(), mime: mime.into(), bytes };
-            let id = self.insert(f.clone());
-            Ok(Self::item(&id, &f))
+            self.files.lock().unwrap().insert(id.to_string(), f.clone());
+            let mut lost = self.lost_replies.lock().unwrap();
+            if *lost > 0 {
+                *lost -= 1;
+                return Err("connection reset".into());
+            }
+            Ok(Self::item(id, &f))
+        }
+        async fn generate_ids(&self, count: u32) -> Result<Vec<String>, String> {
+            Ok((0..count).map(|_| self.new_id()).collect())
+        }
+        async fn find(&self, id: &str) -> Result<Option<DriveItem>, String> {
+            if *self.find_offline.lock().unwrap() {
+                return Err("offline".into());
+            }
+            Ok(self.files.lock().unwrap().get(id).map(|f| Self::item(id, f)))
         }
         async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String> {
             Ok(self.insert(FakeFile { parent: parent.into(), name: name.into(), mime: FOLDER_MIME.into(), bytes: vec![] }))
@@ -1201,10 +1396,21 @@ mod tests {
     }
 
     /// Writes a local file that looks "settled" (old enough for sync to touch) but
-    /// still newer than the previous sync.
+    /// still newer than the previous sync. A brand-new file's creation time can't be
+    /// backdated, so that case waits out SETTLE for real.
     fn write_settled(path: &Path, bytes: &[u8]) {
+        let new = !path.exists();
         std::fs::write(path, bytes).unwrap();
         let t = SystemTime::now() - SETTLE - Duration::from_millis(500);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+        if new {
+            std::thread::sleep(SETTLE + Duration::from_millis(200));
+        }
+    }
+
+    /// Sets a file's modified time to long ago, as File Explorer does when copying.
+    fn backdate(path: &Path) {
+        let t = SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
         std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
     }
 
@@ -1337,6 +1543,105 @@ mod tests {
         assert_eq!(std::fs::read(root.join("b.png")).unwrap(), b"synced");
         assert_eq!(std::fs::read(root.join("b (this device).png")).unwrap(), b"unrelated");
         assert!(!root.join("a.png").exists());
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn file_still_being_copied_doesnt_snowball_into_duplicates() {
+        let (root, data) = dirs("half-copied");
+        let g = FakeDrive::default();
+        let cat = root.join("cat.png");
+        // Explorer: the copy keeps the source's (old) modified time from the start.
+        write_settled(&cat, b"half");
+        backdate(&cat);
+        // ...and finishes writing while the half-copied file is being uploaded.
+        let finish = cat.clone();
+        *g.on_upload.lock().unwrap() = Some(Box::new(move || {
+            std::fs::write(&finish, b"the whole meme").unwrap();
+            backdate(&finish);
+        }));
+
+        let first = cycle(&g, "root", &root, &data).await;
+        assert!(first.retry_soon, "an upload that no longer matches the file is redone");
+        for _ in 0..3 {
+            let r = cycle(&g, "root", &root, &data).await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+        }
+
+        assert_eq!(g.names(), ["cat.png"], "one file on Drive, no conflict copies");
+        let on_drive = g.files.lock().unwrap().values().next().unwrap().bytes.clone();
+        assert_eq!(on_drive, b"the whole meme");
+        let local: Vec<String> =
+            Library::scan(&root).memes.into_iter().map(|m| m.rel).collect();
+        assert_eq!(local, ["cat.png"]);
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn no_conflict_copy_when_drive_already_has_the_bytes() {
+        let (root, data) = dirs("backed-up");
+        let g = FakeDrive::default();
+        // Drive has two different files; this device has dog.png's bytes under cat.png
+        // (e.g. state was lost after a half-finished conflict).
+        g.add("root", "cat.png", b"cat");
+        g.add("root", "dog.png", b"dog");
+        write_settled(&root.join("cat.png"), b"dog");
+
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(g.names(), ["cat.png", "dog.png"], "nothing new uploaded");
+        assert!(!root.join("cat (this device).png").exists());
+        assert_eq!(std::fs::read(root.join("cat.png")).unwrap(), b"cat");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn leftover_conflict_copies_already_on_drive_are_removed() {
+        let (root, data) = dirs("leftover");
+        let g = FakeDrive::default();
+        g.add("root", "cat.png", b"meow");
+        write_settled(&root.join("cat (this device) (1AbCdE).png"), b"meow");
+
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(g.names(), ["cat.png"], "the duplicate isn't uploaded");
+        assert!(!root.join("cat (this device) (1AbCdE).png").exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn recognizes_conflict_copies() {
+        assert!(is_conflict_copy("a/cat (this device).png"));
+        assert!(is_conflict_copy("cat (this device 3).png"));
+        assert!(is_conflict_copy("cat (this device) (1AbCdE).png"));
+        assert!(!is_conflict_copy("this device.png"));
+    }
+
+    #[tokio::test]
+    async fn upload_whose_reply_was_lost_isnt_repeated() {
+        let (root, data) = dirs("lost-reply");
+        let g = FakeDrive::default();
+        write_settled(&root.join("cat.png"), b"meow");
+        // The upload reaches Drive but the reply is lost, and we can't check right away.
+        *g.lost_replies.lock().unwrap() = 1;
+        *g.find_offline.lock().unwrap() = true;
+        let first = cycle(&g, "root", &root, &data).await;
+        assert!(!first.errors.is_empty());
+
+        // Next pass: Drive's listing hasn't caught up yet, so it looks missing.
+        let id = g.files.lock().unwrap().keys().next().unwrap().clone();
+        g.unlisted.lock().unwrap().insert(id.clone());
+        *g.find_offline.lock().unwrap() = false;
+        let second = cycle(&g, "root", &root, &data).await;
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        g.unlisted.lock().unwrap().clear();
+        let third = cycle(&g, "root", &root, &data).await;
+        assert!(third.errors.is_empty(), "{:?}", third.errors);
+        assert_eq!(g.names(), ["cat.png"], "retried with the same id: one file on Drive");
+        assert_eq!(Library::scan(&root).memes.len(), 1, "no duplicate downloaded either");
         cleanup(&root);
     }
 

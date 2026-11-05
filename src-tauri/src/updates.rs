@@ -27,7 +27,7 @@ pub fn spawn(app: AppHandle) {
         tokio::time::sleep(FIRST_CHECK).await;
         loop {
             if let Err(e) = check(&app).await {
-                eprintln!("[memeity] update check failed: {e}");
+                log::warn!("update check failed: {e}");
             }
             tokio::time::sleep(CHECK_EVERY).await;
         }
@@ -97,7 +97,7 @@ pub fn tray_clicked(app: &AppHandle) {
             }
         };
         if let Err(e) = result {
-            eprintln!("[memeity] update: {e}");
+            log::warn!("update: {e}");
         }
     });
 }

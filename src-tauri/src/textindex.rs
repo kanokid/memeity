@@ -57,7 +57,7 @@ pub fn spawn(app: AppHandle, rx: Receiver<()>) {
         while rx.recv().is_ok() {
             while rx.try_recv().is_ok() {} // coalesce
             if let Err(e) = run(&app, &rx, &mut engine, &mut failures) {
-                eprintln!("[memeity] text indexing: {e}");
+                log::warn!("text indexing: {e}");
             }
         }
     });
@@ -256,7 +256,7 @@ fn run(
                 let sidecar_mtime = match sidecar::write(&root, &item.md5, &sc) {
                     Ok(()) => mtime_of(&sidecar::path(&root, &item.md5)),
                     Err(e) => {
-                        eprintln!("[memeity] couldn't write sidecar for {}: {e}", item.rel);
+                        log::warn!("couldn't write sidecar for {}: {e}", item.rel);
                         None
                     }
                 };
@@ -266,7 +266,7 @@ fn run(
             Err(e) => {
                 let attempts = failures.entry(item.rel.clone()).or_insert(0);
                 *attempts += 1;
-                eprintln!("[memeity] OCR failed for {} (attempt {attempts}): {e}", item.rel);
+                log::warn!("OCR failed for {} (attempt {attempts}): {e}", item.rel);
                 if *attempts >= OCR_ATTEMPTS {
                     // Really unreadable: index it as text-less so we stop retrying.
                     failures.remove(&item.rel);
@@ -309,7 +309,7 @@ fn prune_thumbs(app: &AppHandle, keep: &HashSet<String>) {
     if let Some(dir) = crate::thumbs::cache_dir(app) {
         let removed = crate::thumbs::prune(&dir, keep);
         if removed > 0 {
-            eprintln!("[memeity] cleared {removed} unused thumbnail(s)");
+            log::info!("cleared {removed} unused thumbnail(s)");
         }
     }
 }

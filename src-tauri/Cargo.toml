@@ -1,6 +1,6 @@
 [package]
 name = "memeity"
-version = "0.1.2"
+version = "0.1.3"
 description = "One meme folder, everywhere, with a Raycast-style search pane"
 edition = "2024"
 
@@ -48,6 +48,8 @@ enigo = "0.6"
 # OCR: PaddleOCR (PP-OCRv6) models on ONNX Runtime. Needs Rust 1.95+.
 oar-ocr = { version = "0.10", optional = true }
 tauri-plugin-updater = "2"
+log = "0.4"
+tauri-plugin-log = "2"
 
 [target.'cfg(windows)'.dependencies]
 # Instant insert: save/restore the clipboard and refocus the previous app.

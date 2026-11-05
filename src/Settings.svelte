@@ -42,7 +42,10 @@
   const isMac = navigator.userAgent.includes("Mac");
 
   let status = $state<Status | null>(null);
-  let section = $state<Section>("general");
+  // Opened at a section (e.g. from the pane's duplicates prompt): `index.html#duplicates`.
+  const sectionFrom = (id: string): Section | null =>
+    sections.some((s) => s.id === id) ? (id as Section) : null;
+  let section = $state<Section>(sectionFrom(location.hash.slice(1)) ?? "general");
   let error = $state<string | null>(null);
   let busy = $state(false);
   let now = $state(Date.now());
@@ -55,6 +58,14 @@
   async function refresh() {
     status = await invoke<Status>("get_status");
   }
+
+  let diagnosticsCopied = $state(false);
+  const copyDiagnostics = () =>
+    act(async () => {
+      await invoke("copy_diagnostics");
+      diagnosticsCopied = true;
+      setTimeout(() => (diagnosticsCopied = false), 2000);
+    });
 
   async function act(fn: () => Promise<unknown>) {
     if (busy) return;
@@ -207,7 +218,7 @@
     bytes: number;
   };
   type DupGroup = { exact: boolean; items: DupItem[] };
-  type Duplicates = { groups: DupGroup[]; pending: number };
+  type Duplicates = { groups: DupGroup[]; pending: number; exact_extras: number };
 
   let dupes = $state<Duplicates | null>(null);
   let dupesLoading = $state(false);
@@ -228,6 +239,20 @@
   $effect(() => {
     if (section === "duplicates" && !dupes && !dupesLoading) loadDupes();
   });
+
+  // Removing every identical copy at once asks for a second click to confirm.
+  let confirmRemoveAll = $state(false);
+  let removedAll = $state<number | null>(null);
+  const removeAllExact = () =>
+    act(async () => {
+      if (!confirmRemoveAll) {
+        confirmRemoveAll = true;
+        return;
+      }
+      confirmRemoveAll = false;
+      removedAll = await invoke<number>("remove_exact_duplicates");
+      await loadDupes();
+    });
 
   const deleteDupe = (item: DupItem) =>
     act(async () => {
@@ -278,6 +303,12 @@
     refresh();
     const unlisten = ["sync-status", "ocr-status", "library-changed", "update-status"].map((e) =>
       listen(e, () => refresh()),
+    );
+    unlisten.push(
+      listen<string>("show-section", (e) => {
+        const next = sectionFrom(e.payload);
+        if (next) section = next;
+      }),
     );
     const timer = setInterval(() => (now = Date.now()), 5000);
     return () => {
@@ -494,6 +525,31 @@
         </div>
       {/if}
 
+      {#if removedAll !== null}
+        <div class="undo-bar" role="status">
+          <span>
+            Removed {removedAll} identical cop{removedAll === 1 ? "y" : "ies"}. They're in Google Drive's trash for 30 days
+            if you need one back.
+          </span>
+          <button class="btn outline sm" onclick={() => (removedAll = null)}>OK</button>
+        </div>
+      {/if}
+
+      {#if dupes && dupes.exact_extras > 0}
+        <div class="card remove-all">
+          <div>
+            <h3>{dupes.exact_extras} identical cop{dupes.exact_extras === 1 ? "y" : "ies"}</h3>
+            <p class="muted small">
+              Byte-for-byte the same as another meme. Removing them keeps the best copy of each (highest resolution, then
+              oldest).
+            </p>
+          </div>
+          <button class="btn sm danger" onclick={removeAllExact} disabled={busy}>
+            {confirmRemoveAll ? `Remove ${dupes.exact_extras}? Click again` : "Remove copies"}
+          </button>
+        </div>
+      {/if}
+
       {#if dupes && dupes.pending > 0}
         <p class="note top">
           Still fingerprinting {dupes.pending} meme{dupes.pending === 1 ? "" : "s"} in the background. Look-alikes among
@@ -553,6 +609,15 @@
           <button class="btn outline sm" onclick={() => openLink("website")}>Website</button>
           <button class="btn outline sm" onclick={() => openLink("privacy")}>Privacy policy</button>
           <button class="btn outline sm" onclick={() => openLink("source")}>Source code</button>
+        </div>
+        <div class="diagnostics">
+          <button class="btn ghost sm" onclick={copyDiagnostics} disabled={busy}>
+            {diagnosticsCopied ? "Copied" : "Copy diagnostics"}
+          </button>
+          <p class="muted small">
+            Version, sync status and recent log lines, for a bug report. Paste it somewhere to check it first: it
+            includes file names from your meme folder.
+          </p>
         </div>
       </div>
     {/if}
@@ -900,6 +965,22 @@
     font-size: 12px;
   }
 
+  .remove-all {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 12px;
+  }
+
+  .remove-all h3 {
+    margin: 0 0 2px;
+  }
+
+  .remove-all .btn {
+    flex-shrink: 0;
+  }
+
   .undo-bar {
     display: flex;
     align-items: center;
@@ -989,5 +1070,15 @@
   .about .muted {
     margin: 0 0 18px;
     font-size: 13px;
+  }
+
+  .diagnostics {
+    margin-top: 28px;
+  }
+
+  .about .diagnostics .muted {
+    max-width: 380px;
+    margin: 6px auto 0;
+    font-size: 11px;
   }
 </style>

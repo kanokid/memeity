@@ -37,6 +37,8 @@ use tauri_plugin_global_shortcut::{Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
 const PANE: &str = "pane";
+/// Log file name (without extension) in the OS log folder.
+const LOG_FILE: &str = "memeity";
 const CLIENT_FILE: &str = "google-client.json";
 /// Fixed content size of the window (Raycast's default), matching tauri.conf.json.
 const PANE_WIDTH: f64 = 750.0;
@@ -104,7 +106,7 @@ fn update_config(app: &AppHandle, f: impl FnOnce(&mut Config)) {
     f(&mut cfg);
     if let Ok(dir) = app.path().app_config_dir()
         && let Err(e) = cfg.save(&dir) {
-            eprintln!("[memeity] couldn't save config: {e}");
+            log::warn!("couldn't save config: {e}");
         }
 }
 
@@ -384,7 +386,7 @@ fn load_library(app: &AppHandle) {
         return;
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("[memeity] couldn't create {}: {e}", dir.display());
+        log::warn!("couldn't create {}: {e}", dir.display());
     }
     sync::sweep_held_deletes(&dir);
     let cache = state.library.read().unwrap().dims_cache();
@@ -402,7 +404,7 @@ fn open_index(app: &AppHandle) -> Option<index::Index> {
     let dir = app.path().app_data_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
     index::Index::open(&dir.join("index.sqlite"))
-        .inspect_err(|e| eprintln!("[memeity] couldn't open search index: {e}"))
+        .inspect_err(|e| log::warn!("couldn't open search index: {e}"))
         .ok()
 }
 
@@ -520,7 +522,7 @@ fn record_use(app: &AppHandle, path: &std::path::Path) {
     if let Some(idx) = app.state::<AppState>().index.lock().unwrap().as_ref()
         && let Err(e) = idx.record_use(&rel, now_ms())
     {
-        eprintln!("[memeity] couldn't record use: {e}");
+        log::warn!("couldn't record use: {e}");
     }
 }
 
@@ -591,6 +593,65 @@ struct Duplicates {
     groups: Vec<DuplicateGroup>,
     /// Memes not yet fingerprinted (near-duplicates among them aren't found yet).
     pending: usize,
+    /// Byte-identical extra copies (every copy but the best of each set).
+    exact_extras: usize,
+}
+
+/// Best copy first: highest resolution, then biggest file, then oldest.
+fn best_first(items: &mut [DuplicateItem]) {
+    items.sort_by_key(|i| {
+        let area = u64::from(i.hit.width.unwrap_or(0)) * u64::from(i.hit.height.unwrap_or(0));
+        (std::cmp::Reverse(area), std::cmp::Reverse(i.bytes), i.hit.version)
+    });
+}
+
+fn duplicate_item(hit: library::Hit) -> DuplicateItem {
+    let bytes = std::fs::metadata(&hit.path).map(|m| m.len()).unwrap_or(0);
+    DuplicateItem { hit, bytes }
+}
+
+/// Every byte-identical copy of a meme except the best one of each set.
+fn exact_extras(app: &AppHandle) -> Result<Vec<library::Hit>, String> {
+    let state = app.state::<AppState>();
+    let candidates = {
+        let guard = state.index.lock().unwrap();
+        let idx = guard.as_ref().ok_or("The search index isn't available.")?;
+        idx.duplicate_candidates().map_err(|e| e.to_string())?
+    };
+    let mut by_md5: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+    for c in &candidates {
+        by_md5.entry(&c.md5).or_default().push(&c.rel);
+    }
+    let lib = state.library.read().unwrap();
+    let mut extras = Vec::new();
+    for rels in by_md5.values().filter(|r| r.len() > 1) {
+        let mut items: Vec<DuplicateItem> = rels.iter().filter_map(|rel| lib.hit_for(rel)).map(duplicate_item).collect();
+        best_first(&mut items);
+        extras.extend(items.into_iter().skip(1).map(|i| i.hit));
+    }
+    Ok(extras)
+}
+
+/// How many identical extra copies the library has (for the pane's cleanup prompt).
+#[tauri::command(async)]
+fn duplicate_count(app: AppHandle) -> usize {
+    exact_extras(&app).map(|e| e.len()).unwrap_or(0)
+}
+
+/// Deletes every identical extra copy, keeping the best of each set. They go to Drive's
+/// trash (30 days) and this device's Recycle Bin. Returns how many were removed.
+#[tauri::command]
+async fn remove_exact_duplicates(app: AppHandle) -> Result<usize, String> {
+    let extras = exact_extras(&app)?;
+    let mut removed = 0;
+    for hit in &extras {
+        sync::delete(&app, std::path::Path::new(&hit.path)).await?;
+        removed += 1;
+    }
+    log::info!("removed {removed} identical duplicate(s)");
+    refresh_library(&app);
+    textindex::trigger(&app);
+    Ok(removed)
 }
 
 #[tauri::command(async)]
@@ -604,27 +665,18 @@ fn find_duplicates(app: AppHandle) -> Result<Duplicates, String> {
         (candidates, pending)
     };
     let groups = dupes::group(&candidates);
+    let exact_extras = exact_extras(&app).map(|e| e.len()).unwrap_or(0);
     let lib = state.library.read().unwrap();
     let groups = groups
         .into_iter()
         .filter_map(|g| {
-            let mut items: Vec<DuplicateItem> = g
-                .rels
-                .iter()
-                .filter_map(|rel| lib.hit_for(rel))
-                .map(|hit| {
-                    let bytes = std::fs::metadata(&hit.path).map(|m| m.len()).unwrap_or(0);
-                    DuplicateItem { hit, bytes }
-                })
-                .collect();
-            items.sort_by_key(|i| {
-                let area = u64::from(i.hit.width.unwrap_or(0)) * u64::from(i.hit.height.unwrap_or(0));
-                (std::cmp::Reverse(area), std::cmp::Reverse(i.bytes), i.hit.version)
-            });
+            let mut items: Vec<DuplicateItem> =
+                g.rels.iter().filter_map(|rel| lib.hit_for(rel)).map(duplicate_item).collect();
+            best_first(&mut items);
             (items.len() > 1).then_some(DuplicateGroup { exact: g.exact, items })
         })
         .collect();
-    Ok(Duplicates { groups, pending })
+    Ok(Duplicates { groups, pending, exact_extras })
 }
 
 /// The meme's library root and relative path, checking it's actually in the library.
@@ -819,6 +871,48 @@ async fn setup_drive_folder(app: AppHandle) -> Result<Status, String> {
     Ok(status(&app))
 }
 
+/// Copies a bug-report-ready summary to the clipboard: version, OS, sync and text-search
+/// status, and the end of the log. (Not the account email.)
+#[tauri::command(async)]
+fn copy_diagnostics(app: AppHandle) -> Result<(), String> {
+    /// How much of the log to include.
+    const LOG_LINES: usize = 300;
+    let s = status(&app);
+    let mut out = format!(
+        "memeity {} on {} {}\nstage: {}\nmemes: {} ({} with text read)\nsync: {} {}\n\
+         last sync: {} down, {} up, {} removed\ntext: {} {}/{} {}\nshortcut: {}{}\n",
+        s.version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        s.stage,
+        s.count,
+        s.text_indexed,
+        s.sync.state,
+        s.sync.message.as_deref().unwrap_or(""),
+        s.sync.last.downloaded,
+        s.sync.last.uploaded,
+        s.sync.last.removed,
+        s.ocr.state,
+        s.ocr.done,
+        s.ocr.total,
+        s.ocr.message.as_deref().unwrap_or(""),
+        s.shortcut,
+        s.shortcut_error.map(|e| format!(" ({e})")).unwrap_or_default(),
+    );
+    let log = app
+        .path()
+        .app_log_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join(format!("{LOG_FILE}.log"))).ok())
+        .unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    out.push_str(&format!("\n--- last {} log lines ---\n", lines.len().min(LOG_LINES)));
+    out.push_str(&lines[lines.len().saturating_sub(LOG_LINES)..].join("\n"));
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(out))
+        .map_err(|e| format!("Couldn't copy to the clipboard: {e}"))
+}
+
 #[tauri::command]
 fn sync_now(app: AppHandle) {
     sync::trigger(&app);
@@ -922,6 +1016,26 @@ pub fn run() {
                 responder.respond(thumbs::respond(app, uri_path, full).await);
             });
         })
+        // A small rotating log in the OS log folder (and the terminal in dev), so problems
+        // users hit can be diagnosed: Settings > About > Copy diagnostics.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                    file_name: Some(LOG_FILE.into()),
+                }))
+                .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout))
+                .level(log::LevelFilter::Info)
+                // Dependencies' chatter (HTTP internals etc.) only when it's a problem.
+                .level_for("reqwest", log::LevelFilter::Warn)
+                .level_for("hyper", log::LevelFilter::Warn)
+                .level_for("hyper_util", log::LevelFilter::Warn)
+                .level_for("ort", log::LevelFilter::Warn)
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -945,6 +1059,8 @@ pub fn run() {
             meme_text,
             rename_meme,
             find_duplicates,
+            duplicate_count,
+            remove_exact_duplicates,
             set_meme_text,
             insert_meme,
             reveal_meme,
@@ -955,6 +1071,7 @@ pub fn run() {
             sign_out_cmd,
             setup_drive_folder,
             sync_now,
+            copy_diagnostics,
             open_folder,
             open_setup_link,
             hide,
@@ -974,6 +1091,12 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            log::info!(
+                "memeity {} starting on {} {}",
+                app.package_info().version,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
             let config_dir = app.path().app_config_dir()?;
             // memeity's built-in client; a user-supplied one only for builds without it.
             let creds = google::embedded_client().or_else(|| {

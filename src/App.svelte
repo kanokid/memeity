@@ -405,6 +405,38 @@
     }
   }
 
+  // ---------- duplicate cleanup prompt ----------
+
+  /** Identical extra copies in the library (e.g. left over from a sync problem). */
+  let duplicateCount = $state(0);
+  /** The count the user last dismissed the prompt at; it comes back only if it grows. */
+  let duplicatesDismissedAt = $state(readDismissed());
+
+  function readDismissed(): number {
+    try {
+      return Number(localStorage.getItem("duplicatesDismissedAt") ?? 0) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function checkDuplicates() {
+    try {
+      duplicateCount = await invoke<number>("duplicate_count");
+    } catch {
+      duplicateCount = 0; // just a hint; never worth an error banner
+    }
+  }
+
+  function dismissDuplicates() {
+    duplicatesDismissedAt = duplicateCount;
+    try {
+      localStorage.setItem("duplicatesDismissedAt", String(duplicateCount));
+    } catch {
+      // private mode etc.: it simply comes back next launch
+    }
+  }
+
   /** The shortcut was taken at startup: try registering it again. */
   const retryShortcut = () =>
     act(async () => {
@@ -841,8 +873,10 @@
   // ---------- lifecycle ----------
 
   onMount(() => {
+    checkDuplicates();
     const unlisten = [
       listen("pane-shown", () => {
+        checkDuplicates();
         error = null;
         confirmDelete = null;
         menu = null;
@@ -962,6 +996,17 @@
       <span class="banner-actions">
         <button class="btn sm" onclick={() => invoke("open_settings")}>Choose another…</button>
         <button class="btn ghost sm" onclick={retryShortcut} disabled={busy}>Try again</button>
+      </span>
+    </div>
+  {/if}
+  {#if stage === "ready" && duplicateCount > duplicatesDismissedAt}
+    <div class="banner shortcut-banner" role="status">
+      <span>
+        Found {duplicateCount} identical cop{duplicateCount === 1 ? "y" : "ies"} of memes in your library.
+      </span>
+      <span class="banner-actions">
+        <button class="btn sm" onclick={() => invoke("open_settings", { section: "duplicates" })}>Review…</button>
+        <button class="btn ghost sm" onclick={dismissDuplicates}>Dismiss</button>
       </span>
     </div>
   {/if}

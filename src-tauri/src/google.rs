@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -83,7 +83,9 @@ pub struct Google {
     creds: Mutex<Option<ClientCreds>>,
     refresh_token: Mutex<Option<String>>,
     /// Cached access token, its expiry, and the sign-in `epoch` it belongs to.
-    access: tokio::sync::Mutex<Option<(String, Instant, u64)>>,
+    /// Expiry is wall-clock time: `Instant` stops while a Mac sleeps, so after a long
+    /// sleep an expired token would still look fresh (and every Drive call get a 401).
+    access: tokio::sync::Mutex<Option<(String, SystemTime, u64)>>,
     /// Bumped on every sign-out. A cached (or in-flight) access token from an older
     /// epoch is never used, even if a sync held the `access` lock while signing out.
     epoch: AtomicU64,
@@ -123,11 +125,12 @@ impl Google {
     pub fn new(creds: Option<ClientCreds>) -> Self {
         let refresh = keyring_entry().ok().and_then(|e| e.get_password().ok());
         Google {
-            // No overall timeout (big downloads take a while), but don't hang forever
-            // on a dead connection either.
+            // No overall or read timeout: a big upload can go a long time without hearing
+            // back, and timing out one Drive already accepted would upload it twice.
+            // Keepalives still notice a dead connection.
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
-                .read_timeout(Duration::from_secs(60))
+                .tcp_keepalive(Duration::from_secs(30))
                 .build()
                 .expect("HTTP client builds"),
             creds: Mutex::new(creds),
@@ -157,7 +160,7 @@ impl Google {
                 // Best effort: if this fails (offline), the token is still gone from
                 // this device; the user can revoke it at myaccount.google.com/permissions.
                 if let Err(e) = http.post(REVOKE_URL).form(&[("token", refresh.as_str())]).send().await {
-                    eprintln!("[memeity] couldn't revoke the Google sign-in: {e}");
+                    log::warn!("couldn't revoke the Google sign-in: {e}");
                 }
             });
         }
@@ -247,7 +250,7 @@ impl Google {
         let epoch = self.epoch.load(Ordering::SeqCst);
         if let Some((token, expires, at)) = access.as_ref()
             && *at == epoch
-            && Instant::now() < *expires
+            && SystemTime::now() < *expires
         {
             return Ok(token.clone());
         }
@@ -282,6 +285,26 @@ impl Google {
         Ok(token.access_token)
     }
 
+    /// Sends an authorized Drive request. If Google rejects the access token anyway
+    /// (401: revoked early, clock changes...), drops it, gets a fresh one and retries once.
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+        let retry = req.try_clone();
+        let token = self.token().await?;
+        let resp = req.bearer_auth(&token).send().await.map_err(net)?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        let Some(retry) = retry else { return Ok(resp) };
+        {
+            let mut access = self.access.lock().await;
+            if access.as_ref().is_some_and(|(cached, _, _)| *cached == token) {
+                *access = None;
+            }
+        }
+        let token = self.token().await?;
+        retry.bearer_auth(token).send().await.map_err(net)
+    }
+
     // ---------- Drive ----------
 
     pub async fn account_email(&self) -> Result<String, String> {
@@ -296,13 +319,12 @@ impl Google {
             email_address: String,
         }
         let resp = self
-            .http
-            .get(format!("{DRIVE}/about"))
-            .query(&[("fields", "user(emailAddress)")])
-            .bearer_auth(self.token().await?)
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .get(format!("{DRIVE}/about"))
+                    .query(&[("fields", "user(emailAddress)")])
+            )
+            .await?;
         let about: About = check(resp).await?.json().await.map_err(net)?;
         Ok(about.user.email_address)
     }
@@ -322,7 +344,6 @@ impl Google {
             let mut req = self
                 .http
                 .get(format!("{DRIVE}/files"))
-                .bearer_auth(self.token().await?)
                 .query(&[("q", q), ("fields", &fields), ("pageSize", "1000"), ("spaces", "drive")]);
             if let Some(order) = order_by {
                 req = req.query(&[("orderBy", order)]);
@@ -330,7 +351,7 @@ impl Google {
             if let Some(token) = &page_token {
                 req = req.query(&[("pageToken", token.as_str())]);
             }
-            let page: Page = check(req.send().await.map_err(net)?).await?.json().await.map_err(net)?;
+            let page: Page = check(self.send(req).await?).await?.json().await.map_err(net)?;
             out.extend(page.files);
             match page.next_page_token {
                 Some(t) => page_token = Some(t),
@@ -366,19 +387,31 @@ impl Google {
 
     pub async fn download(&self, id: &str) -> Result<Vec<u8>, String> {
         let resp = self
-            .http
-            .get(format!("{DRIVE}/files/{id}"))
-            .query(&[("alt", "media")])
-            .bearer_auth(self.token().await?)
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .get(format!("{DRIVE}/files/{id}"))
+                    .query(&[("alt", "media")])
+            )
+            .await?;
         Ok(check(resp).await?.bytes().await.map_err(net)?.to_vec())
     }
 
-    pub async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+    /// Uploads a new file. With `id` (from `generate_ids`), uploading the same file again
+    /// after an unclear failure can't make a second copy: Drive refuses a reused id.
+    pub async fn upload(
+        &self,
+        parent: &str,
+        name: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+        id: Option<&str>,
+    ) -> Result<DriveItem, String> {
         let boundary = format!("memeity-{}", random_string(16));
-        let meta = serde_json::json!({ "name": name, "parents": [parent] }).to_string();
+        let mut meta = serde_json::json!({ "name": name, "parents": [parent] });
+        if let Some(id) = id {
+            meta["id"] = id.into();
+        }
+        let meta = meta.to_string();
         let mut body = Vec::with_capacity(bytes.len() + 512);
         body.extend_from_slice(
             format!(
@@ -391,28 +424,67 @@ impl Google {
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
         let resp = self
-            .http
-            .post(UPLOAD)
-            .query(&[("uploadType", "multipart"), ("fields", ITEM_FIELDS)])
-            .bearer_auth(self.token().await?)
-            .header(reqwest::header::CONTENT_TYPE, format!("multipart/related; boundary={boundary}"))
-            .body(body)
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .post(UPLOAD)
+                    .query(&[("uploadType", "multipart"), ("fields", ITEM_FIELDS)])
+                    .header(reqwest::header::CONTENT_TYPE, format!("multipart/related; boundary={boundary}"))
+                    .body(body)
+            )
+            .await?;
         check(resp).await?.json().await.map_err(net)
+    }
+
+    /// Reserves ids for files memeity is about to upload.
+    pub async fn generate_ids(&self, count: u32) -> Result<Vec<String>, String> {
+        #[derive(Deserialize)]
+        struct Ids {
+            ids: Vec<String>,
+        }
+        let count = count.to_string();
+        let resp = self
+            .send(
+                self.http
+                    .get(format!("{DRIVE}/files/generateIds"))
+                    .query(&[("count", count.as_str()), ("space", "drive"), ("type", "files")]),
+            )
+            .await?;
+        let ids: Ids = check(resp).await?.json().await.map_err(net)?;
+        Ok(ids.ids)
+    }
+
+    /// A file by id, if it exists and isn't in the trash.
+    pub async fn find(&self, id: &str) -> Result<Option<DriveItem>, String> {
+        #[derive(Deserialize)]
+        struct Found {
+            #[serde(flatten)]
+            item: DriveItem,
+            #[serde(default)]
+            trashed: bool,
+        }
+        let resp = self
+            .send(
+                self.http
+                    .get(format!("{DRIVE}/files/{id}"))
+                    .query(&[("fields", format!("{ITEM_FIELDS},trashed"))]),
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let found: Found = check(resp).await?.json().await.map_err(net)?;
+        Ok((!found.trashed).then_some(found.item))
     }
 
     pub async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String> {
         let resp = self
-            .http
-            .post(format!("{DRIVE}/files"))
-            .query(&[("fields", "id")])
-            .bearer_auth(self.token().await?)
-            .json(&serde_json::json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent] }))
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .post(format!("{DRIVE}/files"))
+                    .query(&[("fields", "id")])
+                    .json(&serde_json::json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent] }))
+            )
+            .await?;
         #[derive(Deserialize)]
         struct Created {
             id: String,
@@ -427,12 +499,11 @@ impl Google {
             .http
             .patch(format!("{DRIVE}/files/{id}"))
             .query(&[("fields", ITEM_FIELDS)])
-            .bearer_auth(self.token().await?)
             .json(&serde_json::json!({ "name": new_name }));
         if let Some((add, remove)) = reparent {
             req = req.query(&[("addParents", add), ("removeParents", remove)]);
         }
-        check(req.send().await.map_err(net)?).await?.json().await.map_err(net)
+        check(self.send(req).await?).await?.json().await.map_err(net)
     }
 
     /// A bookmark for "now" in this account's Drive change feed.
@@ -443,12 +514,11 @@ impl Google {
             start_page_token: String,
         }
         let resp = self
-            .http
-            .get(format!("{DRIVE}/changes/startPageToken"))
-            .bearer_auth(self.token().await?)
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .get(format!("{DRIVE}/changes/startPageToken"))
+            )
+            .await?;
         let token: Token = check(resp).await?.json().await.map_err(net)?;
         Ok(token.start_page_token)
     }
@@ -468,18 +538,17 @@ impl Google {
         let mut token = token.to_string();
         loop {
             let resp = self
-                .http
-                .get(format!("{DRIVE}/changes"))
-                .query(&[
-                    ("pageToken", token.as_str()),
-                    ("pageSize", "100"),
-                    ("spaces", "drive"),
-                    ("fields", "nextPageToken,newStartPageToken,changes(fileId)"),
-                ])
-                .bearer_auth(self.token().await?)
-                .send()
-                .await
-                .map_err(net)?;
+                .send(
+                    self.http
+                        .get(format!("{DRIVE}/changes"))
+                        .query(&[
+                            ("pageToken", token.as_str()),
+                            ("pageSize", "100"),
+                            ("spaces", "drive"),
+                            ("fields", "nextPageToken,newStartPageToken,changes(fileId)"),
+                        ])
+                )
+                .await?;
             let page: Page = check(resp).await?.json().await.map_err(net)?;
             if !page.changes.is_empty() {
                 return Ok(None);
@@ -495,47 +564,44 @@ impl Google {
     /// Replaces an existing file's contents (same id, name and folder).
     pub async fn update_content(&self, id: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
         let resp = self
-            .http
-            .patch(format!("{UPLOAD}/{id}"))
-            .query(&[("uploadType", "media"), ("fields", ITEM_FIELDS)])
-            .bearer_auth(self.token().await?)
-            .header(reqwest::header::CONTENT_TYPE, mime)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .patch(format!("{UPLOAD}/{id}"))
+                    .query(&[("uploadType", "media"), ("fields", ITEM_FIELDS)])
+                    .header(reqwest::header::CONTENT_TYPE, mime)
+                    .body(bytes)
+            )
+            .await?;
         check(resp).await?.json().await.map_err(net)
     }
 
     /// Takes a file back out of Drive's trash (for Undo).
     pub async fn untrash(&self, id: &str) -> Result<(), String> {
         let resp = self
-            .http
-            .patch(format!("{DRIVE}/files/{id}"))
-            .bearer_auth(self.token().await?)
-            .json(&serde_json::json!({ "trashed": false }))
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .patch(format!("{DRIVE}/files/{id}"))
+                    .json(&serde_json::json!({ "trashed": false }))
+            )
+            .await?;
         check(resp).await.map(|_| ())
     }
 
     /// Moves a file to Drive's trash (recoverable for 30 days), not a permanent delete.
     pub async fn trash(&self, id: &str) -> Result<(), String> {
         let resp = self
-            .http
-            .patch(format!("{DRIVE}/files/{id}"))
-            .bearer_auth(self.token().await?)
-            .json(&serde_json::json!({ "trashed": true }))
-            .send()
-            .await
-            .map_err(net)?;
+            .send(
+                self.http
+                    .patch(format!("{DRIVE}/files/{id}"))
+                    .json(&serde_json::json!({ "trashed": true }))
+            )
+            .await?;
         check(resp).await.map(|_| ())
     }
 }
 
-fn expiry(expires_in: u64) -> Instant {
-    Instant::now() + Duration::from_secs(expires_in.saturating_sub(60))
+fn expiry(expires_in: u64) -> SystemTime {
+    SystemTime::now() + Duration::from_secs(expires_in.saturating_sub(60))
 }
 
 /// The page the browser lands on after Google sign-in.

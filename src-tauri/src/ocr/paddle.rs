@@ -134,7 +134,7 @@ fn ensure_file(dir: &Path, file: &ModelFile) -> Result<(), String> {
             Err(e) => last_err = e,
         }
         let _ = std::fs::remove_file(&part);
-        eprintln!("[memeity] model download attempt {attempt} for {} failed: {last_err}", file.name);
+        log::warn!("model download attempt {attempt} for {} failed: {last_err}", file.name);
         std::thread::sleep(Duration::from_secs(2 * attempt));
     }
     Err(format!("Couldn't download the text recognition model: {last_err}"))
