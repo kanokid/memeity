@@ -6,6 +6,8 @@
 
 <p align="center"><i>hey, it's me, it's memeity</i></p>
 
+![screenshot](https://github.com/user-attachments/assets/86f236ac-758f-42f6-ad31-b3b42370664d)
+
 ## What is this?
 Picture this: you're chatting with your friends, when all of a sudden, you've thought of the perfect meme for the occasion! Quickly, you search your downloads folder, only to realize that you've forgotten the filename! (or worse, that the meme is on your other computer!)
 
