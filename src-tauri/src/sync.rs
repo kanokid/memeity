@@ -1396,15 +1396,17 @@ mod tests {
     }
 
     /// Writes a local file that looks "settled" (old enough for sync to touch) but
-    /// still newer than the previous sync. A brand-new file's creation time can't be
-    /// backdated, so that case waits out SETTLE for real.
+    /// still newer than the previous sync. A file's creation time can't be backdated
+    /// (macOS moves it back along with the modified time, Windows doesn't), so a
+    /// recently created file waits out SETTLE for real.
     fn write_settled(path: &Path, bytes: &[u8]) {
-        let new = !path.exists();
         std::fs::write(path, bytes).unwrap();
         let t = SystemTime::now() - SETTLE - Duration::from_millis(500);
         std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
-        if new {
-            std::thread::sleep(SETTLE + Duration::from_millis(200));
+        let created = std::fs::metadata(path).unwrap().created().unwrap_or(UNIX_EPOCH);
+        let age = SystemTime::now().duration_since(created).unwrap_or_default();
+        if age < SETTLE {
+            std::thread::sleep(SETTLE - age + Duration::from_millis(200));
         }
     }
 
