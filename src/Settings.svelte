@@ -24,6 +24,8 @@
     sync: SyncStatus;
     ocr: OcrStatus;
     autostart: boolean;
+    /** A newer published version, if one is waiting. */
+    update: string | null;
     primary_action: "paste" | "copy";
     version: string;
   };
@@ -170,6 +172,29 @@
 
   const openLink = (target: string) => act(() => invoke("open_link", { target }));
 
+  // ---------- updates ----------
+
+  let checking = $state(false);
+  let upToDate = $state(false);
+
+  async function checkUpdate() {
+    checking = true;
+    upToDate = false;
+    error = null;
+    try {
+      const version = await invoke<string | null>("check_for_update");
+      upToDate = version === null;
+      await refresh();
+    } catch (e) {
+      error = `Couldn't check for updates: ${e}`;
+    } finally {
+      checking = false;
+    }
+  }
+
+  // Downloads, installs and restarts memeity (the window closes on success).
+  const installUpdate = () => act(() => invoke("install_update"));
+
   // ---------- duplicates ----------
 
   type DupItem = {
@@ -251,7 +276,9 @@
 
   onMount(() => {
     refresh();
-    const unlisten = ["sync-status", "ocr-status", "library-changed"].map((e) => listen(e, () => refresh()));
+    const unlisten = ["sync-status", "ocr-status", "library-changed", "update-status"].map((e) =>
+      listen(e, () => refresh()),
+    );
     const timer = setInterval(() => (now = Date.now()), 5000);
     return () => {
       clearInterval(timer);
@@ -510,6 +537,18 @@
         <img src={logo} alt="memeity" width="72" height="72" />
         <h1>memeity</h1>
         <p class="muted">Version {status.version}</p>
+        <div class="update-row">
+          {#if status.update}
+            <button class="btn primary sm" onclick={installUpdate} disabled={busy}>
+              {busy ? "Updating…" : `Update to ${status.update}`}
+            </button>
+          {:else}
+            <button class="btn outline sm" onclick={checkUpdate} disabled={busy || checking}>
+              {checking ? "Checking…" : "Check for Updates"}
+            </button>
+          {/if}
+          {#if upToDate}<span class="muted small">memeity is up to date.</span>{/if}
+        </div>
         <div class="buttons center">
           <button class="btn outline sm" onclick={() => openLink("website")}>Website</button>
           <button class="btn outline sm" onclick={() => openLink("privacy")}>Privacy policy</button>
@@ -927,6 +966,14 @@
     color: var(--muted-fg);
     font-size: 11px;
     font-weight: 500;
+  }
+
+  .update-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin: -6px 0 18px;
   }
 
   .about {

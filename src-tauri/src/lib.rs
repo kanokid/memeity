@@ -16,6 +16,7 @@ mod sidecar;
 mod sync;
 mod textindex;
 mod thumbs;
+mod updates;
 mod watcher;
 
 use config::{Config, DriveFolder};
@@ -59,6 +60,10 @@ pub struct AppState {
     /// Memes this device just downloaded from Drive, and when. OCR waits a little for
     /// their sidecars (the device that added them is already reading their text).
     pub arrived: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// A newer published version, if the updater found one (e.g. "0.2.0").
+    pub update: Mutex<Option<String>>,
+    /// The tray's "Check for Updates… / Install Update…" item.
+    update_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     /// Deletes that can still be undone, by token.
     pub pending_deletes: Mutex<std::collections::HashMap<String, sync::HeldDelete>>,
     config: Mutex<Config>,
@@ -135,6 +140,8 @@ struct Status {
     ocr: textindex::OcrStatus,
     client_file: Option<String>,
     autostart: bool,
+    /// A newer version waiting to be installed, if any.
+    update: Option<String>,
     /// "paste" or "copy": what Enter / click does in the pane.
     primary_action: &'static str,
     version: String,
@@ -206,6 +213,7 @@ fn status(app: &AppHandle) -> Status {
         ocr: state.ocr_status.lock().unwrap().clone(),
         client_file: app.path().app_config_dir().ok().map(|d| d.join(CLIENT_FILE).to_string_lossy().into_owned()),
         autostart: settings::autostart_enabled(app),
+        update: state.update.lock().unwrap().clone(),
         primary_action: settings::primary_action(app),
         version: app.package_info().version.to_string(),
     }
@@ -856,15 +864,17 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     // The shortcut in this label (and the tooltip) is filled in by settings::register_initial.
     let open = MenuItem::with_id(app, "open", "Open memeity", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let update_item = MenuItem::with_id(app, "update", "Check for Updates\u{2026}", true, None::<&str>)?;
     let sync_now = MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?;
     let local = MenuItem::with_id(app, "local", "Open local meme folder", true, None::<&str>)?;
     let signout = MenuItem::with_id(app, "signout", "Sign out of Google", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit memeity", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &settings_item, &sep1, &sync_now, &local, &signout, &sep2, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &settings_item, &update_item, &sep1, &sync_now, &local, &signout, &sep2, &quit])?;
 
     *app.state::<AppState>().open_item.lock().unwrap() = Some(open.clone());
+    *app.state::<AppState>().update_item.lock().unwrap() = Some(update_item.clone());
 
     tray_builder(app)?
         .tooltip("memeity")
@@ -873,6 +883,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_pane(app),
             "settings" => settings::open(app),
+            "update" => updates::tray_clicked(app),
             "sync" => sync::trigger(app),
             "local" => open_local_folder(app),
             "signout" => {
@@ -912,6 +923,7 @@ pub fn run() {
         })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![settings::AUTOSTART_ARG]),
@@ -954,7 +966,9 @@ pub fn run() {
             settings::open_link,
             import::import_bytes,
             import::import_url,
-            set_dragging
+            set_dragging,
+            updates::check_for_update,
+            updates::install_update
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -978,6 +992,8 @@ pub fn run() {
                 ocr_status: Mutex::new(textindex::OcrStatus { state: "idle", ..Default::default() }),
                 arrived: Mutex::new(Default::default()),
                 pending_deletes: Mutex::new(Default::default()),
+                update: Mutex::new(None),
+                update_item: Mutex::new(None),
                 config: Mutex::new(Config::load(&config_dir)),
                 matcher: Mutex::new(Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths())),
                 watcher: Mutex::new(None),
@@ -1038,6 +1054,7 @@ pub fn run() {
 
             sync::spawn_loop(handle.clone(), sync_rx);
             textindex::spawn(handle.clone(), text_rx);
+            updates::spawn(handle.clone());
             sync::trigger(&handle);
 
             // Opened by hand: show the pane so it's obvious memeity is running. Started at

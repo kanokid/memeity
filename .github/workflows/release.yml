@@ -1,0 +1,92 @@
+# Builds installers for Windows and macOS (Apple Silicon + Intel) when a version tag
+# like v0.1.0 is pushed, and attaches them to a DRAFT GitHub Release. Review the draft,
+# then publish it: only published releases are offered by the in-app updater.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   MEMEITY_GOOGLE_CLIENT_ID / MEMEITY_GOOGLE_CLIENT_SECRET   built-in Google sign-in
+#   TAURI_SIGNING_PRIVATE_KEY                                  signs updates (~/.tauri/memeity-updater.key)
+# See RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        shell: bash
+        env:
+          CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=0
+          for name in CLIENT_ID CLIENT_SECRET SIGNING_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::Missing secret for $name (see RELEASING.md)"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Check the tag matches the app version
+        shell: bash
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match tauri.conf.json version $version"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.args }}
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MEMEITY_GOOGLE_CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
+          MEMEITY_GOOGLE_CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: memeity ${{ github.ref_name }}
+          releaseBody: |
+            Download the installer for your computer below.
+
+            - **Windows:** `memeity_*_x64-setup.exe`
+            - **Mac (Apple Silicon):** `memeity_*_aarch64.dmg`
+            - **Mac (Intel):** `memeity_*_x64.dmg`
+
+            These builds aren't code-signed yet. Windows may show "Windows protected your PC" (click **More info → Run anyway**); on a Mac, open it once from System Settings → Privacy & Security → **Open Anyway**.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
