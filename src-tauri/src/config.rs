@@ -22,6 +22,10 @@ pub struct Config {
     /// The pane's global shortcut, e.g. "control+alt+KeyM". None = the default.
     #[serde(default)]
     pub shortcut: Option<String>,
+    /// What Enter (and a click) does in the pane: "paste" (default) or "copy".
+    /// Shift+Enter / Shift+click does the other one.
+    #[serde(default)]
+    pub primary_action: Option<String>,
 }
 
 impl Config {

@@ -25,9 +25,11 @@
     sync: SyncStatus;
     ocr: OcrStatus;
     client_file: string | null;
+    /** What Enter / click does; Shift does the other. Set in Settings > General. */
+    primary_action: "paste" | "copy";
   };
   type OcrStatus = {
-    state: "idle" | "reading" | "unavailable";
+    state: "idle" | "preparing" | "reading" | "unavailable";
     done: number;
     total: number;
     message: string | null;
@@ -153,8 +155,19 @@
     const r = masonry.row[i];
     if (dir === "up" || dir === "down") {
       const column = masonry.cols[c];
-      const next = dir === "down" ? Math.min(column.length - 1, r + steps) : Math.max(0, r - steps);
-      select(column[next]);
+      const last = column.length - 1;
+      // Already at the top/bottom of this column: scroll the whole grid to that end,
+      // so the padding (and anything partly hidden) comes fully into view.
+      if ((dir === "up" && r === 0) || (dir === "down" && r === last)) {
+        grid?.scrollTo({ top: dir === "up" ? 0 : grid.scrollHeight, behavior: "smooth" });
+        return;
+      }
+      const next = dir === "down" ? Math.min(last, r + steps) : Math.max(0, r - steps);
+      select(column[next]).then(() => {
+        // Landing on a column's first meme also shows the very top of the grid (every
+        // column starts there). The bottom isn't forced: columns end at different heights.
+        if (next === 0) grid?.scrollTo({ top: 0, behavior: "smooth" });
+      });
     } else {
       const nc = dir === "right" ? c + 1 : c - 1;
       if (nc >= 0 && nc < COLS) select(nearestIn(nc, i));
@@ -265,9 +278,17 @@
 
   const MENU_W = 230;
   const MENU_H = 188;
-  const actions = [
-    { label: "Copy to Clipboard", keys: "↵", danger: false, run: (i: number) => copy(i) },
-    { label: "Paste to App", keys: "Shift ↵", danger: false, run: (i: number) => insert(i) },
+
+  // Enter / click = the primary action, Shift = the other one (swappable in Settings).
+  const pasteFirst = $derived(status?.primary_action !== "copy");
+  const primary = (i = selected) => (pasteFirst ? insert(i) : copy(i));
+  const secondary = (i = selected) => (pasteFirst ? copy(i) : insert(i));
+  const pasteAction = { label: "Paste to App", danger: false, run: (i: number) => insert(i) };
+  const copyAction = { label: "Copy to Clipboard", danger: false, run: (i: number) => copy(i) };
+
+  const actions = $derived([
+    { ...(pasteFirst ? pasteAction : copyAction), keys: "↵" },
+    { ...(pasteFirst ? copyAction : pasteAction), keys: "Shift ↵" },
     { label: "Show in Folder", keys: "Ctrl Shift F", danger: false, run: (i: number) => reveal(i) },
     {
       label: "Show Text",
@@ -286,7 +307,7 @@
         confirmDelete = hits[i];
       },
     },
-  ];
+  ]);
 
   function openMenuAt(e: MouseEvent, i: number) {
     e.preventDefault();
@@ -386,7 +407,7 @@
         case "ArrowUp":    e.preventDefault(); move("up"); break;
         case "PageDown":   e.preventDefault(); move("down", 3); break;
         case "PageUp":     e.preventDefault(); move("up", 3); break;
-        case "Enter":      e.preventDefault(); if (e.shiftKey) insert(); else copy(); break;
+        case "Enter":      e.preventDefault(); if (e.shiftKey) secondary(); else primary(); break;
         case "Backspace":
           // Ctrl+Backspace deletes the selected meme (after confirming). This replaces the
           // search box's delete-a-word shortcut; plain Backspace still edits the search.
@@ -578,8 +599,8 @@
                   onclick={(e) => {
                     // GIF-picker style: one click acts, same as Enter (Shift = Shift+Enter).
                     select(i);
-                    if (e.shiftKey) insert(i);
-                    else copy(i);
+                    if (e.shiftKey) secondary(i);
+                    else primary(i);
                   }}
                   oncontextmenu={(e) => openMenuAt(e, i)}
                 >
@@ -650,7 +671,10 @@
         >
           <i class="dot"></i>{syncLabel(status.sync)}
         </span>
-        {#if status.ocr.state === "reading"}
+        {#if status.ocr.state === "preparing"}
+          <span class="divider"></span>
+          <span class="status busy" title={status.ocr.message ?? ""}><i class="dot"></i>Getting text search ready…</span>
+        {:else if status.ocr.state === "reading"}
           <span class="divider"></span>
           <span class="status busy" title="Reading the text in your memes so you can search it">
             <i class="dot"></i>Reading text · {status.ocr.done}/{status.ocr.total}
@@ -667,14 +691,25 @@
       <span class="spacer"></span>
 
       {#if stage === "ready" && current}
-        <button class="action primary-action" onclick={() => copy()}>
-          <svg class="icon action-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <rect x="8" y="2" width="8" height="4" rx="1" />
-            <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
-          </svg>
-          Copy to Clipboard <kbd>↵</kbd>
+        <button class="action primary-action" onclick={() => primary()}>
+          {#if pasteFirst}
+            <svg class="icon action-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15 2H9a1 1 0 0 0-1 1v2c0 .6.4 1 1 1h6c.6 0 1-.4 1-1V3c0-.6-.4-1-1-1Z" />
+              <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2M16 4h2a2 2 0 0 1 2 2v2M11 14h10" />
+              <path d="m17 10 4 4-4 4" />
+            </svg>
+            Paste to App <kbd>↵</kbd>
+          {:else}
+            <svg class="icon action-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="8" y="2" width="8" height="4" rx="1" />
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+            </svg>
+            Copy to Clipboard <kbd>↵</kbd>
+          {/if}
         </button>
-        <button class="action" onclick={() => insert()}>Paste <kbd>Shift</kbd><kbd>↵</kbd></button>
+        <button class="action" onclick={() => secondary()}>
+          {pasteFirst ? "Copy" : "Paste"} <kbd>Shift</kbd><kbd>↵</kbd>
+        </button>
         <span class="divider"></span>
         <button class="action" onclick={openActions}>Actions <kbd>Ctrl</kbd><kbd>K</kbd></button>
       {/if}

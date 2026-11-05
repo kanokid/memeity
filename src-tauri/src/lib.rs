@@ -3,6 +3,7 @@
 
 mod clipboard;
 mod config;
+mod fuzzytext;
 mod google;
 mod index;
 mod insert;
@@ -47,6 +48,8 @@ pub struct AppState {
     /// Per-device SQLite/FTS5 index of text in images. None if it couldn't be opened
     /// (search then falls back to filenames only).
     pub index: Mutex<Option<index::Index>>,
+    /// Squashed image text per meme, for typo-tolerant text search (kept in sync with `index`).
+    pub text_cache: Mutex<fuzzytext::TextCache>,
     /// Wakes the background OCR/indexing worker.
     pub text_tx: std::sync::mpsc::Sender<()>,
     pub ocr_status: Mutex<textindex::OcrStatus>,
@@ -122,6 +125,8 @@ struct Status {
     ocr: textindex::OcrStatus,
     client_file: Option<String>,
     autostart: bool,
+    /// "paste" or "copy": what Enter / click does in the pane.
+    primary_action: &'static str,
     version: String,
 }
 
@@ -191,6 +196,7 @@ fn status(app: &AppHandle) -> Status {
         ocr: state.ocr_status.lock().unwrap().clone(),
         client_file: app.path().app_config_dir().ok().map(|d| d.join(CLIENT_FILE).to_string_lossy().into_owned()),
         autostart: settings::autostart_enabled(app),
+        primary_action: settings::primary_action(app),
         version: app.package_info().version.to_string(),
     }
 }
@@ -405,20 +411,23 @@ fn get_status(app: AppHandle) -> Status {
 fn search(state: State<'_, AppState>, query: String, limit: usize) -> SearchResult {
     /// How many image-text matches to consider for ranking.
     const TEXT_HITS: usize = 500;
-    let text_hits = if query.trim().is_empty() {
-        Vec::new()
+    let text_bonus = if query.trim().is_empty() {
+        Default::default()
     } else {
-        state
+        // Word matches (FTS), plus loose matches that ignore spaces and allow typos.
+        let words = state
             .index
             .lock()
             .unwrap()
             .as_ref()
             .and_then(|idx| idx.search(&query, TEXT_HITS).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let loose = state.text_cache.lock().unwrap().matches(&query);
+        library::text_bonuses(&words, &loose)
     };
     let lib = state.library.read().unwrap();
     let mut matcher = state.matcher.lock().unwrap();
-    lib.search(&query, limit, &mut matcher, &text_hits)
+    lib.search(&query, limit, &mut matcher, &text_bonus)
 }
 
 #[tauri::command]
@@ -694,6 +703,7 @@ pub fn run() {
             settings::set_shortcut,
             settings::reset_shortcut,
             settings::set_autostart,
+            settings::set_primary_action,
             settings::reread_all_text,
             settings::open_link
         ])
@@ -714,6 +724,7 @@ pub fn run() {
                 sync_lock: tokio::sync::Mutex::new(()),
                 sync_status: Mutex::new(SyncStatus { state: "off", ..Default::default() }),
                 index: Mutex::new(open_index(app.handle())),
+                text_cache: Mutex::new(fuzzytext::TextCache::default()),
                 text_tx,
                 ocr_status: Mutex::new(textindex::OcrStatus { state: "idle", ..Default::default() }),
                 config: Mutex::new(Config::load(&config_dir)),
@@ -731,6 +742,16 @@ pub fn run() {
             });
 
             migrate_auth_scope(&handle);
+
+            // Fill the typo-tolerant text cache from the index, so search works immediately.
+            {
+                let state = app.state::<AppState>();
+                let texts = state.index.lock().unwrap().as_ref().and_then(|idx| idx.all_texts().ok());
+                let mut cache = state.text_cache.lock().unwrap();
+                for (rel, text, tags) in texts.unwrap_or_default() {
+                    cache.set(&rel, &text, &tags);
+                }
+            }
 
             setup_tray(&handle)?;
             settings::register_initial(&handle);

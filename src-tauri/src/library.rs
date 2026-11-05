@@ -30,8 +30,36 @@ pub struct Meme {
 
 /// Score bonus for memes whose image text matched (nucleo filename scores for a good
 /// match are typically ~50-300, so a text hit competes with a decent filename hit).
+/// Word matches from the FTS index get BASE + SPAN for the best hit, tapering to BASE.
 const TEXT_BONUS_BASE: u32 = 100;
 const TEXT_BONUS_SPAN: u32 = 100;
+
+/// Bonus for a loose ("squashed", typo-tolerant) text match with `typos` edits: an exact
+/// squashed match ranks with the best word match; each typo costs a bit.
+pub fn fuzzy_text_bonus(typos: usize) -> u32 {
+    match typos {
+        0 => TEXT_BONUS_BASE + TEXT_BONUS_SPAN,
+        1 => TEXT_BONUS_BASE + TEXT_BONUS_SPAN / 2,
+        2 => TEXT_BONUS_BASE + TEXT_BONUS_SPAN / 5,
+        _ => TEXT_BONUS_BASE,
+    }
+}
+
+/// Text-match bonuses per meme: word matches from FTS (`ranked`, best first) and loose
+/// matches (`loose`: rel, typos). A meme keeps its best bonus.
+pub fn text_bonuses(ranked: &[String], loose: &[(String, usize)]) -> HashMap<String, u32> {
+    let n = ranked.len().max(1) as u32;
+    let mut bonus: HashMap<String, u32> = ranked
+        .iter()
+        .enumerate()
+        .map(|(i, rel)| (rel.clone(), TEXT_BONUS_BASE + TEXT_BONUS_SPAN * (n - i as u32) / n))
+        .collect();
+    for (rel, typos) in loose {
+        let b = fuzzy_text_bonus(*typos);
+        bonus.entry(rel.clone()).and_modify(|v| *v = (*v).max(b)).or_insert(b);
+    }
+    bonus
+}
 
 /// Previously-read dimensions, keyed by path, valid while the mtime is unchanged.
 pub type DimsCache = HashMap<PathBuf, (SystemTime, (u32, u32))>;
@@ -118,7 +146,7 @@ impl Library {
                 Meme { path, rel, haystack, modified, dims: None }
             })
             .collect();
-        memes.sort_by(|a, b| b.modified.cmp(&a.modified));
+        memes.sort_by_key(|m| std::cmp::Reverse(m.modified));
         Library { root: Some(root.to_path_buf()), memes }
     }
 
@@ -144,9 +172,15 @@ impl Library {
         }
     }
 
-    /// `text_hits` are memes whose image text/tags matched the query, best first (from
-    /// the FTS index). A meme can match by filename, by text, or both (ranks highest).
-    pub fn search(&self, query: &str, limit: usize, matcher: &mut Matcher, text_hits: &[String]) -> SearchResult {
+    /// `text_bonus` holds memes whose image text/tags matched the query (see
+    /// `text_bonuses`). A meme can match by filename, by text, or both (ranks highest).
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        matcher: &mut Matcher,
+        text_bonus: &HashMap<String, u32>,
+    ) -> SearchResult {
         let start = Instant::now();
         let query = query.trim();
 
@@ -159,14 +193,6 @@ impl Library {
         }
 
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-        // Text matches earn a bonus on top of any filename score: the best text hit gets
-        // TEXT_BONUS_BASE + TEXT_BONUS_SPAN, tapering to TEXT_BONUS_BASE for the last.
-        let n = text_hits.len().max(1) as u32;
-        let bonus: HashMap<&str, u32> = text_hits
-            .iter()
-            .enumerate()
-            .map(|(i, rel)| (rel.as_str(), TEXT_BONUS_BASE + TEXT_BONUS_SPAN * (n - i as u32) / n))
-            .collect();
         let mut buf = Vec::new();
         let mut scored: Vec<(u32, usize)> = self
             .memes
@@ -174,7 +200,7 @@ impl Library {
             .enumerate()
             .filter_map(|(i, m)| {
                 let fuzzy = pattern.score(Utf32Str::new(&m.haystack, &mut buf), matcher);
-                let text = bonus.get(m.rel.as_str()).copied();
+                let text = text_bonus.get(&m.rel).copied();
                 if fuzzy.is_none() && text.is_none() {
                     return None;
                 }
@@ -182,7 +208,7 @@ impl Library {
             })
             .collect();
         // Stable sort: equal scores keep newest-first order.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
 
         SearchResult {
             total: scored.len(),
@@ -217,18 +243,28 @@ mod tests {
         assert_eq!(lib.memes.len(), 2, "skips non-images and dot-folders");
 
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
-        let res = lib.search("spika", 10, &mut m, &[]);
+        let res = lib.search("spika", 10, &mut m, &HashMap::new());
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
-        assert_eq!(lib.search("", 10, &mut m, &[]).hits.len(), 2);
-        assert_eq!(lib.search("zzzz", 10, &mut m, &[]).hits.len(), 0);
+        assert_eq!(lib.search("", 10, &mut m, &HashMap::new()).hits.len(), 2);
+        assert_eq!(lib.search("zzzz", 10, &mut m, &HashMap::new()).hits.len(), 0);
 
         // A text-only match (filename doesn't match) still shows up...
-        let res = lib.search("zzzz", 10, &mut m, &["this is fine.png".to_string()]);
+        let res = lib.search("zzzz", 10, &mut m, &text_bonuses(&["this is fine.png".to_string()], &[]));
         assert_eq!(res.hits.len(), 1);
         // ...and a text hit lifts a meme above a filename-only match.
-        let res = lib.search("i", 10, &mut m, &["reactions/surprised pikachu.jpg".to_string()]);
+        let res = lib.search("i", 10, &mut m, &text_bonuses(&["reactions/surprised pikachu.jpg".to_string()], &[]));
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn loose_and_word_text_matches_combine() {
+        let ranked = vec!["a.png".to_string(), "b.png".to_string()];
+        let loose = vec![("b.png".to_string(), 0), ("c.png".to_string(), 2)];
+        let bonus = text_bonuses(&ranked, &loose);
+        assert_eq!(bonus["a.png"], TEXT_BONUS_BASE + TEXT_BONUS_SPAN, "best word match");
+        assert_eq!(bonus["b.png"], TEXT_BONUS_BASE + TEXT_BONUS_SPAN, "exact loose match lifts b");
+        assert!(bonus["c.png"] < bonus["b.png"], "typos rank lower");
     }
 }

@@ -7,7 +7,8 @@
 //!   2. otherwise runs OCR, writes the sidecar (which then syncs to Drive), and indexes it.
 //!
 //! It also re-reads a sidecar whenever its file changes, which is how tags edited on
-//! another device (milestone 2) will reach this device's search.
+//! another device (milestone 2) will reach this device's search, and it re-reads (with
+//! OCR) any meme whose text came from an older engine, so upgrades apply everywhere.
 
 use crate::index::Index;
 use crate::ocr::{self, Engine};
@@ -25,7 +26,7 @@ const BATCH: usize = 10;
 
 #[derive(Clone, Default, Serialize)]
 pub struct OcrStatus {
-    /// "idle" | "reading" | "unavailable"
+    /// "idle" | "preparing" (downloading the model) | "reading" | "unavailable"
     pub state: &'static str,
     pub done: usize,
     pub total: usize,
@@ -38,8 +39,9 @@ pub fn trigger(app: &AppHandle) {
 
 pub fn spawn(app: AppHandle, rx: Receiver<()>) {
     std::thread::spawn(move || {
-        // Created lazily on first use and kept for the thread's lifetime.
-        let mut engine: Option<Result<Engine, String>> = None;
+        // Loaded (and, the first time, downloaded) on first use, then kept. A failure
+        // (e.g. offline) isn't cached: the next pass simply tries again.
+        let mut engine: Option<Engine> = None;
         while rx.recv().is_ok() {
             while rx.try_recv().is_ok() {} // coalesce
             if let Err(e) = run(&app, &rx, &mut engine) {
@@ -78,7 +80,7 @@ struct Pending {
     md5: String,
 }
 
-fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, String>>) -> Result<(), String> {
+fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Result<(), String> {
     let Some((_, root)) = sync_target(app) else { return Ok(()) };
     let memes: Vec<(String, PathBuf)> = {
         let state = app.state::<AppState>();
@@ -94,6 +96,7 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
     if with_index(app, |idx| idx.retain(&keep))?.is_none() {
         return Ok(()); // index unavailable; search falls back to filenames
     }
+    app.state::<AppState>().text_cache.lock().unwrap().retain(&keep);
 
     // "Re-read all memes" from Settings: OCR everything again, ignoring cached text.
     let force = app.state::<AppState>().reread_text.swap(false, std::sync::atomic::Ordering::SeqCst);
@@ -106,13 +109,17 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
         let (size, mtime) = (meta.len() as i64, meta.modified().map(millis).unwrap_or(0));
 
         let cached = with_index(app, |idx| idx.lookup(&rel))?.flatten();
-        let (md5, indexed, seen_sidecar) = match cached {
-            Some(e) if e.size == size && e.mtime == mtime => (e.md5, e.indexed, e.sidecar_mtime),
+        let (md5, indexed, seen_sidecar, current_engine) = match cached {
+            Some(e) if e.size == size && e.mtime == mtime => {
+                let current = e.engine.as_deref() == Some(ocr::ENGINE_NAME);
+                (e.md5, e.indexed, e.sidecar_mtime, current)
+            }
             _ => {
                 // New or changed file: hash it (outside the index lock).
                 let Ok(md5) = sync::file_md5(&path) else { continue };
                 with_index(app, |idx| idx.upsert_file(&rel, size, mtime, &md5))?;
-                (md5, false, None)
+                app.state::<AppState>().text_cache.lock().unwrap().remove(&rel);
+                (md5, false, None, false)
             }
         };
 
@@ -122,14 +129,22 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
             pending.push(Pending { rel, path, md5 });
             continue;
         }
-        if indexed && sidecar_mtime == seen_sidecar {
+        if indexed && sidecar_mtime == seen_sidecar && current_engine {
             continue; // up to date
         }
         match sidecar::read(&root, &md5) {
             Some(sc) if sc.ocr.is_some() => {
-                let text = sc.ocr.as_ref().map(|o| o.text.as_str()).unwrap_or_default();
-                with_index(app, |idx| idx.set_text(&rel, text, &sc.tags, sidecar_mtime))?;
+                let ocr_text = sc.ocr.as_ref().expect("checked above");
+                // Index what we have right away so search works meanwhile...
+                with_index(app, |idx| {
+                    idx.set_text(&rel, &ocr_text.text, &sc.tags, sidecar_mtime, Some(&ocr_text.engine))
+                })?;
+                app.state::<AppState>().text_cache.lock().unwrap().set(&rel, &ocr_text.text, &sc.tags);
                 changed = true;
+                // ...and re-read it if an older engine produced that text.
+                if ocr_text.engine != ocr::ENGINE_NAME {
+                    pending.push(Pending { rel, path, md5 });
+                }
             }
             _ => pending.push(Pending { rel, path, md5 }),
         }
@@ -143,14 +158,22 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
         return Ok(());
     }
 
-    // 3. OCR whatever is left.
-    let engine = match engine.get_or_insert_with(Engine::new) {
-        Ok(engine) => engine,
-        Err(message) => {
-            set_status(app, OcrStatus { state: "unavailable", message: Some(message.clone()), ..Default::default() });
-            return Ok(());
+    // 3. OCR whatever is left (loading the engine, and downloading it the first time).
+    if engine.is_none() {
+        let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join(ocr::MODEL_DIR);
+        if !Engine::is_downloaded(&dir) {
+            let message = format!("Downloading the text recognition model ({})…", ocr::DOWNLOAD_SIZE);
+            set_status(app, OcrStatus { state: "preparing", message: Some(message), ..Default::default() });
         }
-    };
+        match Engine::new(&dir) {
+            Ok(loaded) => *engine = Some(loaded),
+            Err(message) => {
+                set_status(app, OcrStatus { state: "unavailable", message: Some(message), ..Default::default() });
+                return Ok(());
+            }
+        }
+    }
+    let engine = engine.as_ref().expect("loaded above");
     let total = pending.len();
     set_status(app, OcrStatus { state: "reading", done: 0, total, message: None });
 
@@ -170,7 +193,7 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
                 sc.ocr = Some(sidecar::Ocr {
                     text: text.clone(),
                     engine: ocr::ENGINE_NAME.to_string(),
-                    lang: engine.language(),
+                    lang: None, // PP-OCRv6 reads many scripts at once
                     at: Some(humantime::format_rfc3339_seconds(SystemTime::now()).to_string()),
                 });
                 let sidecar_mtime = match sidecar::write(&root, &item.md5, &sc) {
@@ -180,12 +203,13 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Result<Engine, St
                         None
                     }
                 };
-                with_index(app, |idx| idx.set_text(&item.rel, &text, &sc.tags, sidecar_mtime))?;
+                with_index(app, |idx| idx.set_text(&item.rel, &text, &sc.tags, sidecar_mtime, Some(ocr::ENGINE_NAME)))?;
+                app.state::<AppState>().text_cache.lock().unwrap().set(&item.rel, &text, &sc.tags);
             }
             Err(e) => {
                 // Unreadable image: index it as text-less so we don't retry every pass.
                 eprintln!("[memeity] OCR failed for {}: {e}", item.rel);
-                with_index(app, |idx| idx.set_text(&item.rel, "", &[], None))?;
+                with_index(app, |idx| idx.set_text(&item.rel, "", &[], None, Some(ocr::ENGINE_NAME)))?;
             }
         }
 

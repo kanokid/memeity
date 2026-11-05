@@ -263,7 +263,35 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
     let mut folders = remote.folders;
     let now = SystemTime::now();
     for meme in local_files(root) {
-        if st.files.contains_key(&meme.rel) {
+        if let Some(synced) = st.files.get(&meme.rel).cloned() {
+            // Already on Drive. Sidecars change locally (e.g. text re-read by a newer OCR
+            // engine; tags later), so push those edits, but only while Drive still has the
+            // version we last synced. If another device changed it, step 2 already took
+            // Drive's copy.
+            let remote_unchanged = remote
+                .files
+                .get(&meme.rel)
+                .is_some_and(|r| r.id == synced.id && r.md5_checksum == synced.md5);
+            let settled = now.duration_since(meme.modified).is_ok_and(|age| age >= SETTLE);
+            if sidecar::is_sidecar_rel(&meme.rel)
+                && remote_unchanged
+                && settled
+                && let Ok(local_md5) = file_md5(&meme.path)
+                && Some(&local_md5) != synced.md5.as_ref()
+            {
+                let result = async {
+                    let bytes = std::fs::read(&meme.path).map_err(|e| e.to_string())?;
+                    g.update_content(&synced.id, mime_for(&meme.rel), bytes).await
+                }
+                .await;
+                match result {
+                    Ok(item) => {
+                        st.files.insert(meme.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
+                        report.counts.uploaded += 1;
+                    }
+                    Err(e) => report.errors.push(format!("Update {}: {e}", meme.rel)),
+                }
+            }
             continue;
         }
         if now.duration_since(meme.modified).is_ok_and(|age| age < SETTLE) {

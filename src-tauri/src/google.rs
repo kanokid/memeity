@@ -393,6 +393,21 @@ impl Google {
         check(req.send().await.map_err(net)?).await?.json().await.map_err(net)
     }
 
+    /// Replaces an existing file's contents (same id, name and folder).
+    pub async fn update_content(&self, id: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+        let resp = self
+            .http
+            .patch(format!("{UPLOAD}/{id}"))
+            .query(&[("uploadType", "media"), ("fields", ITEM_FIELDS)])
+            .bearer_auth(self.token().await?)
+            .header(reqwest::header::CONTENT_TYPE, mime)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(net)?;
+        check(resp).await?.json().await.map_err(net)
+    }
+
     /// Moves a file to Drive's trash (recoverable for 30 days), not a permanent delete.
     pub async fn trash(&self, id: &str) -> Result<(), String> {
         let resp = self
@@ -411,12 +426,36 @@ fn expiry(expires_in: u64) -> Instant {
     Instant::now() + Duration::from_secs(expires_in.saturating_sub(60))
 }
 
-const PAGE_OK: &str = "<!doctype html><meta charset=utf-8><title>memeity</title>\
-<body style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\">\
-<p>Signed in to memeity. You can close this tab.</p>";
-const PAGE_FAIL: &str = "<!doctype html><meta charset=utf-8><title>memeity</title>\
-<body style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\">\
-<p>Sign-in didn't complete. Head back to memeity and try again.</p>";
+/// The page the browser lands on after Google sign-in.
+///
+/// On success it tries to close its own tab. Browsers only allow that for tabs a script
+/// opened, and this one was opened by the OS and went through Google's pages, so most
+/// browsers ignore it. Then it simply shows a tidy confirmation; memeity has already
+/// come back to the front by then.
+fn result_page(ok: bool) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    let logo = STANDARD.encode(include_bytes!("../icons/128x128.png"));
+    let (title, detail, close) = if ok {
+        ("You're signed in", "You can close this tab and head back to memeity.", "<script>window.close()</script>")
+    } else {
+        ("Sign-in didn't finish", "Head back to memeity and try again.", "")
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>memeity</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {{ color-scheme: light dark; --bg: #fff; --fg: #09090b; --muted: #71717a; }}
+  @media (prefers-color-scheme: dark) {{ :root {{ --bg: #09090b; --fg: #fafafa; --muted: #a1a1aa; }} }}
+  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; text-align: center; }}
+  img {{ width: 64px; height: 64px; margin-bottom: 16px; }}
+  h1 {{ margin: 0 0 6px; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }}
+  p {{ margin: 0; color: var(--muted); }}
+</style>
+<main><img src="data:image/png;base64,{logo}" alt=""><h1>{title}</h1><p>{detail}</p></main>
+{close}</html>"#
+    )
+}
 
 /// Waits for Google to redirect the browser to our loopback server, and returns the auth code.
 async fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String, String> {
@@ -453,7 +492,7 @@ async fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<S
         } else {
             Ok(params["code"].clone())
         };
-        let page = if result.is_ok() { PAGE_OK } else { PAGE_FAIL };
+        let page = result_page(result.is_ok());
         let _ = sock
             .write_all(
                 format!(
@@ -464,5 +503,19 @@ async fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<S
             )
             .await;
         return result;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::result_page;
+
+    #[test]
+    fn result_pages() {
+        let ok = result_page(true);
+        assert!(ok.contains("You're signed in") && ok.contains("window.close()"));
+        assert!(ok.contains("data:image/png;base64,iVBOR"), "logo embedded as a valid PNG");
+        let fail = result_page(false);
+        assert!(fail.contains("didn't finish") && !fail.contains("window.close()"), "failure page stays open");
     }
 }

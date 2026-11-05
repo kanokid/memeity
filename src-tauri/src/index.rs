@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS memes (
     mtime         INTEGER NOT NULL,
     md5           TEXT NOT NULL,
     indexed       INTEGER NOT NULL DEFAULT 0,
-    sidecar_mtime INTEGER
+    sidecar_mtime INTEGER,
+    engine        TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS meme_fts USING fts5(
     text,
@@ -34,6 +35,8 @@ pub struct Entry {
     pub md5: String,
     pub indexed: bool,
     pub sidecar_mtime: Option<i64>,
+    /// Which OCR engine produced the indexed text (e.g. "paddleocr.pp-ocrv6-small").
+    pub engine: Option<String>,
 }
 
 pub struct Index {
@@ -44,21 +47,21 @@ impl Index {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-        conn.execute_batch(SCHEMA)?;
+        init(&conn)?;
         Ok(Index { conn })
     }
 
     #[cfg(test)]
     fn in_memory() -> Self {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        init(&conn).unwrap();
         Index { conn }
     }
 
     pub fn lookup(&self, rel: &str) -> rusqlite::Result<Option<Entry>> {
         self.conn
             .query_row(
-                "SELECT size, mtime, md5, indexed, sidecar_mtime FROM memes WHERE rel = ?1",
+                "SELECT size, mtime, md5, indexed, sidecar_mtime, engine FROM memes WHERE rel = ?1",
                 [rel],
                 |r| {
                     Ok(Entry {
@@ -67,6 +70,7 @@ impl Index {
                         md5: r.get(2)?,
                         indexed: r.get::<_, i64>(3)? != 0,
                         sidecar_mtime: r.get(4)?,
+                        engine: r.get(5)?,
                     })
                 },
             )
@@ -78,7 +82,7 @@ impl Index {
         self.conn.execute(
             "INSERT INTO memes (rel, size, mtime, md5, indexed, sidecar_mtime)
              VALUES (?1, ?2, ?3, ?4, 0, NULL)
-             ON CONFLICT(rel) DO UPDATE SET size = ?2, mtime = ?3, md5 = ?4, indexed = 0, sidecar_mtime = NULL",
+             ON CONFLICT(rel) DO UPDATE SET size = ?2, mtime = ?3, md5 = ?4, indexed = 0, sidecar_mtime = NULL, engine = NULL",
             params![rel, size, mtime, md5],
         )?;
         self.conn.execute(
@@ -89,7 +93,14 @@ impl Index {
     }
 
     /// Sets the searchable text for a meme and marks it indexed.
-    pub fn set_text(&self, rel: &str, text: &str, tags: &[String], sidecar_mtime: Option<i64>) -> rusqlite::Result<()> {
+    pub fn set_text(
+        &self,
+        rel: &str,
+        text: &str,
+        tags: &[String],
+        sidecar_mtime: Option<i64>,
+        engine: Option<&str>,
+    ) -> rusqlite::Result<()> {
         let Some(id) = self
             .conn
             .query_row("SELECT id FROM memes WHERE rel = ?1", [rel], |r| r.get::<_, i64>(0))
@@ -103,8 +114,8 @@ impl Index {
             params![id, text, tags.join(" ")],
         )?;
         self.conn.execute(
-            "UPDATE memes SET indexed = 1, sidecar_mtime = ?2 WHERE id = ?1",
-            params![id, sidecar_mtime],
+            "UPDATE memes SET indexed = 1, sidecar_mtime = ?2, engine = ?3 WHERE id = ?1",
+            params![id, sidecar_mtime, engine],
         )?;
         Ok(())
     }
@@ -121,6 +132,18 @@ impl Index {
             self.conn.execute("DELETE FROM memes WHERE id = ?1", [id])?;
         }
         Ok(())
+    }
+
+    /// Every indexed meme's text and tags (for the in-memory loose-match cache).
+    pub fn all_texts(&self) -> rusqlite::Result<Vec<(String, String, Vec<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT m.rel, f.text, f.tags FROM meme_fts f JOIN memes m ON m.id = f.rowid")?;
+        let rows = stmt.query_map([], |r| {
+            let tags: String = r.get(2)?;
+            Ok((r.get(0)?, r.get(1)?, tags.split_whitespace().map(str::to_owned).collect()))
+        })?;
+        rows.collect()
     }
 
     /// How many memes have had their text indexed.
@@ -140,6 +163,21 @@ impl Index {
         let rows = stmt.query_map(params![fts, limit as i64], |r| r.get(0))?;
         rows.collect()
     }
+}
+
+/// Creates the schema, and migrates indexes made by earlier versions.
+fn init(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 2 {
+        // v2 added `memes.engine`. Fresh databases already have it from SCHEMA.
+        let has_engine = conn.prepare("SELECT engine FROM memes LIMIT 0").is_ok();
+        if !has_engine {
+            conn.execute_batch("ALTER TABLE memes ADD COLUMN engine TEXT")?;
+        }
+        conn.execute_batch("PRAGMA user_version = 2")?;
+    }
+    Ok(())
 }
 
 /// Turns free text into a safe FTS5 query: each word becomes a quoted prefix term
@@ -171,8 +209,8 @@ mod tests {
         let idx = Index::in_memory();
         idx.upsert_file("a.png", 1, 1, "aaa").unwrap();
         idx.upsert_file("b.png", 1, 1, "bbb").unwrap();
-        idx.set_text("a.png", "When the code compiles first try", &[], None).unwrap();
-        idx.set_text("b.png", "nobody: absolutely nobody", &["cat".into()], Some(5)).unwrap();
+        idx.set_text("a.png", "When the code compiles first try", &[], None, Some("eng")).unwrap();
+        idx.set_text("b.png", "nobody: absolutely nobody", &["cat".into()], Some(5), Some("eng")).unwrap();
 
         assert_eq!(idx.search("compil", 10).unwrap(), vec!["a.png"], "prefix match");
         assert_eq!(idx.search("CODE when", 10).unwrap(), vec!["a.png"], "any order, case-insensitive");
@@ -181,14 +219,28 @@ mod tests {
 
         let e = idx.lookup("b.png").unwrap().unwrap();
         assert!(e.indexed && e.sidecar_mtime == Some(5) && e.md5 == "bbb");
+        assert_eq!(e.engine.as_deref(), Some("eng"));
 
         // Changing a file drops its old text until it's re-indexed.
         idx.upsert_file("a.png", 2, 2, "aaa2").unwrap();
         assert!(idx.search("compiles", 10).unwrap().is_empty());
-        assert!(!idx.lookup("a.png").unwrap().unwrap().indexed);
+        let a = idx.lookup("a.png").unwrap().unwrap();
+        assert!(!a.indexed && a.engine.is_none(), "a changed file forgets its text and engine");
 
         idx.retain(&HashSet::from(["a.png".to_string()])).unwrap();
         assert!(idx.lookup("b.png").unwrap().is_none());
         assert!(idx.search("nobody", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrates_v1_index_by_adding_engine_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A v1 database: same tables, no `engine` column, user_version 0.
+        conn.execute_batch(&SCHEMA.replace(",
+    engine        TEXT", "")).unwrap();
+        assert!(conn.prepare("SELECT engine FROM memes").is_err(), "test setup: v1 has no engine");
+        init(&conn).unwrap();
+        assert!(conn.prepare("SELECT engine FROM memes").is_ok());
+        init(&conn).unwrap(); // idempotent
     }
 }

@@ -211,6 +211,23 @@ pub fn reset_shortcut(app: AppHandle) -> Result<Status, String> {
     Ok(status(&app))
 }
 
+/// What Enter / click does in the pane. Defaults to pasting into the app you were in.
+pub fn primary_action(app: &AppHandle) -> &'static str {
+    match config(app).primary_action.as_deref() {
+        Some("copy") => "copy",
+        _ => "paste",
+    }
+}
+
+#[tauri::command]
+pub fn set_primary_action(app: AppHandle, action: String) -> Result<Status, String> {
+    if action != "paste" && action != "copy" {
+        return Err("Unknown action.".into());
+    }
+    update_config(&app, |c| c.primary_action = Some(action));
+    Ok(status(&app))
+}
+
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<Status, String> {
     let launcher = app.autolaunch();

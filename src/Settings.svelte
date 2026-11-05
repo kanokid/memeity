@@ -11,7 +11,7 @@
     last_synced: number | null;
     last: { downloaded: number; uploaded: number; removed: number };
   };
-  type OcrStatus = { state: "idle" | "reading" | "unavailable"; done: number; total: number; message: string | null };
+  type OcrStatus = { state: "idle" | "preparing" | "reading" | "unavailable"; done: number; total: number; message: string | null };
   type Status = {
     stage: "setup" | "signin" | "folder" | "ready";
     account: string | null;
@@ -24,6 +24,7 @@
     sync: SyncStatus;
     ocr: OcrStatus;
     autostart: boolean;
+    primary_action: "paste" | "copy";
     version: string;
   };
 
@@ -133,6 +134,11 @@
   }
 
   // ---------- actions ----------
+
+  const setPrimaryAction = (action: "paste" | "copy") =>
+    act(async () => {
+      status = await invoke<Status>("set_primary_action", { action });
+    });
 
   const toggleAutostart = () =>
     act(async () => {
@@ -248,6 +254,31 @@
       <div class="card">
         <div class="row">
           <div>
+            <h3>Enter key</h3>
+            <p>What Enter (or a click) does with the selected meme. Shift+Enter does the other.</p>
+          </div>
+          <div class="segmented" role="radiogroup" aria-label="Enter key action">
+            <button
+              role="radio"
+              aria-checked={status.primary_action === "paste"}
+              class:on={status.primary_action === "paste"}
+              onclick={() => setPrimaryAction("paste")}
+              disabled={busy}
+            >Paste to App</button>
+            <button
+              role="radio"
+              aria-checked={status.primary_action === "copy"}
+              class:on={status.primary_action === "copy"}
+              onclick={() => setPrimaryAction("copy")}
+              disabled={busy}
+            >Copy to Clipboard</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
             <h3>Launch at login</h3>
             <p>Start memeity quietly in the {isMac ? "menu bar" : "tray"} when you log in.</p>
           </div>
@@ -321,7 +352,9 @@
         <div class="row">
           <div>
             <h3>Text in images</h3>
-            {#if status.ocr.state === "reading"}
+            {#if status.ocr.state === "preparing"}
+              <p>{status.ocr.message ?? "Getting text recognition ready…"}</p>
+            {:else if status.ocr.state === "reading"}
               <p>Reading text… {status.ocr.done} of {status.ocr.total}</p>
             {:else if status.ocr.state === "unavailable"}
               <p class="warn">{status.ocr.message ?? "Text recognition isn't available on this device."}</p>
@@ -334,8 +367,9 @@
           <div class="progress"><div style:width="{(status.ocr.done / status.ocr.total) * 100}%"></div></div>
         {/if}
         <p class="note">
-          memeity reads the words in your memes on this device, using {isMac ? "your Mac's" : "Windows'"} built-in text
-          recognition, so you can search by them. Results sync to your other devices, so each meme is only read once.
+          memeity reads the words in your memes with PaddleOCR, an AI text-recognition model that runs entirely on this
+          device (downloaded once, about 30 MB). Images never leave your computer for this. Results sync to your other
+          devices, so each meme is only read once.
         </p>
       </div>
 
@@ -343,7 +377,7 @@
         <div class="row">
           <div>
             <h3>Re-read all memes</h3>
-            <p>Run text recognition again on every meme, e.g. after adding a language in Windows settings.</p>
+            <p>Run text recognition again on every meme. Memes read by an older version are re-read automatically.</p>
           </div>
           {#if confirmReread}
             <div class="buttons">
@@ -619,6 +653,33 @@
   .recorder .hint {
     color: var(--muted-fg);
     font-size: 13px;
+  }
+
+  .segmented {
+    display: inline-flex;
+    flex-shrink: 0;
+    padding: 3px;
+    border-radius: 8px;
+    background: var(--muted);
+  }
+
+  .segmented button {
+    height: 26px;
+    padding: 0 10px;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted-fg);
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .segmented button.on {
+    background: var(--bg);
+    color: var(--fg);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
   }
 
   .switch {

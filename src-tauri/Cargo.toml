@@ -39,8 +39,9 @@ arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 tauri-plugin-autostart = "2"
 enigo = "0.6"
+# OCR: PaddleOCR (PP-OCRv6) models on ONNX Runtime. Needs Rust 1.95+.
+oar-ocr = "0.10"
 
-# OCR via Windows.Media.Ocr (WinRT). Same `windows` version Tauri already uses.
 [target.'cfg(windows)'.dependencies]
 # Instant insert: save/restore the clipboard and refocus the previous app.
 windows-sys = { version = "0.59", features = [
@@ -49,16 +50,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Memory",
   "Win32_UI_WindowsAndMessaging",
 ] }
-windows = { version = "0.62", features = [
-  "Foundation",
-  "Globalization",
-  "Graphics_Imaging",
-  "Media_Ocr",
-  "Storage_Streams",
-  "Win32_Foundation",
-  "Win32_Graphics_Dwm",
-  "Win32_System_WinRT",
-] }
+# Turning the pane's hide animation on/off (DWM). Same `windows` version Tauri uses.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
 
 # macOS: re-apply the Dock icon after switching between menu-bar-only and Dock modes.
 # Same versions Tauri itself uses.
