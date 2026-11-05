@@ -43,6 +43,20 @@ impl Config {
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let json = serde_json::to_vec_pretty(self).expect("config serializes");
-        std::fs::write(Self::file(dir), json)
+        write_atomic(&Self::file(dir), &json)
     }
+}
+
+/// Writes `bytes` to a temp file next to `dest`, then renames it into place, so a crash
+/// mid-write never leaves a half-written (unreadable) file behind.
+pub fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dest.with_file_name(format!(".{name}.tmp"));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dest)
 }

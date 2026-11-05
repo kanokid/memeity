@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 const DRIVE: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3/files";
 /// Only files memeity itself created (or the user opened with it). Non-sensitive, so
@@ -80,7 +82,11 @@ pub struct Google {
     http: reqwest::Client,
     creds: Mutex<Option<ClientCreds>>,
     refresh_token: Mutex<Option<String>>,
-    access: tokio::sync::Mutex<Option<(String, Instant)>>,
+    /// Cached access token, its expiry, and the sign-in `epoch` it belongs to.
+    access: tokio::sync::Mutex<Option<(String, Instant, u64)>>,
+    /// Bumped on every sign-out. A cached (or in-flight) access token from an older
+    /// epoch is never used, even if a sync held the `access` lock while signing out.
+    epoch: AtomicU64,
 }
 
 fn keyring_entry() -> keyring::Result<keyring::Entry> {
@@ -117,10 +123,17 @@ impl Google {
     pub fn new(creds: Option<ClientCreds>) -> Self {
         let refresh = keyring_entry().ok().and_then(|e| e.get_password().ok());
         Google {
-            http: reqwest::Client::new(),
+            // No overall timeout (big downloads take a while), but don't hang forever
+            // on a dead connection either.
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(60))
+                .build()
+                .expect("HTTP client builds"),
             creds: Mutex::new(creds),
             refresh_token: Mutex::new(refresh),
             access: tokio::sync::Mutex::new(None),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -136,14 +149,33 @@ impl Google {
         self.refresh_token.lock().unwrap().is_some()
     }
 
+    /// Signs out on this device and revokes the sign-in with Google (in the background).
     pub fn sign_out(&self) {
-        *self.refresh_token.lock().unwrap() = None;
+        if let Some(refresh) = self.forget() {
+            let http = self.http.clone();
+            tauri::async_runtime::spawn(async move {
+                // Best effort: if this fails (offline), the token is still gone from
+                // this device; the user can revoke it at myaccount.google.com/permissions.
+                if let Err(e) = http.post(REVOKE_URL).form(&[("token", refresh.as_str())]).send().await {
+                    eprintln!("[memeity] couldn't revoke the Google sign-in: {e}");
+                }
+            });
+        }
+    }
+
+    /// Drops this device's sign-in (tokens in memory and the keychain). Returns the
+    /// refresh token that was forgotten, if any.
+    fn forget(&self) -> Option<String> {
+        let refresh = self.refresh_token.lock().unwrap().take();
+        // Invalidates any cached access token, even one we can't clear right now.
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut access) = self.access.try_lock() {
             *access = None;
         }
         if let Ok(entry) = keyring_entry() {
             let _ = entry.delete_credential();
         }
+        refresh
     }
 
     fn creds(&self) -> Result<ClientCreds, String> {
@@ -204,17 +236,21 @@ impl Google {
             .and_then(|e| e.set_password(&refresh))
             .map_err(|e| format!("Couldn't save sign-in to the system keychain: {e}"))?;
         *self.refresh_token.lock().unwrap() = Some(refresh);
-        *self.access.lock().await = Some((token.access_token, expiry(token.expires_in)));
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        *self.access.lock().await = Some((token.access_token, expiry(token.expires_in), epoch));
         Ok(())
     }
 
     /// A valid access token, refreshing it if needed.
     async fn token(&self) -> Result<String, String> {
         let mut access = self.access.lock().await;
-        if let Some((token, expires)) = access.as_ref()
-            && Instant::now() < *expires {
-                return Ok(token.clone());
-            }
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        if let Some((token, expires, at)) = access.as_ref()
+            && *at == epoch
+            && Instant::now() < *expires
+        {
+            return Ok(token.clone());
+        }
         let creds = self.creds()?;
         let refresh = self.refresh_token.lock().unwrap().clone().ok_or(NOT_SIGNED_IN)?;
         let resp = self
@@ -232,11 +268,17 @@ impl Google {
         if resp.status() == reqwest::StatusCode::BAD_REQUEST || resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             // invalid_grant: revoked, or expired (test-mode apps expire tokens after 7 days).
             drop(access);
-            self.sign_out();
+            // Already invalid on Google's side, so there's nothing to revoke.
+            self.forget();
             return Err("Your Google sign-in expired. Sign in again.".into());
         }
         let token: TokenResponse = check(resp).await?.json().await.map_err(net)?;
-        *access = Some((token.access_token.clone(), expiry(token.expires_in)));
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            // Signed out while this refresh was in flight: don't use or keep the result.
+            *access = None;
+            return Err(NOT_SIGNED_IN.into());
+        }
+        *access = Some((token.access_token.clone(), expiry(token.expires_in), epoch));
         Ok(token.access_token)
     }
 

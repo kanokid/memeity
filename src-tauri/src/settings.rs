@@ -6,7 +6,7 @@
 use crate::is_ready;
 use crate::{config, hide_pane, status, textindex, update_config, AppState, Status};
 use std::sync::atomic::Ordering;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Modifiers, Shortcut};
 use tauri_plugin_opener::OpenerExt;
@@ -154,29 +154,47 @@ pub fn register_initial(app: &AppHandle) {
     let shortcut = saved.unwrap_or_else(|| parse(DEFAULT_SHORTCUT).expect("default shortcut is valid"));
     *app.state::<AppState>().shortcut.lock().unwrap() = shortcut;
     if let Err(e) = app.global_shortcut().register(shortcut) {
-        let msg = format!("Couldn't register {} (another app may own it): {e}", label(&shortcut));
-        eprintln!("[memeity] {msg}");
-        *app.state::<AppState>().shortcut_error.lock().unwrap() = Some(msg);
+        eprintln!("[memeity] couldn't register {}: {e}", label(&shortcut));
+        *app.state::<AppState>().shortcut_error.lock().unwrap() = Some(taken_message(&shortcut));
     }
     refresh_shortcut_labels(app);
+}
+
+/// Shown when a shortcut can't be registered (almost always: another app owns it).
+fn taken_message(shortcut: &Shortcut) -> String {
+    let os = if cfg!(target_os = "macos") { "macOS" } else { "Windows" };
+    format!("{} is already used by another app or {os}, so it can't open memeity.", label(shortcut))
+}
+
+fn registered(app: &AppHandle) -> bool {
+    app.state::<AppState>().shortcut_error.lock().unwrap().is_none()
 }
 
 /// Swaps in a new shortcut. If it can't be registered, the old one stays active.
 fn apply(app: &AppHandle, next: Shortcut) -> Result<(), String> {
     let old = current(app);
-    if next == old {
+    // The current shortcut may never have registered (taken at startup); then
+    // "applying" it again is a retry, not a no-op.
+    let old_registered = registered(app);
+    if next == old && old_registered {
         return Ok(());
     }
     let gs = app.global_shortcut();
-    let _ = gs.unregister(old);
+    if old_registered {
+        let _ = gs.unregister(old);
+    }
     if let Err(e) = gs.register(next) {
-        let _ = gs.register(old);
-        return Err(format!("{} is already used by another app or Windows. Try another combination. ({e})", label(&next)));
+        if old_registered {
+            let _ = gs.register(old);
+        }
+        eprintln!("[memeity] couldn't register {}: {e}", label(&next));
+        return Err(format!("{} Try another combination.", taken_message(&next)));
     }
     *app.state::<AppState>().shortcut.lock().unwrap() = next;
     *app.state::<AppState>().shortcut_error.lock().unwrap() = None;
     update_config(app, |c| c.shortcut = Some(next.into_string()));
     refresh_shortcut_labels(app);
+    let _ = app.emit("status-changed", ());
     Ok(())
 }
 
@@ -202,6 +220,13 @@ pub async fn open_settings(app: AppHandle) {
 #[tauri::command]
 pub fn set_shortcut(app: AppHandle, accelerator: String) -> Result<Status, String> {
     apply(&app, parse(&accelerator)?)?;
+    Ok(status(&app))
+}
+
+/// Tries the current shortcut again (e.g. after quitting the app that had it).
+#[tauri::command]
+pub fn retry_shortcut(app: AppHandle) -> Result<Status, String> {
+    apply(&app, current(&app))?;
     Ok(status(&app))
 }
 

@@ -24,7 +24,8 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -38,6 +39,69 @@ const STALE: Duration = Duration::from_secs(15);
 const SETTLE: Duration = Duration::from_secs(2);
 /// Downloads land here first, then get renamed into place. Dot-prefixed, so it's never indexed.
 const TMP_DIR: &str = ".memeity-tmp";
+/// Local files modified this long before the previous sync started aren't re-hashed to
+/// look for local edits (covers coarse filesystem timestamps and small clock jumps).
+const MTIME_SLACK: Duration = Duration::from_secs(5);
+
+// ---------- Drive, as sync sees it ----------
+
+/// The Drive calls sync makes. `Google` implements it for real; tests use a fake.
+pub(crate) trait Drive {
+    async fn list_children(&self, parent: &str) -> Result<Vec<DriveItem>, String>;
+    async fn download(&self, id: &str) -> Result<Vec<u8>, String>;
+    async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String>;
+    async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String>;
+    async fn rename(&self, id: &str, new_name: &str, reparent: Option<(&str, &str)>) -> Result<DriveItem, String>;
+    async fn update_content(&self, id: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String>;
+    async fn start_page_token(&self) -> Result<String, String>;
+}
+
+impl Drive for Google {
+    async fn list_children(&self, parent: &str) -> Result<Vec<DriveItem>, String> {
+        Google::list_children(self, parent).await
+    }
+    async fn download(&self, id: &str) -> Result<Vec<u8>, String> {
+        Google::download(self, id).await
+    }
+    async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+        Google::upload(self, parent, name, mime, bytes).await
+    }
+    async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String> {
+        Google::create_folder(self, parent, name).await
+    }
+    async fn rename(&self, id: &str, new_name: &str, reparent: Option<(&str, &str)>) -> Result<DriveItem, String> {
+        Google::rename(self, id, new_name, reparent).await
+    }
+    async fn update_content(&self, id: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+        Google::update_content(self, id, mime, bytes).await
+    }
+    async fn start_page_token(&self) -> Result<String, String> {
+        Google::start_page_token(self).await
+    }
+}
+
+// ---------- files sync just wrote ----------
+
+/// How long the file watcher ignores a path sync just wrote.
+const OWN_WRITE_WINDOW: Duration = Duration::from_secs(10);
+
+fn own_writes() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static WRITES: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    WRITES.get_or_init(Default::default)
+}
+
+/// Notes that sync itself just created/replaced/moved `path`, so the watcher doesn't
+/// answer it with yet another full sync.
+fn note_own_write(path: &Path) {
+    let mut writes = own_writes().lock().unwrap();
+    writes.retain(|_, at| at.elapsed() < OWN_WRITE_WINDOW);
+    writes.insert(path.to_path_buf(), Instant::now());
+}
+
+/// True if sync wrote `path` in the last few seconds (for the file watcher).
+pub fn is_own_write(path: &Path) -> bool {
+    own_writes().lock().unwrap().get(path).is_some_and(|at| at.elapsed() < OWN_WRITE_WINDOW)
+}
 
 #[derive(Clone, Copy, Default, Serialize)]
 pub struct Counts {
@@ -69,9 +133,13 @@ struct SyncState {
     /// ask "anything new since this?" instead of listing the whole folder.
     #[serde(default)]
     page_token: Option<String>,
+    /// Unix millis when the previous full sync started. Files untouched since then
+    /// can't have been edited locally, so they aren't re-hashed.
+    #[serde(default)]
+    last_scan: Option<u64>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Synced {
     id: String,
     md5: Option<String>,
@@ -92,12 +160,13 @@ impl SyncState {
                 scope: crate::google::SCOPE.to_string(),
                 files: BTreeMap::new(),
                 page_token: None,
+                last_scan: None,
             })
     }
 
     fn save(&self, data_dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
-        std::fs::write(Self::file(data_dir), serde_json::to_vec(self).expect("state serializes"))
+        crate::config::write_atomic(&Self::file(data_dir), &serde_json::to_vec(self).expect("state serializes"))
             .map_err(|e| format!("Couldn't save sync state: {e}"))
     }
 }
@@ -251,13 +320,14 @@ struct Report {
     downloaded: Vec<String>,
 }
 
-async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Report {
+async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -> Report {
     let mut report = Report { counts: Counts::default(), errors: Vec::new(), retry_soon: false, downloaded: Vec::new() };
 
-    if let Err(e) = std::fs::create_dir_all(root.join(TMP_DIR)) {
+    if let Err(e) = tokio::fs::create_dir_all(root.join(TMP_DIR)).await {
         report.errors.push(format!("Couldn't create {}: {e}", root.display()));
         return report;
     }
+    let started = now_ms();
     // Bookmark the change feed *before* reading Drive, so changes made while this sync
     // runs show up in the next check rather than being missed.
     let fresh_token = g.start_page_token().await.ok();
@@ -269,45 +339,88 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
         }
     };
     let mut st = SyncState::load(data_dir, folder_id);
+    // Local files modified after this may have been edited here since the last sync.
+    let edited_after = st
+        .last_scan
+        .map(|ms| UNIX_EPOCH + Duration::from_millis(ms).saturating_sub(MTIME_SLACK));
 
     // 0a. Renamed/moved on Drive -> rename the local file to match (same Drive id, new path).
     follow_remote_renames(root, &remote, &mut st, &mut report);
     // 0b. Renamed/moved locally -> rename on Drive (a file vanished and one with the same
     //     bytes appeared). Without this, a rename looks like "delete + new file" and
-    //     we'd end up with two copies.
-    push_local_renames(g, root, &mut remote, &mut st, &mut report).await;
+    //     we'd end up with two copies. Renames Drive refused are left alone this pass.
+    let held_back = push_local_renames(g, root, &mut remote, &mut st, &mut report).await;
 
     // 1. Gone from Drive -> gone from this device (to the Recycle Bin).
     let gone: Vec<String> = st.files.keys().filter(|rel| !remote.files.contains_key(*rel)).cloned().collect();
     for rel in gone {
         let path = rel_path(root, &rel);
         if path.exists()
-            && let Err(e) = trash::delete(&path) {
-                report.errors.push(format!("Couldn't remove {rel}: {e}"));
-                continue;
-            }
+            && let Err(e) = trash::delete(&path)
+        {
+            report.errors.push(format!("Couldn't remove {rel}: {e}"));
+            continue;
+        }
         st.files.remove(&rel);
         report.counts.removed += 1;
     }
 
     // 2. Download anything new, changed, or missing locally (incl. local deletes).
     for (rel, item) in &remote.files {
+        if held_back.contains(rel) {
+            continue;
+        }
         let path = rel_path(root, rel);
+        let is_sidecar = sidecar::is_sidecar_rel(rel);
         let need = if !path.is_file() {
             true
-        } else if let Some(s) = st.files.get(rel) {
-            s.id != item.id || s.md5 != item.md5_checksum
-        } else if item.md5_checksum.is_some() && file_md5(&path).ok() == item.md5_checksum {
+        } else if let Some(s) = st.files.get(rel).cloned() {
+            if s.id == item.id && s.md5 == item.md5_checksum {
+                false // unchanged on Drive; local edits (if any) upload in step 3
+            } else {
+                // Changed on Drive. Was it changed here too?
+                let local = md5_of(&path).await.ok();
+                if local.is_some() && local == item.md5_checksum {
+                    // Both sides already have the same bytes.
+                    st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
+                    false
+                } else if local.is_some() && local == s.md5 {
+                    true // only Drive changed: take its copy
+                } else if is_sidecar {
+                    match merge_sidecar(g, item, &path).await {
+                        Ok(true) => {
+                            // Kept text the user typed here; it uploads once settled.
+                            st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
+                            report.retry_soon = true;
+                            report.counts.downloaded += 1;
+                            false
+                        }
+                        Ok(false) => true, // nothing of ours worth keeping: take Drive's
+                        Err(e) => {
+                            report.errors.push(format!("Download {rel}: {e}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    // Edited on both sides: keep this device's version under a new name.
+                    if let Err(e) = set_aside(&path) {
+                        report.errors.push(format!("Couldn't set aside local {rel}: {e}"));
+                        continue;
+                    }
+                    true
+                }
+            }
+        } else if item.md5_checksum.is_some() && md5_of(&path).await.ok() == item.md5_checksum {
             // Same bytes already here (e.g. first sync, or state was lost). Just adopt it.
             st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
             false
-        } else if sidecar::is_sidecar_rel(rel) {
+        } else if is_sidecar {
             // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy.
             true
         } else {
             // A different local file with the same name: keep it under a new name
             // (it'll upload in step 3) and download Drive's version.
-            if let Err(e) = std::fs::rename(&path, conflict_path(&path)) {
+            if let Err(e) = set_aside(&path) {
                 report.errors.push(format!("Couldn't set aside local {rel}: {e}"));
                 continue;
             }
@@ -318,7 +431,7 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
                 Ok(()) => {
                     st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
                     report.counts.downloaded += 1;
-                    if !sidecar::is_sidecar_rel(rel) {
+                    if !is_sidecar {
                         report.downloaded.push(rel.clone());
                     }
                 }
@@ -327,66 +440,131 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
         }
     }
 
-    // 3. Upload local files (memes and sidecars) Drive doesn't know about.
+    // 3. Upload local files Drive doesn't know about, and local edits to ones it does.
     let mut folders = remote.folders;
     let now = SystemTime::now();
-    for meme in local_files(root) {
-        if let Some(synced) = st.files.get(&meme.rel).cloned() {
-            // Already on Drive. Sidecars change locally (e.g. text re-read by a newer OCR
-            // engine; tags later), so push those edits, but only while Drive still has the
-            // version we last synced. If another device changed it, step 2 already took
-            // Drive's copy.
+    for local in local_files(root).await {
+        if held_back.contains(&local.rel) {
+            continue;
+        }
+        let settled = now.duration_since(local.modified).is_ok_and(|age| age >= SETTLE);
+        if let Some(synced) = st.files.get(&local.rel).cloned() {
+            // Already on Drive. Push local edits (a re-read or retyped sidecar, an image
+            // edited in place), but only while Drive still has the version we last
+            // synced. If another device changed it, step 2 already dealt with that.
             let remote_unchanged = remote
                 .files
-                .get(&meme.rel)
+                .get(&local.rel)
                 .is_some_and(|r| r.id == synced.id && r.md5_checksum == synced.md5);
-            let settled = now.duration_since(meme.modified).is_ok_and(|age| age >= SETTLE);
-            if sidecar::is_sidecar_rel(&meme.rel)
-                && remote_unchanged
-                && settled
-                && let Ok(local_md5) = file_md5(&meme.path)
-                && Some(&local_md5) != synced.md5.as_ref()
-            {
-                let result = async {
-                    let bytes = std::fs::read(&meme.path).map_err(|e| e.to_string())?;
-                    g.update_content(&synced.id, mime_for(&meme.rel), bytes).await
+            let maybe_edited = edited_after.is_none_or(|t| local.modified >= t);
+            if !remote_unchanged || !maybe_edited {
+                continue;
+            }
+            let Ok(local_md5) = md5_of(&local.path).await else { continue };
+            if Some(&local_md5) == synced.md5.as_ref() {
+                continue;
+            }
+            if !settled {
+                report.retry_soon = true; // still being written; try again shortly
+                continue;
+            }
+            let result = async {
+                let bytes = tokio::fs::read(&local.path).await.map_err(|e| e.to_string())?;
+                g.update_content(&synced.id, mime_for(&local.rel), bytes).await
+            }
+            .await;
+            match result {
+                Ok(item) => {
+                    st.files.insert(local.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
+                    report.counts.uploaded += 1;
                 }
-                .await;
-                match result {
-                    Ok(item) => {
-                        st.files.insert(meme.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
-                        report.counts.uploaded += 1;
-                    }
-                    Err(e) => report.errors.push(format!("Update {}: {e}", meme.rel)),
-                }
+                Err(e) => report.errors.push(format!("Update {}: {e}", local.rel)),
             }
             continue;
         }
-        if now.duration_since(meme.modified).is_ok_and(|age| age < SETTLE) {
+        if !settled {
             report.retry_soon = true;
             continue;
         }
-        let (dir, name) = meme.rel.rsplit_once('/').unwrap_or(("", &meme.rel));
+        let (dir, name) = local.rel.rsplit_once('/').unwrap_or(("", &local.rel));
         let result = async {
             let parent = ensure_folder(g, &mut folders, dir).await?;
-            let bytes = std::fs::read(&meme.path).map_err(|e| e.to_string())?;
+            let bytes = tokio::fs::read(&local.path).await.map_err(|e| e.to_string())?;
             g.upload(&parent, name, mime_for(name), bytes).await
         }
         .await;
         match result {
             Ok(item) => {
-                st.files.insert(meme.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
+                st.files.insert(local.rel.clone(), Synced { id: item.id, md5: item.md5_checksum });
                 report.counts.uploaded += 1;
             }
-            Err(e) => report.errors.push(format!("Upload {}: {e}", meme.rel)),
+            Err(e) => report.errors.push(format!("Upload {}: {e}", local.rel)),
         }
     }
 
-    st.page_token = fresh_token;
+    // Only move the change-feed bookmark past this pass if it fully succeeded. Otherwise
+    // the next 30-second check sees "changes" and retries the failures right away,
+    // instead of waiting for the ~10-minute safety-net sync.
+    if report.errors.is_empty() {
+        st.page_token = fresh_token;
+    }
+    st.last_scan = Some(started);
     if let Err(e) = st.save(data_dir) {
         report.errors.push(e);
     }
     report
+}
+
+/// A sidecar changed on Drive *and* here. Drive's copy wins, except for text the user
+/// typed on this device, which is kept (unless it was also retyped elsewhere). Returns
+/// true if the merged sidecar was written locally (and still needs uploading), false
+/// if Drive's copy should simply be downloaded.
+async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result<bool, String> {
+    let local: Option<sidecar::Sidecar> =
+        tokio::fs::read(path).await.ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let Some(local_ocr) = local.and_then(|sc| sc.ocr).filter(|o| o.edited) else {
+        return Ok(false);
+    };
+    let bytes = g.download(&item.id).await?;
+    let Ok(mut merged) = serde_json::from_slice::<sidecar::Sidecar>(&bytes) else {
+        return Ok(false); // Drive's copy is unreadable; downloading it as-is changes nothing
+    };
+    if merged.ocr.as_ref().is_some_and(|o| o.edited) {
+        return Ok(false); // retyped on another device too: the newest edit (Drive's) wins
+    }
+    merged.ocr = Some(local_ocr);
+    let json = serde_json::to_vec_pretty(&merged).map_err(|e| e.to_string())?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::config::write_atomic(&path, &json)?;
+        note_own_write(&path);
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Moves a local file out of the way (`cat.png` -> `cat (this device).png`).
+fn set_aside(path: &Path) -> std::io::Result<()> {
+    let to = conflict_path(path);
+    std::fs::rename(path, &to)?;
+    note_own_write(path);
+    note_own_write(&to);
+    Ok(())
+}
+
+/// True if a file with exactly this name (same letter case) exists. On case-insensitive
+/// filesystems (Windows, macOS) `Path::exists` also matches `Cat.png` for `cat.png`.
+fn exists_exact(path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return path.exists() };
+    std::fs::read_dir(dir).is_ok_and(|entries| entries.flatten().any(|e| e.file_name() == name))
+}
+
+/// `a` and `b` differ only in letter case, and the filesystem treats them as one file.
+fn same_file_other_case(a: &Path, b: &Path) -> bool {
+    a != b && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase() && !exists_exact(b)
 }
 
 fn follow_remote_renames(root: &Path, remote: &RemoteTree, st: &mut SyncState, report: &mut Report) {
@@ -401,45 +579,71 @@ fn follow_remote_renames(root: &Path, remote: &RemoteTree, st: &mut SyncState, r
         .collect();
     for (old, new) in moves {
         let (from, to) = (rel_path(root, &old), rel_path(root, &new));
-        if from.is_file() && !to.exists() {
-            let moved = to
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| std::fs::rename(&from, &to));
-            if let Err(e) = moved {
+        if !from.is_file() {
+            // Nothing here to move: forget the old entry, and step 2 treats the new path
+            // like any other (download it, or adopt/set aside whatever is already there).
+            st.files.remove(&old);
+            continue;
+        }
+        let case_only = same_file_other_case(&from, &to);
+        if to.exists() && !case_only {
+            // An unrelated local file is in the way: keep it under another name.
+            if let Err(e) = set_aside(&to) {
                 report.errors.push(format!("Couldn't rename {old} to {new}: {e}"));
                 continue;
             }
         }
+        let moved = to
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::rename(&from, &to));
+        if let Err(e) = moved {
+            report.errors.push(format!("Couldn't rename {old} to {new}: {e}"));
+            continue;
+        }
+        note_own_write(&from);
+        note_own_write(&to);
         if let Some(entry) = st.files.remove(&old) {
             st.files.insert(new, entry);
         }
     }
 }
 
-async fn push_local_renames(g: &Google, root: &Path, remote: &mut RemoteTree, st: &mut SyncState, report: &mut Report) {
-    // Synced files that are missing locally but still on Drive, unchanged, at the same path.
+/// Renames on Drive whatever was renamed locally. Returns the paths (old and new) of
+/// renames Drive refused, which the rest of this pass leaves alone so a failed rename
+/// doesn't turn into a duplicate upload plus a re-download of the old name.
+async fn push_local_renames<D: Drive>(
+    g: &D,
+    root: &Path,
+    remote: &mut RemoteTree,
+    st: &mut SyncState,
+    report: &mut Report,
+) -> HashSet<String> {
+    let mut held_back = HashSet::new();
+    // Synced files that are missing locally but still on Drive, unchanged, at the same
+    // path. "Missing" means no file with exactly that name, so a case-only rename
+    // (`Cat.png` -> `cat.png`) counts too.
     let missing: Vec<(String, Synced)> = st
         .files
         .iter()
         .filter(|(rel, s)| {
-            s.md5.is_some()
-                && !rel_path(root, rel).exists()
-                && remote.files.get(*rel).is_some_and(|r| r.id == s.id)
+            s.md5.is_some() && remote.files.get(*rel).is_some_and(|r| r.id == s.id) && !exists_exact(&rel_path(root, rel))
         })
         .map(|(rel, s)| (rel.clone(), s.clone()))
         .collect();
     if missing.is_empty() {
-        return;
+        return held_back;
     }
 
     // Local files memeity hasn't seen before, by content hash.
     let mut untracked: HashMap<String, String> = HashMap::new();
-    for meme in Library::scan(root).memes {
-        if !st.files.contains_key(&meme.rel) && !remote.files.contains_key(&meme.rel)
-            && let Ok(md5) = file_md5(&meme.path) {
-                untracked.entry(md5).or_insert(meme.rel);
-            }
+    for meme in scan(root).await.memes {
+        if !st.files.contains_key(&meme.rel)
+            && !remote.files.contains_key(&meme.rel)
+            && let Ok(md5) = md5_of(&meme.path).await
+        {
+            untracked.entry(md5).or_insert(meme.rel);
+        }
     }
 
     for (old, synced) in missing {
@@ -465,9 +669,53 @@ async fn push_local_renames(g: &Google, root: &Path, remote: &mut RemoteTree, st
                 remote.files.remove(&old);
                 remote.files.insert(new, item);
             }
-            Err(e) => report.errors.push(format!("Rename {old} to {new} on Drive: {e}")),
+            Err(e) => {
+                report.errors.push(format!("Rename {old} to {new} on Drive: {e}"));
+                held_back.insert(old);
+                held_back.insert(new);
+            }
         }
     }
+    held_back
+}
+
+/// Renames a meme on this device and on Drive right away (under the sync lock, so it
+/// can't interleave with a sync pass). If Drive can't be reached, the next sync spots
+/// the rename (same bytes, new name) and finishes it.
+pub async fn rename(app: &AppHandle, from: &Path, to: &Path) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (folder, root) = sync_target(app).ok_or("No meme folder selected.")?;
+    let rel_of = |p: &Path| -> Result<String, String> {
+        Ok(p.strip_prefix(&root)
+            .map_err(|_| "That file isn't in your meme folder.".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/"))
+    };
+    let (old_rel, new_rel) = (rel_of(from)?, rel_of(to)?);
+    let new_name = to.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Give it a name.")?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+
+    let _guard = state.sync_lock.lock().await;
+    if to.exists() && !same_file_other_case(from, to) {
+        return Err(format!("There's already a meme called {new_name}."));
+    }
+    tokio::fs::rename(from, to).await.map_err(|e| format!("Couldn't rename: {e}"))?;
+
+    let mut st = SyncState::load(&data_dir, &folder.id);
+    let Some(synced) = st.files.get(&old_rel).cloned() else { return Ok(()) };
+    if !state.google.signed_in() {
+        return Ok(());
+    }
+    match tokio::time::timeout(Duration::from_secs(10), state.google.rename(&synced.id, &new_name, None)).await {
+        Ok(Ok(item)) => {
+            st.files.remove(&old_rel);
+            st.files.insert(new_rel, Synced { id: item.id, md5: item.md5_checksum });
+            st.save(&data_dir)?;
+        }
+        Ok(Err(e)) => eprintln!("[memeity] rename on Drive failed, sync will retry: {e}"),
+        Err(_) => eprintln!("[memeity] rename on Drive timed out, sync will retry"),
+    }
+    Ok(())
 }
 
 /// How long a delete can be undone. Afterwards the local copy goes to the Recycle Bin
@@ -588,7 +836,7 @@ struct RemoteTree {
     folders: HashMap<String, String>,
 }
 
-async fn remote_tree(g: &Google, root_id: &str) -> Result<RemoteTree, String> {
+async fn remote_tree<D: Drive>(g: &D, root_id: &str) -> Result<RemoteTree, String> {
     let mut tree = RemoteTree {
         files: HashMap::new(),
         folders: HashMap::from([(String::new(), root_id.to_string())]),
@@ -630,7 +878,7 @@ async fn remote_tree(g: &Google, root_id: &str) -> Result<RemoteTree, String> {
     Ok(tree)
 }
 
-async fn ensure_folder(g: &Google, folders: &mut HashMap<String, String>, dir: &str) -> Result<String, String> {
+async fn ensure_folder<D: Drive>(g: &D, folders: &mut HashMap<String, String>, dir: &str) -> Result<String, String> {
     if let Some(id) = folders.get(dir) {
         return Ok(id.clone());
     }
@@ -641,19 +889,29 @@ async fn ensure_folder(g: &Google, folders: &mut HashMap<String, String>, dir: &
     Ok(id)
 }
 
-async fn download(g: &Google, item: &DriveItem, root: &Path, dest: &Path) -> Result<(), String> {
+async fn download<D: Drive>(g: &D, item: &DriveItem, root: &Path, dest: &Path) -> Result<(), String> {
     let bytes = g.download(&item.id).await?;
     let tmp = root.join(TMP_DIR).join(&item.id);
-    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-    // Keep Drive's modified time so "newest first" means newest on Drive.
-    if let Some(t) = item.modified_time.as_deref().and_then(|t| humantime::parse_rfc3339_weak(t).ok())
-        && let Ok(f) = std::fs::File::options().write(true).open(&tmp) {
+    let dest = dest.to_path_buf();
+    let modified = item.modified_time.as_deref().and_then(|t| humantime::parse_rfc3339_weak(t).ok());
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&tmp, &bytes)?;
+        // Keep Drive's modified time so "newest first" means newest on Drive.
+        if let Some(t) = modified
+            && let Ok(f) = std::fs::File::options().write(true).open(&tmp)
+        {
             let _ = f.set_modified(t);
         }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&tmp, &dest)?;
+        note_own_write(&dest);
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 // ---------- helpers ----------
@@ -708,7 +966,18 @@ struct LocalFile {
     modified: SystemTime,
 }
 
-fn local_files(root: &Path) -> Vec<LocalFile> {
+/// `Library::scan`, off the async runtime's worker threads.
+async fn scan(root: &Path) -> Library {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || Library::scan(&root)).await.unwrap_or_default()
+}
+
+async fn local_files(root: &Path) -> Vec<LocalFile> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || local_files_blocking(&root)).await.unwrap_or_default()
+}
+
+fn local_files_blocking(root: &Path) -> Vec<LocalFile> {
     let mut files: Vec<LocalFile> = Library::scan(root)
         .memes
         .into_iter()
@@ -725,6 +994,12 @@ fn local_files(root: &Path) -> Vec<LocalFile> {
         }
     }
     files
+}
+
+/// `file_md5`, off the async runtime's worker threads.
+async fn md5_of(path: &Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || file_md5(&path)).await.map_err(std::io::Error::other)?
 }
 
 pub(crate) fn file_md5(path: &Path) -> std::io::Result<String> {
@@ -818,4 +1093,264 @@ mod tests {
         assert_eq!(file_md5(&f).unwrap(), "5d41402abc4b2a76b9719d911017c592");
         std::fs::remove_file(f).unwrap();
     }
+
+    // ---------- whole sync passes against a fake Drive ----------
+
+    #[derive(Clone)]
+    struct FakeFile {
+        parent: String,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    }
+
+    /// An in-memory Drive. Folder "root" is the synced folder.
+    #[derive(Default)]
+    struct FakeDrive {
+        files: Mutex<HashMap<String, FakeFile>>,
+        next_id: Mutex<u32>,
+        fail_downloads: bool,
+        renames: Mutex<u32>,
+    }
+
+    impl FakeDrive {
+        fn add(&self, parent: &str, name: &str, bytes: &[u8]) -> String {
+            let mime = if name.ends_with(".json") { "application/json" } else { "image/png" };
+            self.insert(FakeFile { parent: parent.into(), name: name.into(), mime: mime.into(), bytes: bytes.to_vec() })
+        }
+        fn insert(&self, f: FakeFile) -> String {
+            let mut n = self.next_id.lock().unwrap();
+            *n += 1;
+            let id = format!("id{n:06}");
+            self.files.lock().unwrap().insert(id.clone(), f);
+            id
+        }
+        fn item(id: &str, f: &FakeFile) -> DriveItem {
+            let is_folder = f.mime == FOLDER_MIME;
+            DriveItem {
+                id: id.into(),
+                name: f.name.clone(),
+                mime_type: f.mime.clone(),
+                md5_checksum: (!is_folder).then(|| format!("{:x}", Md5::digest(&f.bytes))),
+                modified_time: None,
+            }
+        }
+        fn set_bytes(&self, id: &str, bytes: &[u8]) {
+            self.files.lock().unwrap().get_mut(id).unwrap().bytes = bytes.to_vec();
+        }
+        fn rename_to(&self, id: &str, name: &str) {
+            self.files.lock().unwrap().get_mut(id).unwrap().name = name.into();
+        }
+        fn get(&self, id: &str) -> FakeFile {
+            self.files.lock().unwrap()[id].clone()
+        }
+        fn names(&self) -> Vec<String> {
+            let mut v: Vec<String> = self.files.lock().unwrap().values().map(|f| f.name.clone()).collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drive for FakeDrive {
+        async fn list_children(&self, parent: &str) -> Result<Vec<DriveItem>, String> {
+            let files = self.files.lock().unwrap();
+            Ok(files.iter().filter(|(_, f)| f.parent == parent).map(|(id, f)| Self::item(id, f)).collect())
+        }
+        async fn download(&self, id: &str) -> Result<Vec<u8>, String> {
+            if self.fail_downloads {
+                return Err("offline".into());
+            }
+            Ok(self.get(id).bytes)
+        }
+        async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+            let f = FakeFile { parent: parent.into(), name: name.into(), mime: mime.into(), bytes };
+            let id = self.insert(f.clone());
+            Ok(Self::item(&id, &f))
+        }
+        async fn create_folder(&self, parent: &str, name: &str) -> Result<String, String> {
+            Ok(self.insert(FakeFile { parent: parent.into(), name: name.into(), mime: FOLDER_MIME.into(), bytes: vec![] }))
+        }
+        async fn rename(&self, id: &str, new_name: &str, reparent: Option<(&str, &str)>) -> Result<DriveItem, String> {
+            *self.renames.lock().unwrap() += 1;
+            let mut files = self.files.lock().unwrap();
+            let f = files.get_mut(id).ok_or("no such file")?;
+            f.name = new_name.into();
+            if let Some((to, _)) = reparent {
+                f.parent = to.into();
+            }
+            Ok(Self::item(id, f))
+        }
+        async fn update_content(&self, id: &str, _mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
+            let mut files = self.files.lock().unwrap();
+            let f = files.get_mut(id).ok_or("no such file")?;
+            f.bytes = bytes;
+            Ok(Self::item(id, f))
+        }
+        async fn start_page_token(&self) -> Result<String, String> {
+            Ok(format!("token-{}", now_ms()))
+        }
+    }
+
+    /// A fresh library folder and app-data dir.
+    fn dirs(name: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("memeity-{name}-{}-{}", std::process::id(), now_ms()));
+        let (root, data) = (base.join("lib"), base.join("data"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        (root, data)
+    }
+
+    /// Writes a local file that looks "settled" (old enough for sync to touch) but
+    /// still newer than the previous sync.
+    fn write_settled(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        let t = SystemTime::now() - SETTLE - Duration::from_millis(500);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn first_sync_downloads_and_uploads() {
+        let (root, data) = dirs("first");
+        let g = FakeDrive::default();
+        g.add("root", "remote.png", b"from drive");
+        write_settled(&root.join("local.png"), b"from here");
+
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(std::fs::read(root.join("remote.png")).unwrap(), b"from drive");
+        assert_eq!(g.names(), ["local.png", "remote.png"]);
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn edited_on_both_sides_keeps_both() {
+        let (root, data) = dirs("conflict");
+        let g = FakeDrive::default();
+        let id = g.add("root", "cat.png", b"v1");
+        cycle(&g, "root", &root, &data).await;
+
+        write_settled(&root.join("cat.png"), b"edited here");
+        g.set_bytes(&id, b"edited on drive");
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(std::fs::read(root.join("cat.png")).unwrap(), b"edited on drive");
+        assert_eq!(std::fs::read(root.join("cat (this device).png")).unwrap(), b"edited here");
+        assert!(g.names().contains(&"cat (this device).png".to_string()), "local edit uploaded too");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn local_edit_uploads_in_place() {
+        let (root, data) = dirs("edit");
+        let g = FakeDrive::default();
+        let id = g.add("root", "cat.png", b"v1");
+        cycle(&g, "root", &root, &data).await;
+
+        write_settled(&root.join("cat.png"), b"cropped");
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(g.get(&id).bytes, b"cropped");
+        assert_eq!(g.names(), ["cat.png"], "updated, not uploaded as a second file");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn unsettled_edit_retries_soon() {
+        let (root, data) = dirs("unsettled");
+        let g = FakeDrive::default();
+        let id = g.add("root", "cat.png", b"v1");
+        cycle(&g, "root", &root, &data).await;
+
+        std::fs::write(root.join("cat.png"), b"just written").unwrap();
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.retry_soon, "a fresh local edit must schedule a quick retry");
+        assert_eq!(g.get(&id).bytes, b"v1");
+        cleanup(&root);
+    }
+
+    fn sidecar_json(text: &str, edited: bool) -> Vec<u8> {
+        let sc = sidecar::Sidecar {
+            ocr: Some(sidecar::Ocr { text: text.into(), engine: "test".into(), lang: None, at: None, edited }),
+            ..Default::default()
+        };
+        serde_json::to_vec_pretty(&sc).unwrap()
+    }
+
+    #[tokio::test]
+    async fn typed_text_survives_a_remote_sidecar_change() {
+        let (root, data) = dirs("sidecar");
+        let g = FakeDrive::default();
+        let meta = g.create_folder("root", META_DIR).await.unwrap();
+        let id = g.add(&meta, "abc.json", &sidecar_json("ocr v1", false));
+        cycle(&g, "root", &root, &data).await;
+
+        // Typed here; meanwhile another device re-read the text with OCR.
+        write_settled(&root.join(META_DIR).join("abc.json"), &sidecar_json("typed by me", true));
+        g.set_bytes(&id, &sidecar_json("ocr v2", false));
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let local: sidecar::Sidecar =
+            serde_json::from_slice(&std::fs::read(root.join(META_DIR).join("abc.json")).unwrap()).unwrap();
+        assert_eq!(local.ocr.unwrap().text, "typed by me");
+        assert!(r.retry_soon, "the merged sidecar uploads on the next pass");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn local_rename_renames_on_drive() {
+        let (root, data) = dirs("rename");
+        let g = FakeDrive::default();
+        let id = g.add("root", "Cat.png", b"meow");
+        cycle(&g, "root", &root, &data).await;
+
+        // Case-only on purpose: on Windows/macOS "Cat.png" still "exists" afterwards.
+        std::fs::rename(root.join("Cat.png"), root.join("cat.png")).unwrap();
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(g.get(&id).name, "cat.png");
+        assert_eq!(g.names(), ["cat.png"], "renamed, no duplicate upload");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn drive_rename_onto_an_occupied_name_keeps_both() {
+        let (root, data) = dirs("occupied");
+        let g = FakeDrive::default();
+        let id = g.add("root", "a.png", b"synced");
+        cycle(&g, "root", &root, &data).await;
+
+        std::fs::write(root.join("b.png"), b"unrelated").unwrap();
+        g.rename_to(&id, "b.png");
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(std::fs::read(root.join("b.png")).unwrap(), b"synced");
+        assert_eq!(std::fs::read(root.join("b (this device).png")).unwrap(), b"unrelated");
+        assert!(!root.join("a.png").exists());
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn failed_pass_keeps_the_old_bookmark() {
+        let (root, data) = dirs("bookmark");
+        let g = FakeDrive { fail_downloads: true, ..Default::default() };
+        g.add("root", "cat.png", b"meow");
+
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(!r.errors.is_empty());
+        assert_eq!(SyncState::load(&data, "root").page_token, None, "next check must retry, not skip");
+        cleanup(&root);
+    }
+
 }

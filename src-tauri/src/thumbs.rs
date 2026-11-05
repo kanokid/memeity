@@ -37,10 +37,11 @@ pub fn cache_dir(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_cache_dir().ok().map(|d| d.join("thumbs"))
 }
 
-/// Handles one `thumb://` request (called on a worker thread).
-pub async fn respond(app: AppHandle, uri_path: String) -> Response<Vec<u8>> {
-    let _permit = permits().acquire().await;
-    let result = tauri::async_runtime::spawn_blocking(move || serve(&app, &uri_path))
+/// Handles one `thumb://` request (called on a worker thread). `full` serves the
+/// original file instead of a thumbnail.
+pub async fn respond(app: AppHandle, uri_path: String, full: bool) -> Response<Vec<u8>> {
+    let _permit = if full { None } else { Some(permits().acquire().await) };
+    let result = tauri::async_runtime::spawn_blocking(move || serve(&app, &uri_path, full))
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r);
@@ -59,15 +60,30 @@ pub async fn respond(app: AppHandle, uri_path: String) -> Response<Vec<u8>> {
     }
 }
 
-fn serve(app: &AppHandle, uri_path: &str) -> Result<(Vec<u8>, &'static str), String> {
+fn serve(app: &AppHandle, uri_path: &str, full: bool) -> Result<(Vec<u8>, &'static str), String> {
     let path = PathBuf::from(percent_decode_str(uri_path.trim_start_matches('/')));
     // Only ever read files that are in the meme library.
     let known = app.state::<crate::AppState>().library.read().unwrap().contains(&path);
     if !known {
         return Err("not in the library".into());
     }
+    if full {
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        return Ok((bytes, original_mime(&path)));
+    }
     let dir = cache_dir(app).ok_or("no cache dir")?;
     thumbnail(&dir, &path)
+}
+
+fn original_mime(path: &Path) -> &'static str {
+    match path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Returns the cached thumbnail for `path`, making it first if needed.

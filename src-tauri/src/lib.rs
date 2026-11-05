@@ -31,7 +31,7 @@ use std::sync::{Mutex, RwLock};
 use sync::SyncStatus;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
@@ -373,7 +373,8 @@ fn toggle_pane(app: &AppHandle) {
 
 // ---------- local library ----------
 
-/// Index the local mirror, watch it, and let the webview load thumbnails from it.
+/// Index the local mirror and watch it. (The webview loads images through `thumb://`,
+/// which only serves files in the current library, so no folder is ever opened up to it.)
 fn load_library(app: &AppHandle) {
     let state = app.state::<AppState>();
     let Some((_, dir)) = sync_target(app) else {
@@ -386,9 +387,6 @@ fn load_library(app: &AppHandle) {
         eprintln!("[memeity] couldn't create {}: {e}", dir.display());
     }
     sync::sweep_held_deletes(&dir);
-    if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
-        eprintln!("[memeity] couldn't allow asset scope: {e}");
-    }
     let cache = state.library.read().unwrap().dims_cache();
     let mut lib = Library::scan(&dir);
     lib.fill_dims(&cache);
@@ -475,8 +473,10 @@ fn get_status(app: AppHandle) -> Status {
     status(&app)
 }
 
-#[tauri::command]
-fn search(state: State<'_, AppState>, query: String, offset: Option<usize>, limit: usize) -> SearchResult {
+/// Runs on a worker thread (`async`), not the UI thread: it runs on every keystroke.
+#[tauri::command(async)]
+fn search(app: AppHandle, query: String, offset: Option<usize>, limit: usize) -> SearchResult {
+    let state = app.state::<AppState>();
     /// How many image-text matches to consider for ranking.
     const TEXT_HITS: usize = 500;
     let text_bonus = if query.trim().is_empty() {
@@ -550,7 +550,7 @@ struct MemeText {
 }
 
 /// What OCR found in a meme, from its sidecar.
-#[tauri::command]
+#[tauri::command(async)]
 fn meme_text(app: AppHandle, path: String) -> Result<MemeText, String> {
     let (_, root) = sync_target(&app).ok_or("No Drive folder selected.")?;
     let path = PathBuf::from(path);
@@ -593,7 +593,7 @@ struct Duplicates {
     pending: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn find_duplicates(app: AppHandle) -> Result<Duplicates, String> {
     let state = app.state::<AppState>();
     let (candidates, pending) = {
@@ -641,10 +641,10 @@ fn library_rel(app: &AppHandle, path: &std::path::Path) -> Result<(PathBuf, Stri
     Ok((root, rel))
 }
 
-/// Renames a meme (keeping its extension and folder). Sync spots the rename (same
-/// bytes, new name) and renames it on Drive too. Returns the new path.
+/// Renames a meme (keeping its extension and folder), here and on Drive. Returns the
+/// new path.
 #[tauri::command]
-fn rename_meme(app: AppHandle, path: String, name: String) -> Result<String, String> {
+async fn rename_meme(app: AppHandle, path: String, name: String) -> Result<String, String> {
     let path = PathBuf::from(path);
     library_rel(&app, &path)?;
     let stem = sync::sanitize(name.trim());
@@ -657,20 +657,15 @@ fn rename_meme(app: AppHandle, path: String, name: String) -> Result<String, Str
     if dest == path {
         return Ok(path.to_string_lossy().into_owned());
     }
-    // Windows/macOS names are case-insensitive: "Cat.png" -> "cat.png" is a rename, not a clash.
-    let same_file = dest.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
-    if dest.exists() && !same_file {
-        return Err(format!("There's already a meme called {file_name}."));
-    }
-    std::fs::rename(&path, &dest).map_err(|e| format!("Couldn't rename: {e}"))?;
+    // Checks for a clash (a case-only rename like "Cat.png" -> "cat.png" isn't one).
+    sync::rename(&app, &path, &dest).await?;
     refresh_library(&app);
-    sync::trigger(&app);
     Ok(dest.to_string_lossy().into_owned())
 }
 
 /// Replaces a meme's recognized text with what the user typed. Stored in its sidecar
 /// (so it syncs everywhere) and marked as edited, so OCR never overwrites it.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_meme_text(app: AppHandle, path: String, text: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     let (root, rel) = library_rel(&app, &path)?;
@@ -918,11 +913,13 @@ pub fn run() {
 
     tauri::Builder::default()
         // Grid thumbnails: `thumb://<path>`, made on demand and cached (see thumbs.rs).
+        // `?full=1` serves the original instead (details preview, animated GIFs).
         .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             let uri_path = request.uri().path().to_string();
+            let full = request.uri().query().is_some_and(|q| q.split('&').any(|p| p == "full=1"));
             tauri::async_runtime::spawn(async move {
-                responder.respond(thumbs::respond(app, uri_path).await);
+                responder.respond(thumbs::respond(app, uri_path, full).await);
             });
         })
         .plugin(tauri_plugin_dialog::init())
@@ -964,6 +961,7 @@ pub fn run() {
             settings::open_settings,
             settings::set_shortcut,
             settings::reset_shortcut,
+            settings::retry_shortcut,
             settings::set_autostart,
             settings::set_primary_action,
             settings::reread_all_text,
@@ -1063,8 +1061,11 @@ pub fn run() {
 
             // Opened by hand: show the pane so it's obvious memeity is running. Started at
             // login: stay quietly in the tray/menu bar until the shortcut is pressed.
+            // Also show it if the shortcut couldn't be registered: otherwise there'd be
+            // no (obvious) way to open memeity, and nothing saying why.
             let at_login = std::env::args().any(|a| a == settings::AUTOSTART_ARG);
-            if !at_login || !is_ready(&handle) {
+            let shortcut_failed = app.state::<AppState>().shortcut_error.lock().unwrap().is_some();
+            if !at_login || !is_ready(&handle) || shortcut_failed {
                 show_pane(&handle);
             } else {
                 settings::update_activation_policy(&handle);

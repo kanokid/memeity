@@ -209,7 +209,7 @@ pub async fn add_url(app: &AppHandle, url: &str) -> Result<ImportResult, String>
 
 /// Raw image bytes in the request body (from a drop or a paste); the original filename,
 /// if any, comes percent-encoded in the `x-filename` header.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_bytes(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<ImportResult, String> {
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("Expected raw image bytes.".into());

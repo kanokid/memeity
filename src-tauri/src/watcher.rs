@@ -32,13 +32,25 @@ pub fn watch(app: AppHandle, root: PathBuf) -> Option<RecommendedWatcher> {
 
     std::thread::spawn(move || {
         while let Ok(event) = rx.recv() {
-            let relevant = matches!(&event, Ok(e) if !matches!(e.kind, EventKind::Access(_)) && !only_hidden(&root, e));
-            if !relevant {
+            let relevant = |event: &notify::Result<Event>| {
+                matches!(event, Ok(e) if !matches!(e.kind, EventKind::Access(_)) && !only_hidden(&root, e))
+            };
+            if !relevant(&event) {
                 continue;
             }
+            // Did anything other than sync itself (downloads, renames) touch the folder?
+            let mut by_others = false;
+            let mut note = |event: &notify::Result<Event>| {
+                if let Ok(e) = event
+                    && relevant(event)
+                {
+                    by_others |= e.paths.iter().any(|p| !p.starts_with(root.join(".memeity-tmp")) && !sync::is_own_write(p));
+                }
+            };
+            note(&event);
             loop {
                 match rx.recv_timeout(DEBOUNCE) {
-                    Ok(_) => continue,
+                    Ok(more) => note(&more),
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -57,8 +69,11 @@ pub fn watch(app: AppHandle, root: PathBuf) -> Option<RecommendedWatcher> {
                 *lib = fresh;
             }
             let _ = app.emit("library-changed", ());
-            // New local files should head up to Drive, and get their text read.
-            sync::trigger(&app);
+            // New local files should head up to Drive, and get their text read. Changes
+            // sync made itself don't need another sync (it refreshes the library itself).
+            if by_others {
+                sync::trigger(&app);
+            }
             crate::textindex::trigger(&app);
         }
     });

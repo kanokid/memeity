@@ -67,10 +67,16 @@
   let hits = $state<Hit[]>([]);
   let selected = $state(0);
   let hovered = $state(-1);
+  const stage = $derived(status?.stage);
+  const current = $derived(hits[selected]);
 
-  /** Small cached thumbnail (see thumbs.rs), or the original for animated memes in play. */
-  function tileSrc(hit: Hit, i: number) {
-    if (hit.animated && (i === selected || i === hovered)) return convertFileSrc(hit.path);
+  /**
+   * Small cached thumbnail (see thumbs.rs), or the original for animated memes in play
+   * (`active` = selected or hovered). Pure, so a tile's src only re-renders when its own
+   * `active` flips, not on every arrow key / hover elsewhere in the grid.
+   */
+  function tileSrc(hit: Hit, active: boolean) {
+    if (hit.animated && active) return `${convertFileSrc(hit.path, "thumb")}?full=1&v=${hit.version}`;
     return `${convertFileSrc(hit.path, "thumb")}?v=${hit.version}`;
   }
   let confirmDelete = $state<Hit | null>(null);
@@ -90,7 +96,10 @@
     edited: boolean;
   };
   let showDetails = $state(false);
-  let details = $state<MemeText | null>(null);
+  /** The last text loaded, tagged with the meme it belongs to. */
+  let loaded = $state<{ path: string; text: MemeText } | null>(null);
+  /** Text for the *current* meme only: never a previous selection's text while the new one loads. */
+  const details = $derived(loaded && loaded.path === current?.path ? loaded.text : null);
   let copiedText = $state(false);
   let detailsSeq = 0;
 
@@ -104,7 +113,7 @@
     const seq = ++detailsSeq;
     invoke<MemeText>("meme_text", { path })
       .then((t) => {
-        if (seq === detailsSeq) details = t;
+        if (seq === detailsSeq) loaded = { path, text: t };
       })
       .catch((e) => {
         if (seq === detailsSeq) error = String(e);
@@ -114,7 +123,7 @@
   function toggleDetails(open = !showDetails) {
     if (open && !current) return;
     showDetails = open;
-    details = null;
+    loaded = null;
     copiedText = false;
     renaming = false;
     editingText = false;
@@ -154,16 +163,35 @@
     act(async () => {
       if (!current) return;
       const path = current.path;
-      await invoke<string>("rename_meme", { path, name: nameDraft });
+      const renamed = await invoke<string>("rename_meme", { path, name: nameDraft });
       stopEditing();
+      // Keep the renamed meme selected (its rank, and so its index, may have changed).
+      pendingSelectPath = renamed;
       await refresh();
     });
 
+  /**
+   * Opens the text editor pre-filled with the meme's current text. Waits for that text to
+   * load first, so the editor never opens empty (saving that would wipe the real text).
+   */
   async function startEditText() {
-    if (!current) return;
+    const hit = current;
+    if (!hit) return;
     if (!showDetails) toggleDetails(true);
     renaming = false;
-    textDraft = details?.text ?? "";
+    let text = details;
+    if (!text) {
+      try {
+        text = await invoke<MemeText>("meme_text", { path: hit.path });
+      } catch (e) {
+        error = String(e);
+        return;
+      }
+      // The selection moved on (or details closed) while loading: don't edit the wrong meme.
+      if (current?.path !== hit.path || !showDetails) return;
+      loaded = { path: hit.path, text };
+    }
+    textDraft = text.text ?? "";
     editingText = true;
     await tick();
     textInput?.focus();
@@ -171,10 +199,11 @@
 
   const saveText = () =>
     act(async () => {
-      if (!current) return;
-      await invoke("set_meme_text", { path: current.path, text: textDraft });
+      if (!editingText || !current) return;
+      const path = current.path; // fixed before any await: the selection may change meanwhile
+      await invoke("set_meme_text", { path, text: textDraft });
       stopEditing();
-      details = await invoke<MemeText>("meme_text", { path: current.path });
+      loaded = { path, text: await invoke<MemeText>("meme_text", { path }) };
       await runSearch(false); // the new text is searchable right away
     });
 
@@ -207,8 +236,15 @@
   let input: HTMLInputElement | undefined = $state();
   let grid: HTMLDivElement | undefined = $state();
 
-  const stage = $derived(status?.stage);
-  const current = $derived(hits[selected]);
+  /** Platform-specific wording for shortcut hints (the handlers accept Ctrl or Cmd). */
+  const isMac = navigator.userAgent.includes("Mac");
+  const MOD = isMac ? "⌘" : "Ctrl";
+  const credentialStore = isMac
+    ? "your macOS Keychain"
+    : navigator.userAgent.includes("Windows")
+      ? "Windows Credential Manager"
+      : "your system keyring";
+
 
   // ---------- masonry layout ----------
 
@@ -227,17 +263,90 @@
     const col: number[] = [];
     const row: number[] = [];
     const mid: number[] = []; // vertical centre of each tile
+    const ratio: number[] = []; // height / width of each tile
+    const top: number[] = []; // sum of the ratios of the tiles above it in its column
+    const sums = new Array<number>(COLS).fill(0);
     hits.forEach((hit, i) => {
       const c = heights.indexOf(Math.min(...heights));
       const r = ratioOf(hit);
       col[i] = c;
       row[i] = cols[c].length;
       mid[i] = heights[c] + r / 2;
+      ratio[i] = r;
+      top[i] = sums[c];
       cols[c].push(i);
       heights[c] += r + GAP_UNITS;
+      sums[c] += r;
     });
-    return { cols, col, row, mid };
+    return { cols, col, row, mid, ratio, top };
   });
+
+  // ---------- windowing ----------
+  // Only tiles near the viewport are rendered; each column is padded above and below to
+  // its full computed height, so the scrollbar and positions match the full layout.
+
+  /** Must match the .masonry / .col CSS. */
+  const GRID_PAD_Y = 20;
+  const GRID_PAD_X = 22;
+  const GAP_PX = 14;
+
+  let scrollTop = $state(0);
+  let viewH = $state(0);
+  let colW = $state(0);
+
+  function measureGrid() {
+    if (!grid) return;
+    viewH = grid.clientHeight;
+    scrollTop = grid.scrollTop;
+    colW = Math.max(1, (grid.clientWidth - 2 * GRID_PAD_X - (COLS - 1) * GAP_PX) / COLS);
+  }
+
+  $effect(() => {
+    const el = grid;
+    if (!el) return;
+    measureGrid();
+    const ro = new ResizeObserver(measureGrid);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  /** A tile's top, relative to the start of its column, in px. */
+  const tileTopPx = (i: number) => masonry.top[i] * colW + masonry.row[i] * GAP_PX;
+  const tileHeightPx = (i: number) => masonry.ratio[i] * colW;
+
+  /** Per column: the rendered slice plus the padding standing in for the rest. */
+  const windowed = $derived.by(() => {
+    // Not measured yet: render the first screenful-ish so there's something to measure.
+    const buffer = viewH || 1000;
+    const from = scrollTop - GRID_PAD_Y - buffer;
+    const to = scrollTop - GRID_PAD_Y + (viewH || 1000) + buffer;
+    return masonry.cols.map((column) => {
+      if (column.length === 0) return { items: [] as number[], padTop: 0, padBottom: 0 };
+      let start = 0;
+      while (start < column.length - 1 && tileTopPx(column[start]) + tileHeightPx(column[start]) < from) start++;
+      let end = start;
+      while (end < column.length - 1 && tileTopPx(column[end + 1]) <= to) end++;
+      const lastI = column[column.length - 1];
+      const colHeight = tileTopPx(lastI) + tileHeightPx(lastI);
+      const endI = column[end];
+      return {
+        items: column.slice(start, end + 1),
+        padTop: tileTopPx(column[start]),
+        padBottom: Math.max(0, colHeight - tileTopPx(endI) - tileHeightPx(endI)),
+      };
+    });
+  });
+
+  /** Scrolls the grid just enough to show tile `i` (it may not be rendered yet). */
+  function scrollToTile(i: number) {
+    if (!grid || masonry.top[i] === undefined) return;
+    measureGrid();
+    const margin = 6; // room for the selection ring
+    const top = GRID_PAD_Y + tileTopPx(i) - margin;
+    const bottom = GRID_PAD_Y + tileTopPx(i) + tileHeightPx(i) + margin;
+    if (top < grid.scrollTop) grid.scrollTop = top;
+    else if (bottom > grid.scrollTop + grid.clientHeight) grid.scrollTop = bottom - grid.clientHeight;
+  }
 
   /** The tile in column `c` whose centre is closest to tile `i`'s centre. */
   function nearestIn(c: number, i: number) {
@@ -296,6 +405,12 @@
     }
   }
 
+  /** The shortcut was taken at startup: try registering it again. */
+  const retryShortcut = () =>
+    act(async () => {
+      status = await invoke<Status>("retry_shortcut");
+    });
+
   // ---------- setup / sign in ----------
 
   const loadClientFile = () =>
@@ -325,35 +440,55 @@
 
   /** Total matches for the current query (hits may hold fewer: pages load as you scroll). */
   let total = $state(0);
-  let loadingMore = false;
+  /** The search (searchSeq) whose next page is loading, so an old query's slow page can't block a new one. */
+  let loadingMoreSeq = -1;
+  /** After a rename: select this meme (by its new path) once the results include it. */
+  let pendingSelectPath: string | null = null;
 
   async function runSearch(resetSelection: boolean) {
     const seq = ++searchSeq;
+    if (resetSelection) pendingSelectPath = null;
     // A refresh (library changed) keeps however many pages were already loaded.
     const limit = resetSelection ? PAGE : Math.max(PAGE, hits.length);
-    const res = await invoke<SearchResult>("search", { query, offset: 0, limit });
+    let res: SearchResult;
+    try {
+      res = await invoke<SearchResult>("search", { query, offset: 0, limit });
+    } catch (e) {
+      if (seq === searchSeq) error = `Search failed: ${e}`;
+      return;
+    }
     if (seq !== searchSeq) return; // a newer keystroke already won
     hits = res.hits;
     total = res.total;
     selected = resetSelection ? 0 : Math.min(selected, Math.max(hits.length - 1, 0));
+    const follow = pendingSelectPath;
+    pendingSelectPath = null;
+    const found = follow ? hits.findIndex((h) => h.path === follow) : -1;
+    if (found >= 0) selected = found;
     if (resetSelection) grid?.scrollTo({ top: 0 });
     await tick();
+    if (found >= 0) scrollToTile(found);
     maybeLoadMore(); // the first page might not fill the pane
   }
 
   /** Appends the next page of results. */
   async function loadMore() {
-    if (loadingMore || hits.length >= total) return;
-    loadingMore = true;
     const seq = searchSeq;
+    if (loadingMoreSeq === seq || hits.length >= total) return;
+    loadingMoreSeq = seq;
     try {
       const res = await invoke<SearchResult>("search", { query, offset: hits.length, limit: PAGE });
       if (seq !== searchSeq) return; // the query changed meanwhile
       hits = [...hits, ...res.hits];
       total = res.total;
+    } catch (e) {
+      if (seq === searchSeq) error = `Couldn't load more results: ${e}`;
+      return;
     } finally {
-      loadingMore = false;
+      if (loadingMoreSeq === seq) loadingMoreSeq = -1;
     }
+    await tick();
+    maybeLoadMore(); // still short of the pane's end (or the selection's)?
   }
 
   /** Loads more if the grid is scrolled near its end (or doesn't overflow yet). */
@@ -367,7 +502,7 @@
     confirmDelete = null;
     selected = Math.max(0, Math.min(hits.length - 1, i));
     await tick();
-    grid?.querySelector(`[data-i="${selected}"]`)?.scrollIntoView({ block: "nearest" });
+    scrollToTile(selected); // from the computed layout: the tile may not be rendered yet
     // Arrowing towards the end loads the next page before you hit it.
     if (selected >= hits.length - COLS * 3) loadMore();
   }
@@ -544,10 +679,10 @@
   const actions = $derived([
     { ...(pasteFirst ? pasteAction : copyAction), keys: "↵" },
     { ...(pasteFirst ? copyAction : pasteAction), keys: "Shift ↵" },
-    { label: "Show in Folder", keys: "Ctrl Shift F", danger: false, run: (i: number) => reveal(i) },
+    { label: "Show in Folder", keys: `${MOD} Shift F`, danger: false, run: (i: number) => reveal(i) },
     {
       label: "Show Text",
-      keys: "Ctrl I",
+      keys: `${MOD} I`,
       danger: false,
       run: (i: number) => {
         select(i);
@@ -567,14 +702,12 @@
       keys: "",
       danger: false,
       run: (i: number) => {
-        select(i);
-        toggleDetails(true);
-        setTimeout(startEditText, 150); // once its current text has loaded
+        select(i).then(startEditText); // waits for the meme's current text before editing
       },
     },
     {
       label: "Delete Meme…",
-      keys: "Ctrl ⌫",
+      keys: `${MOD} ⌫`,
       danger: true,
       run: (i: number) => {
         confirmDelete = hits[i];
@@ -719,9 +852,14 @@
       }),
       listen("library-changed", () => refresh()),
       listen("sync-status", () => refresh()),
+      listen("status-changed", () => refresh()), // e.g. a new shortcut picked in Settings
       listen("ocr-status", async () => {
         // Progress ticks often; only refresh the status, not the search results.
-        status = await invoke<Status>("get_status");
+        try {
+          status = await invoke<Status>("get_status");
+        } catch (e) {
+          error = String(e);
+        }
       }),
     ];
     const timer = setInterval(() => (now = Date.now()), 5000);
@@ -805,7 +943,7 @@
       {/if}
       <button
         class="icon-btn"
-        title="Settings (Ctrl+,)"
+        title={`Settings (${MOD}${isMac ? "" : "+"},)`}
         aria-label="Settings"
         onmousedown={(e) => e.preventDefault()}
         onclick={() => invoke("open_settings")}
@@ -819,7 +957,13 @@
   {/if}
 
   {#if status?.shortcut_error}
-    <div class="banner">{status.shortcut_error}</div>
+    <div class="banner shortcut-banner" role="alert">
+      <span>{status.shortcut_error} Until then, open memeity from its {isMac ? "menu bar" : "tray"} icon.</span>
+      <span class="banner-actions">
+        <button class="btn sm" onclick={() => invoke("open_settings")}>Choose another…</button>
+        <button class="btn ghost sm" onclick={retryShortcut} disabled={busy}>Try again</button>
+      </span>
+    </div>
   {/if}
   {#if error}
     <!-- Full error text (not truncated) and selectable, so it can be copied into a bug report. -->
@@ -845,8 +989,8 @@
           It can only see files it creates, never the rest of your Drive.
         </p>
         <p class="callout">
-          Your browser will open to sign in. If Google says it <b>hasn't verified this app</b>, click <b>Continue</b>.
-          Your sign-in stays in Windows Credential Manager.
+          Your browser will open to sign in.
+          Your sign-in stays in {credentialStore}.
         </p>
         <button class="btn primary" onclick={signIn} disabled={busy}>
           {busy ? "Waiting for your browser…" : "Sign in with Google"}
@@ -889,13 +1033,15 @@
           bind:this={grid}
           onscroll={() => {
             menu = null;
+            if (grid) scrollTop = grid.scrollTop;
             maybeLoadMore();
           }}
         >
-          {#each masonry.cols as column, c (c)}
-            <div class="col">
-              {#each column as i (hits[i].path)}
+          {#each windowed as w, c (c)}
+            <div class="col" style:padding-top="{w.padTop}px" style:padding-bottom="{w.padBottom}px">
+              {#each w.items as i (hits[i].path)}
                 {@const hit = hits[i]}
+                {@const active = i === selected || i === hovered}
                 <button
                   class="tile"
                   class:selected={i === selected}
@@ -915,7 +1061,7 @@
                   onmouseenter={() => (hovered = i)}
                   onmouseleave={() => (hovered = -1)}
                 >
-                  <img src={tileSrc(hit, i)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
+                  <img src={tileSrc(hit, active)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
                 </button>
               {/each}
             </div>
@@ -927,7 +1073,7 @@
     {#if stage === "ready" && showDetails && current}
       <div class="details">
         <div class="preview">
-          <img src={convertFileSrc(current.path)} alt={current.name} draggable="false" />
+          <img src={`${convertFileSrc(current.path, "thumb")}?full=1&v=${current.version}`} alt={current.name} draggable="false" />
         </div>
         <aside class="info">
           <p class="label">File</p>
@@ -971,7 +1117,7 @@
             ></textarea>
             <div class="edit-actions">
               <button class="btn ghost sm" onclick={stopEditing}>Cancel</button>
-              <button class="btn primary sm" onclick={saveText} disabled={busy}>Save <kbd>Ctrl</kbd><kbd>↵</kbd></button>
+              <button class="btn primary sm" onclick={saveText} disabled={busy}>Save <kbd>{MOD}</kbd><kbd>↵</kbd></button>
             </div>
           {:else if !details}
             <div class="ocr-text skeleton-text"></div>
@@ -1063,7 +1209,7 @@
           {pasteFirst ? "Copy" : "Paste"} <kbd>Shift</kbd><kbd>↵</kbd>
         </button>
         <span class="divider"></span>
-        <button class="action" onclick={openActions}>Actions <kbd>Ctrl</kbd><kbd>K</kbd></button>
+        <button class="action" onclick={openActions}>Actions <kbd>{MOD}</kbd><kbd>K</kbd></button>
       {/if}
     {/if}
   </footer>
@@ -1224,6 +1370,19 @@
     background: var(--muted);
     color: var(--fg);
     font-size: 12px;
+  }
+
+  .shortcut-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .banner-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+    margin-left: auto;
   }
 
   .error-banner {
@@ -1543,8 +1702,7 @@
     font-size: 12px !important;
   }
 
-  .empty b,
-  .callout b {
+  .empty b {
     color: var(--fg);
     font-weight: 500;
   }

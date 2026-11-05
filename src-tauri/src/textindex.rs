@@ -15,7 +15,7 @@ use crate::ocr::{self, Engine};
 use crate::sidecar::{self, Sidecar};
 use crate::{sync, sync_target, AppState};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,12 @@ const OCR_GRACE: Duration = Duration::from_secs(180);
 
 /// Refresh search results / upload sidecars every this many OCR'd memes.
 const BATCH: usize = 10;
+/// A meme whose image can't be read is retried this many times (on later passes)
+/// before it's indexed as text-less for good. One failure is often temporary: a file
+/// still being written, or locked by another app.
+const OCR_ATTEMPTS: u32 = 3;
+/// Wait this long before retrying memes that failed.
+const OCR_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Default, Serialize)]
 pub struct OcrStatus {
@@ -46,9 +52,11 @@ pub fn spawn(app: AppHandle, rx: Receiver<()>) {
         // Loaded (and, the first time, downloaded) on first use, then kept. A failure
         // (e.g. offline) isn't cached: the next pass simply tries again.
         let mut engine: Option<Engine> = None;
+        // OCR failures so far, per meme (relative path).
+        let mut failures: HashMap<String, u32> = HashMap::new();
         while rx.recv().is_ok() {
             while rx.try_recv().is_ok() {} // coalesce
-            if let Err(e) = run(&app, &rx, &mut engine) {
+            if let Err(e) = run(&app, &rx, &mut engine, &mut failures) {
                 eprintln!("[memeity] text indexing: {e}");
             }
         }
@@ -84,7 +92,12 @@ struct Pending {
     md5: String,
 }
 
-fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Result<(), String> {
+fn run(
+    app: &AppHandle,
+    rx: &Receiver<()>,
+    engine: &mut Option<Engine>,
+    failures: &mut HashMap<String, u32>,
+) -> Result<(), String> {
     let Some((_, root)) = sync_target(app) else { return Ok(()) };
     let (memes, thumb_keys): (Vec<(String, PathBuf)>, HashSet<String>) = {
         let state = app.state::<AppState>();
@@ -216,6 +229,7 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
     set_status(app, OcrStatus { state: "reading", done: 0, total, message: None });
 
     let mut rerun = false;
+    let mut retry_later = false;
     for (n, item) in pending.into_iter().enumerate() {
         if rx.try_recv().is_ok() {
             rerun = true; // the library changed meanwhile; go round again after this pass
@@ -225,6 +239,7 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
         }
         match engine.recognize(&item.path) {
             Ok(text) => {
+                failures.remove(&item.rel);
                 let text = text.trim().to_string();
                 // Merge into any existing sidecar so we never clobber tags/unknown fields.
                 let mut sc: Sidecar = sidecar::read(&root, &item.md5).unwrap_or_default();
@@ -249,9 +264,16 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
                 app.state::<AppState>().text_cache.lock().unwrap().set(&item.rel, &text, &sc.tags);
             }
             Err(e) => {
-                // Unreadable image: index it as text-less so we don't retry every pass.
-                eprintln!("[memeity] OCR failed for {}: {e}", item.rel);
-                with_index(app, |idx| idx.set_text(&item.rel, "", &[], None, Some(ocr::ENGINE_NAME)))?;
+                let attempts = failures.entry(item.rel.clone()).or_insert(0);
+                *attempts += 1;
+                eprintln!("[memeity] OCR failed for {} (attempt {attempts}): {e}", item.rel);
+                if *attempts >= OCR_ATTEMPTS {
+                    // Really unreadable: index it as text-less so we stop retrying.
+                    failures.remove(&item.rel);
+                    with_index(app, |idx| idx.set_text(&item.rel, "", &[], None, Some(ocr::ENGINE_NAME)))?;
+                } else {
+                    retry_later = true; // still pending; a later pass tries again
+                }
             }
         }
 
@@ -266,6 +288,13 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
     set_status(app, OcrStatus { state: "idle", ..Default::default() });
     let _ = app.emit("library-changed", ());
     sync::trigger(app);
+    if retry_later {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(OCR_RETRY_AFTER);
+            trigger(&app);
+        });
+    }
     if rerun {
         trigger(app);
     } else {
