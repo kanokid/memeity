@@ -38,9 +38,17 @@ walkdir = "2"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 tauri-plugin-autostart = "2"
+enigo = "0.6"
 
 # OCR via Windows.Media.Ocr (WinRT). Same `windows` version Tauri already uses.
 [target.'cfg(windows)'.dependencies]
+# Instant insert: save/restore the clipboard and refocus the previous app.
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_UI_WindowsAndMessaging",
+] }
 windows = { version = "0.62", features = [
   "Foundation",
   "Globalization",
@@ -51,6 +59,13 @@ windows = { version = "0.62", features = [
   "Win32_Graphics_Dwm",
   "Win32_System_WinRT",
 ] }
+
+# macOS: re-apply the Dock icon after switching between menu-bar-only and Dock modes.
+# Same versions Tauri itself uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", features = ["NSData"] }
 
 # `tauri dev` builds are unoptimized, which makes image decoding/encoding ~50x slower
 # (seconds per copy for big memes). Optimize dependencies only; our own code stays debuggable.

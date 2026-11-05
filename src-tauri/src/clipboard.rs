@@ -67,7 +67,7 @@ fn with_retries(
 }
 
 /// Sniffs the file header (not the extension, since memes are often misnamed).
-fn is_animated(path: &Path) -> bool {
+pub(crate) fn is_animated(path: &Path) -> bool {
     let mut head = [0u8; 32];
     let Ok(n) = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) else {
         return false;

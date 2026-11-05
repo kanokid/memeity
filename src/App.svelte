@@ -233,6 +233,20 @@
       if (hit) await invoke("copy_meme", { path: hit.path }); // hides the pane on success
     });
 
+  /** Instant insert (Shift+Enter / Shift+click): paste into the app you were in. */
+  const insert = (i = selected) =>
+    act(async () => {
+      const hit = hits[i];
+      if (hit) await invoke("insert_meme", { path: hit.path }); // hides the pane itself
+    });
+
+  /** Show in folder (Ctrl+Shift+F): Explorer/Finder with the meme selected. */
+  const reveal = (i = selected) =>
+    act(async () => {
+      const hit = hits[i];
+      if (hit) await invoke("reveal_meme", { path: hit.path });
+    });
+
   const doDelete = (hit: Hit) =>
     act(async () => {
       confirmDelete = null;
@@ -250,9 +264,11 @@
   // ---------- actions menu ----------
 
   const MENU_W = 230;
-  const MENU_H = 124;
+  const MENU_H = 188;
   const actions = [
     { label: "Copy to Clipboard", keys: "↵", danger: false, run: (i: number) => copy(i) },
+    { label: "Paste to App", keys: "Shift ↵", danger: false, run: (i: number) => insert(i) },
+    { label: "Show in Folder", keys: "Ctrl Shift F", danger: false, run: (i: number) => reveal(i) },
     {
       label: "Show Text",
       keys: "Ctrl I",
@@ -362,6 +378,7 @@
       }
       if (ctrl && key.toLowerCase() === "k") { e.preventDefault(); openActions(); return; }
       if (ctrl && key.toLowerCase() === "i") { e.preventDefault(); toggleDetails(); return; }
+      if (ctrl && e.shiftKey && key.toLowerCase() === "f") { e.preventDefault(); reveal(); return; }
       switch (key) {
         case "ArrowRight": e.preventDefault(); move("right"); break;
         case "ArrowLeft":  e.preventDefault(); move("left"); break;
@@ -369,7 +386,7 @@
         case "ArrowUp":    e.preventDefault(); move("up"); break;
         case "PageDown":   e.preventDefault(); move("down", 3); break;
         case "PageUp":     e.preventDefault(); move("up", 3); break;
-        case "Enter":      e.preventDefault(); copy(); break;
+        case "Enter":      e.preventDefault(); if (e.shiftKey) insert(); else copy(); break;
         case "Backspace":
           // Ctrl+Backspace deletes the selected meme (after confirming). This replaces the
           // search box's delete-a-word shortcut; plain Backspace still edits the search.
@@ -558,10 +575,11 @@
                   style:aspect-ratio="1 / {ratioOf(hit)}"
                   title={hit.name}
                   onmousedown={(e) => e.preventDefault()}
-                  onclick={() => {
-                    // GIF-picker style: one click acts, same as Enter.
+                  onclick={(e) => {
+                    // GIF-picker style: one click acts, same as Enter (Shift = Shift+Enter).
                     select(i);
-                    copy(i);
+                    if (e.shiftKey) insert(i);
+                    else copy(i);
                   }}
                   oncontextmenu={(e) => openMenuAt(e, i)}
                 >
@@ -656,6 +674,7 @@
           </svg>
           Copy to Clipboard <kbd>↵</kbd>
         </button>
+        <button class="action" onclick={() => insert()}>Paste <kbd>Shift</kbd><kbd>↵</kbd></button>
         <span class="divider"></span>
         <button class="action" onclick={openActions}>Actions <kbd>Ctrl</kbd><kbd>K</kbd></button>
       {/if}

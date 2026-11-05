@@ -5,6 +5,7 @@ mod clipboard;
 mod config;
 mod google;
 mod index;
+mod insert;
 mod library;
 mod ocr;
 mod settings;
@@ -20,7 +21,7 @@ use notify::RecommendedWatcher;
 use nucleo_matcher::Matcher;
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use sync::SyncStatus;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -69,6 +70,8 @@ pub struct AppState {
     settings_open: AtomicBool,
     /// Asks the text worker to re-run OCR on every meme on its next pass.
     pub reread_text: AtomicBool,
+    /// The window that was in front before the pane opened: where instant insert pastes.
+    prev_window: AtomicIsize,
 }
 
 // ---------- config & paths ----------
@@ -223,6 +226,7 @@ fn lock_size(win: &WebviewWindow) {
 
 fn show_pane(app: &AppHandle) {
     let Some(win) = pane(app) else { return };
+    remember_foreground(app, &win);
     apply_window_mode(app);
     if is_ready(app) {
         lock_size(&win);
@@ -235,6 +239,19 @@ fn show_pane(app: &AppHandle) {
     let _ = app.emit_to(PANE, "pane-shown", ());
     sync::trigger_if_stale(app);
 }
+
+/// Notes which app the user was in, so instant insert can paste back into it.
+#[cfg(windows)]
+fn remember_foreground(app: &AppHandle, win: &WebviewWindow) {
+    let foreground = insert::win::foreground();
+    let ours = win.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+    if foreground != 0 && foreground != ours {
+        app.state::<AppState>().prev_window.store(foreground, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(windows))]
+fn remember_foreground(_app: &AppHandle, _win: &WebviewWindow) {}
 
 /// Closes the pane instantly (Esc, clicking away, the hotkey, the close button).
 fn hide_pane(app: &AppHandle) {
@@ -448,6 +465,33 @@ fn meme_text(app: AppHandle, path: String) -> Result<MemeText, String> {
     }
 }
 
+/// Instant insert (Shift+Enter): paste the meme into the app the user was in, then
+/// restore their clipboard.
+#[tauri::command]
+async fn insert_meme(app: AppHandle, path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let state = app.state::<AppState>();
+    if !state.library.read().unwrap().contains(&path) {
+        return Err("That file isn't in your meme folder.".into());
+    }
+    let target = state.prev_window.load(Ordering::SeqCst);
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || insert::insert(&handle, &path, target))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Show in folder (Ctrl+Shift+F): open Explorer/Finder with the meme selected.
+#[tauri::command]
+fn reveal_meme(app: AppHandle, path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if !app.state::<AppState>().library.read().unwrap().contains(&path) {
+        return Err("That file isn't in your meme folder.".into());
+    }
+    hide_pane(&app);
+    app.opener().reveal_item_in_dir(&path).map_err(|e| format!("Couldn't show the file: {e}"))
+}
+
 /// Trash a meme on Drive and remove it from this device.
 #[tauri::command]
 async fn delete_meme(app: AppHandle, path: String) -> Result<(), String> {
@@ -635,6 +679,8 @@ pub fn run() {
             search,
             copy_meme,
             meme_text,
+            insert_meme,
+            reveal_meme,
             delete_meme,
             load_client_file,
             sign_in,
@@ -681,6 +727,7 @@ pub fn run() {
                 open_item: Mutex::new(None),
                 settings_open: AtomicBool::new(false),
                 reread_text: AtomicBool::new(false),
+                prev_window: AtomicIsize::new(0),
             });
 
             migrate_auth_scope(&handle);
