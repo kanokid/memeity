@@ -17,8 +17,12 @@ const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const DRIVE: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3/files";
-/// Full Drive scope: we need to read memes added from anywhere, upload, and trash.
-const SCOPE: &str = "https://www.googleapis.com/auth/drive";
+/// Only files memeity itself created (or the user opened with it). Non-sensitive, so
+/// the shared memeity app can be published without Google's security review. The
+/// trade-off: memes must be added through memeity (any device), not Drive's website.
+pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+/// The Drive folder memeity creates in My Drive (and finds again on other devices).
+pub const LIBRARY_FOLDER: &str = "memeity";
 const ITEM_FIELDS: &str = "id,name,mimeType,md5Checksum,modifiedTime";
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
@@ -32,6 +36,13 @@ pub const NOT_SIGNED_IN: &str = "Not signed in to Google.";
 pub struct ClientCreds {
     pub client_id: String,
     pub client_secret: String,
+}
+
+/// memeity's own client, baked in at build time (see build.rs / oauth/HOW-TO.md).
+pub fn embedded_client() -> Option<ClientCreds> {
+    let client_id = option_env!("MEMEITY_GOOGLE_CLIENT_ID")?;
+    let client_secret = option_env!("MEMEITY_GOOGLE_CLIENT_SECRET")?;
+    Some(ClientCreds { client_id: client_id.into(), client_secret: client_secret.into() })
 }
 
 /// Parses the JSON that Google Cloud Console downloads for a "Desktop app" OAuth client.
@@ -286,10 +297,24 @@ impl Google {
         }
     }
 
-    /// Sub-folders of `parent` ("root" = My Drive), sorted by name. For the folder picker.
-    pub async fn list_folders(&self, parent: &str) -> Result<Vec<DriveItem>, String> {
-        let q = format!("'{parent}' in parents and mimeType='{FOLDER_MIME}' and trashed=false");
-        self.list(&q, Some("name")).await
+    /// The "memeity" folder at the top of My Drive: the oldest one memeity can see (one
+    /// made earlier on any device), or a new one. With the drive.file scope, folders the
+    /// user made by hand are invisible to us, so this only ever finds memeity's own.
+    pub async fn find_or_create_library(&self) -> Result<DriveItem, String> {
+        let q = format!(
+            "name = '{LIBRARY_FOLDER}' and mimeType = '{FOLDER_MIME}' and 'root' in parents and trashed = false"
+        );
+        if let Some(existing) = self.list(&q, Some("createdTime")).await?.into_iter().next() {
+            return Ok(existing);
+        }
+        let id = self.create_folder("root", LIBRARY_FOLDER).await?;
+        Ok(DriveItem {
+            id,
+            name: LIBRARY_FOLDER.into(),
+            mime_type: FOLDER_MIME.into(),
+            md5_checksum: None,
+            modified_time: None,
+        })
     }
 
     /// Everything directly inside `parent` that isn't trashed.

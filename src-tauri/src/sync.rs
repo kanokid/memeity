@@ -57,6 +57,10 @@ pub struct SyncStatus {
 #[derive(Default, Serialize, Deserialize)]
 struct SyncState {
     folder_id: String,
+    /// The Drive scope this state was built under. If it changes, the set of files we
+    /// can *see* changes, so stale entries would look like remote deletes. Start over.
+    #[serde(default)]
+    scope: String,
     /// Local relative path (`/`-separated) -> what it was last synced as.
     files: BTreeMap<String, Synced>,
 }
@@ -76,8 +80,12 @@ impl SyncState {
         std::fs::read(Self::file(data_dir))
             .ok()
             .and_then(|b| serde_json::from_slice::<SyncState>(&b).ok())
-            .filter(|s| s.folder_id == folder_id)
-            .unwrap_or_else(|| SyncState { folder_id: folder_id.to_string(), files: BTreeMap::new() })
+            .filter(|s| s.folder_id == folder_id && s.scope == crate::google::SCOPE)
+            .unwrap_or_else(|| SyncState {
+                folder_id: folder_id.to_string(),
+                scope: crate::google::SCOPE.to_string(),
+                files: BTreeMap::new(),
+            })
     }
 
     fn save(&self, data_dir: &Path) -> Result<(), String> {

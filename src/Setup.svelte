@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import logo from "./assets/logo.png";
 
   let { onLoad, busy }: { onLoad: () => void; busy: boolean } = $props();
 
@@ -14,7 +15,7 @@
   const steps: Step[] = [
     {
       title: "Create a Google Cloud project",
-      why: "memeity talks to Google Drive through its own little Google Cloud project. It's free and only you use it.",
+      why: "This copy of memeity was built without its Google sign-in client, so it needs one of your own. Official builds skip this whole setup. Developers: see <b>src-tauri/oauth/HOW-TO.md</b> to build it in instead.",
       link: { label: "Open “New project”", url: "https://console.cloud.google.com/projectcreate" },
       todo: [
         "Sign in with the Google account whose Drive holds your memes.",
@@ -125,8 +126,8 @@
 
 <div class="setup">
   <nav class="rail" aria-label="Setup steps">
-    <p class="brand">memeity</p>
-    <p class="sub">Connect Google Drive</p>
+    <p class="brand"><img src={logo} alt="" width="22" height="22" />memeity</p>
+    <p class="sub">Developer setup</p>
     <ol>
       {#each steps as s, i}
         <li>
@@ -199,10 +200,17 @@
   }
 
   .brand {
-    margin: 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 8px 2px;
     font-size: 14px;
     font-weight: 600;
     letter-spacing: -0.02em;
+  }
+
+  .brand img {
+    flex-shrink: 0;
   }
 
   .sub {

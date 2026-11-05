@@ -15,6 +15,10 @@ pub struct Config {
     pub account: Option<String>,
     /// The Google Drive folder memeity mirrors.
     pub drive_folder: Option<DriveFolder>,
+    /// The Drive access level this device's sign-in was granted. If memeity's scope
+    /// changes, the sign-in is dropped and redone (see `migrate_auth_scope`).
+    #[serde(default)]
+    pub auth_scope: Option<String>,
 }
 
 impl Config {

@@ -3,6 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, tick } from "svelte";
   import Setup from "./Setup.svelte";
+  import logo from "./assets/logo.png";
 
   type Hit = { path: string; name: string; rel: string; width: number | null; height: number | null };
   type SearchResult = { hits: Hit[]; total: number; micros: number };
@@ -101,28 +102,11 @@
     return isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   }
 
-  // folder stage
-  let trail = $state<DriveFolder[]>([{ id: "root", name: "My Drive" }]);
-  let folders = $state<DriveFolder[]>([]);
-  let foldersLoading = $state(false);
-  let folderSel = $state(0);
-
   let input: HTMLInputElement | undefined = $state();
   let grid: HTMLDivElement | undefined = $state();
-  let list: HTMLDivElement | undefined = $state();
 
   const stage = $derived(status?.stage);
   const current = $derived(hits[selected]);
-  const here = $derived(trail[trail.length - 1]);
-  const NEW_FOLDER = "memeity";
-  // Offer to create a "memeity" folder unless one already exists right here.
-  const showCreate = $derived(
-    !foldersLoading && !folders.some((f) => f.name.trim().toLowerCase() === NEW_FOLDER),
-  );
-  const rowOffset = $derived(showCreate ? 1 : 0);
-  const shownFolders = $derived(
-    query.trim() ? folders.filter((f) => f.name.toLowerCase().includes(query.trim().toLowerCase())) : folders,
-  );
 
   // ---------- masonry layout ----------
 
@@ -180,14 +164,10 @@
   // ---------- shared ----------
 
   async function refresh(resetSelection = false) {
-    const prev = status?.stage;
     status = await invoke<Status>("get_status");
     if (status.stage === "ready") await runSearch(resetSelection);
-    if (status.stage === "folder" && prev !== "folder") {
-      query = "";
-      trail = [{ id: "root", name: "My Drive" }];
-      await loadFolders();
-    }
+    // Signed in but no library folder yet (sign-in's own setup failed, e.g. offline): retry once.
+    if (status.stage === "folder" && !folderTried) setupFolder();
   }
 
   async function act<T>(fn: () => Promise<T>) {
@@ -216,59 +196,17 @@
       await refresh(true);
     });
 
-  // ---------- folder picker ----------
+  // ---------- library folder ----------
 
-  async function loadFolders() {
-    foldersLoading = true;
-    folderSel = 0;
-    error = null;
-    try {
-      folders = await invoke<DriveFolder[]>("list_drive_folders", { parent: here.id });
-    } catch (e) {
-      folders = [];
-      error = String(e);
-    } finally {
-      foldersLoading = false;
-    }
-  }
+  /** Set once we've tried, so a failure shows a Retry button instead of looping. */
+  let folderTried = $state(false);
 
-  async function openFolder(f: DriveFolder) {
-    trail = [...trail, f];
-    query = "";
-    await loadFolders();
-  }
-
-  async function goUp(toIndex = trail.length - 2) {
-    if (toIndex < 0 || toIndex >= trail.length - 1) return;
-    trail = trail.slice(0, toIndex + 1);
-    query = "";
-    await loadFolders();
-  }
-
-  const useFolder = (f: DriveFolder) =>
+  const setupFolder = () =>
     act(async () => {
-      if (f.id === "root") return;
-      query = "";
-      status = await invoke<Status>("set_drive_folder", { id: f.id, name: f.name });
+      folderTried = true;
+      status = await invoke<Status>("setup_drive_folder");
       await runSearch(true);
     });
-
-  /** Creates a "memeity" folder in the folder being viewed, and starts syncing it. */
-  const createMemeityFolder = () =>
-    act(async () => {
-      const created = await invoke<DriveFolder>("create_drive_folder", { parent: here.id, name: NEW_FOLDER });
-      query = "";
-      status = await invoke<Status>("set_drive_folder", { id: created.id, name: created.name });
-      await runSearch(true);
-    });
-
-  async function selectFolder(i: number) {
-    const rows = shownFolders.length + rowOffset;
-    if (rows === 0) return;
-    folderSel = Math.max(0, Math.min(rows - 1, i));
-    await tick();
-    list?.querySelector(`[data-i="${folderSel}"]`)?.scrollIntoView({ block: "nearest" });
-  }
 
   // ---------- search grid ----------
 
@@ -307,7 +245,6 @@
     confirmDelete = null;
     menu = null;
     if (stage === "ready") runSearch(true);
-    else folderSel = 0;
   }
 
   // ---------- actions menu ----------
@@ -411,16 +348,6 @@
         e.preventDefault();
         signIn();
       }
-    } else if (stage === "folder") {
-      if (key === "ArrowDown") { e.preventDefault(); selectFolder(folderSel + 1); }
-      else if (key === "ArrowUp") { e.preventDefault(); selectFolder(folderSel - 1); }
-      else if (key === "Enter" && ctrl) { e.preventDefault(); useFolder(here); }
-      else if (key === "Enter") {
-        e.preventDefault();
-        if (showCreate && folderSel === 0) createMemeityFolder();
-        else { const f = shownFolders[folderSel - rowOffset]; if (f) openFolder(f); }
-      }
-      else if (key === "Backspace" && query === "") { e.preventDefault(); goUp(); }
     } else if (stage === "ready") {
       if (confirmDelete) {
         if (key === "Enter") { e.preventDefault(); doDelete(confirmDelete); }
@@ -508,17 +435,13 @@
 {/snippet}
 
 <main class:pane={stage === "ready"}>
-  {#if stage === "folder" || stage === "ready"}
+  {#if stage === "ready"}
     <header>
       <input
         bind:this={input}
         bind:value={query}
         oninput={onInput}
-        placeholder={stage === "folder"
-          ? `Search folders in ${here.name}…`
-          : status?.count
-            ? `Search ${status.count} memes by name or text…`
-            : "Search memes…"}
+        placeholder={status?.count ? `Search ${status.count} memes by name or text…` : "Search memes…"}
         spellcheck="false"
         autocomplete="off"
       />
@@ -551,13 +474,15 @@
       <Setup onLoad={loadClientFile} {busy} />
     {:else if stage === "signin"}
       <div class="empty">
-        <div class="empty-icon">
-          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>
-        </div>
+        <img class="logo" src={logo} alt="memeity" width="64" height="64" />
         <h2>Sign in to Google Drive</h2>
-        <p>memeity syncs one Drive folder to this device. Your browser opens to sign in, and the token stays in Windows Credential Manager.</p>
+        <p>
+          memeity keeps your memes in a <b>memeity</b> folder in your Google Drive and syncs it to every device you sign in on.
+          It can only see files it creates, never the rest of your Drive.
+        </p>
         <p class="callout">
-          Google will say <b>“Google hasn't verified this app”</b>. It's your own project, so click <b>Continue</b>, then allow Drive access.
+          Your browser will open to sign in. If Google says it <b>hasn't verified this app</b>, click <b>Continue</b>.
+          Your sign-in stays in Windows Credential Manager.
         </p>
         <button class="btn primary" onclick={signIn} disabled={busy}>
           {busy ? "Waiting for your browser…" : "Sign in with Google"}
@@ -565,55 +490,16 @@
         </button>
       </div>
     {:else if stage === "folder"}
-      <div class="picker">
-        <nav class="trail">
-          {#each trail as crumb, i (crumb.id)}
-            {#if i > 0}<span class="sep">/</span>{/if}
-            <button class="crumb" disabled={i === trail.length - 1} onclick={() => goUp(i)}>{crumb.name}</button>
-          {/each}
-        </nav>
-        <div class="list" bind:this={list}>
-          {#if foldersLoading}
-            {#each [0, 1, 2, 3] as n (n)}<div class="row skeleton"></div>{/each}
-          {:else}
-            {#if showCreate}
-              <p class="group">Quick start</p>
-              <button
-                class="row"
-                class:selected={folderSel === 0}
-                data-i={0}
-                tabindex="-1"
-                disabled={busy}
-                onmousedown={(e) => e.preventDefault()}
-                onclick={() => (folderSel = 0)}
-                ondblclick={createMemeityFolder}
-              >
-                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-                <span class="row-label">Create “{NEW_FOLDER}” folder in {here.name}</span>
-                <span class="row-hint">Create &amp; use</span>
-              </button>
-            {/if}
-            <p class="group">Folders in {here.name}</p>
-            {#if shownFolders.length === 0}
-              <p class="none">{query.trim() ? "No folders match." : "No sub-folders here."}</p>
-            {/if}
-            {#each shownFolders as f, i (f.id)}
-              <button
-                class="row"
-                class:selected={i + rowOffset === folderSel}
-                data-i={i + rowOffset}
-                tabindex="-1"
-                onmousedown={(e) => e.preventDefault()}
-                onclick={() => (folderSel = i + rowOffset)}
-                ondblclick={() => openFolder(f)}
-              >
-                {@render folderIcon()}
-                <span class="row-label">{f.name}</span>
-                <span class="row-hint">Open</span>
-              </button>
-            {/each}
-          {/if}
-        </div>
+      <div class="empty">
+        <div class="empty-icon">{@render folderIcon()}</div>
+        {#if busy || !folderTried}
+          <h2>Setting up your memeity folder…</h2>
+          <p>Finding (or creating) the <b>memeity</b> folder in your Google Drive.</p>
+        {:else}
+          <h2>Couldn't reach your memeity folder</h2>
+          <p>Check your connection and try again.</p>
+          <button class="btn primary" onclick={setupFolder}>Try again</button>
+        {/if}
       </div>
     {:else if stage === "ready"}
       {#if status.count === 0}
@@ -624,7 +510,7 @@
             <p>Your memes will appear here as they download.</p>
           {:else}
             <h2>No memes in “{status.drive_folder?.name}” yet</h2>
-            <p>Add images to the folder on Google Drive, or drop them into the local folder and they'll upload.</p>
+            <p>Drop images into your memeity folder on any device and they'll sync everywhere.</p>
             <button class="btn outline" onclick={() => invoke("open_folder")}>Open local folder</button>
           {/if}
         </div>
@@ -731,8 +617,6 @@
           <span class="divider"></span>
           <span class="status err" title={status.ocr.message ?? ""}><i class="dot"></i>Text search unavailable</span>
         {/if}
-      {:else if stage === "folder"}
-        <span class="status muted">Choose the Drive folder that holds your memes</span>
       {:else if status?.account}
         <span class="status muted">{status.account}</span>
       {:else}
@@ -750,13 +634,6 @@
         </button>
         <span class="divider"></span>
         <button class="action" onclick={openActions}>Actions <kbd>Ctrl</kbd><kbd>K</kbd></button>
-      {:else if stage === "folder"}
-        {#if trail.length > 1}<span class="action static">Back <kbd>⌫</kbd></span>{/if}
-        <span class="action static">Open <kbd>↵</kbd></span>
-        <span class="divider"></span>
-        <button class="btn primary sm" disabled={here.id === "root" || busy} onclick={() => useFolder(here)}>
-          Use “{here.name}” <kbd>Ctrl</kbd><kbd>↵</kbd>
-        </button>
       {/if}
     {/if}
   </footer>
@@ -1086,6 +963,11 @@
     color: var(--fg);
   }
 
+  .empty .logo {
+    display: block;
+    margin: 0 auto 16px;
+  }
+
   .empty h2 {
     margin: 0 0 6px;
     font-size: 15px;
@@ -1112,115 +994,6 @@
   .callout b {
     color: var(--fg);
     font-weight: 500;
-  }
-
-  /* ---------- folder picker (cmdk-style list) ---------- */
-
-  .picker {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-  }
-
-  .trail {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 2px;
-    padding: 10px 14px 0;
-    font-size: 12px;
-  }
-
-  .crumb {
-    padding: 2px 4px;
-    border: none;
-    border-radius: 4px;
-    background: none;
-    color: var(--muted-fg);
-    cursor: pointer;
-  }
-
-  .crumb:hover:not(:disabled) {
-    color: var(--fg);
-  }
-
-  .crumb:disabled {
-    color: var(--fg);
-    font-weight: 500;
-    cursor: default;
-  }
-
-  .sep {
-    color: var(--border-strong);
-  }
-
-  .list {
-    flex: 1;
-    overflow-y: auto;
-    padding: 4px 8px 8px;
-  }
-
-  .group {
-    margin: 0;
-    padding: 10px 8px 6px;
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--muted-fg);
-  }
-
-  .none {
-    margin: 0;
-    padding: 6px 8px;
-    font-size: 13px;
-    color: var(--muted-fg);
-  }
-
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    height: 38px;
-    padding: 0 10px;
-    border: none;
-    border-radius: 6px;
-    background: none;
-    color: var(--fg);
-    font-size: 13px;
-    text-align: left;
-    cursor: default;
-  }
-
-  .row .icon {
-    color: var(--muted-fg);
-  }
-
-  .row-label {
-    flex: 1;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .row-hint {
-    color: var(--muted-fg);
-    font-size: 12px;
-    opacity: 0;
-  }
-
-  .row.selected {
-    background: var(--accent);
-  }
-
-  .row.selected .row-hint {
-    opacity: 1;
-  }
-
-  .row.skeleton {
-    margin-bottom: 4px;
-    background: var(--muted);
-    animation: pulse 1.4s ease-in-out infinite;
   }
 
   @keyframes pulse {
@@ -1304,13 +1077,9 @@
     cursor: pointer;
   }
 
-  .action:hover:not(.static) {
+  .action:hover {
     background: var(--accent);
     color: var(--fg);
-  }
-
-  .action.static {
-    cursor: default;
   }
 
   .primary-action {

@@ -13,7 +13,7 @@ mod textindex;
 mod watcher;
 
 use config::{Config, DriveFolder};
-use google::{DriveItem, Google};
+use google::Google;
 use library::{Library, SearchResult};
 use notify::RecommendedWatcher;
 use nucleo_matcher::Matcher;
@@ -210,17 +210,48 @@ fn show_pane(app: &AppHandle) {
         position_pane(app, &win);
     }
     app.state::<AppState>().had_focus.store(false, Ordering::SeqCst);
+    set_window_animation(&win, true); // opening keeps the usual Windows animation
     let _ = win.show();
     let _ = win.set_focus();
     let _ = app.emit_to(PANE, "pane-shown", ());
     sync::trigger_if_stale(app);
 }
 
+/// Closes the pane instantly (Esc, clicking away, the hotkey, the close button).
 fn hide_pane(app: &AppHandle) {
     if let Some(win) = pane(app) {
+        set_window_animation(&win, false);
         let _ = win.hide();
     }
 }
+
+/// Closes the pane with the Windows fade-out: only after copying a meme, as a
+/// "done" cue.
+fn hide_pane_after_copy(app: &AppHandle) {
+    if let Some(win) = pane(app) {
+        set_window_animation(&win, true);
+        let _ = win.hide();
+    }
+}
+
+/// Turns Windows' show/hide window animation on or off for the pane.
+#[cfg(windows)]
+fn set_window_animation(win: &WebviewWindow, enabled: bool) {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+    let Ok(hwnd) = win.hwnd() else { return };
+    let disabled: i32 = (!enabled).into(); // a Win32 BOOL
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&disabled as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn set_window_animation(_win: &WebviewWindow, _enabled: bool) {}
 
 fn toggle_pane(app: &AppHandle) {
     let Some(win) = pane(app) else { return };
@@ -294,11 +325,30 @@ fn open_local_folder(app: &AppHandle) {
     }
 }
 
-fn change_folder(app: &AppHandle) {
-    update_config(app, |c| c.drive_folder = None);
+/// Finds (or creates) the "memeity" folder on Drive and starts syncing it.
+async fn setup_library_folder(app: &AppHandle) -> Result<(), String> {
+    let folder = app.state::<AppState>().google.find_or_create_library().await?;
+    update_config(app, |c| c.drive_folder = Some(DriveFolder { id: folder.id, name: folder.name }));
     load_library(app);
     sync::trigger(app);
-    show_pane(app);
+    Ok(())
+}
+
+/// Drive access level changed since this device last signed in (e.g. full Drive ->
+/// memeity's files only): sign in again and start with a fresh folder lookup. Sync's
+/// own state resets too (see SyncState), so nothing is mistaken for a remote delete.
+fn migrate_auth_scope(app: &AppHandle) {
+    if config(app).auth_scope.as_deref() == Some(google::SCOPE) {
+        return;
+    }
+    let state = app.state::<AppState>();
+    if state.google.signed_in() {
+        state.google.sign_out();
+    }
+    update_config(app, |c| {
+        c.account = None;
+        c.drive_folder = None;
+    });
 }
 
 fn sign_out(app: &AppHandle) {
@@ -343,7 +393,7 @@ async fn copy_meme(app: AppHandle, path: String) -> Result<(), String> {
         return Err("That file isn't in your meme folder.".into());
     }
     clipboard::copy(&path)?;
-    hide_pane(&app);
+    hide_pane_after_copy(&app);
     Ok(())
 }
 
@@ -434,8 +484,12 @@ async fn sign_in(app: AppHandle) -> Result<Status, String> {
     show_pane(&app);
     result?;
     let email = state.google.account_email().await.ok();
-    update_config(&app, |c| c.account = email);
-    sync::trigger(&app);
+    update_config(&app, |c| {
+        c.account = email;
+        c.auth_scope = Some(google::SCOPE.to_string());
+    });
+    // Go straight to the library. If this fails, the pane retries via setup_drive_folder.
+    setup_library_folder(&app).await?;
     Ok(status(&app))
 }
 
@@ -445,31 +499,11 @@ fn sign_out_cmd(app: AppHandle) -> Status {
     status(&app)
 }
 
-/// Sub-folders of a Drive folder ("root" = My Drive), for the in-app picker.
+/// Signed in but no library folder yet (e.g. the first attempt failed offline): retry.
 #[tauri::command]
-async fn list_drive_folders(state: State<'_, AppState>, parent: String) -> Result<Vec<DriveItem>, String> {
-    state.google.list_folders(&parent).await
-}
-
-/// Creates a new folder on Drive inside `parent` ("root" = My Drive) and returns it.
-#[tauri::command]
-async fn create_drive_folder(state: State<'_, AppState>, parent: String, name: String) -> Result<DriveFolder, String> {
-    let id = state.google.create_folder(&parent, &name).await?;
-    Ok(DriveFolder { id, name })
-}
-
-#[tauri::command]
-fn set_drive_folder(app: AppHandle, id: String, name: String) -> Status {
-    update_config(&app, |c| c.drive_folder = Some(DriveFolder { id, name }));
-    load_library(&app);
-    sync::trigger(&app);
-    status(&app)
-}
-
-#[tauri::command]
-fn change_drive_folder(app: AppHandle) -> Status {
-    change_folder(&app);
-    status(&app)
+async fn setup_drive_folder(app: AppHandle) -> Result<Status, String> {
+    setup_library_folder(&app).await?;
+    Ok(status(&app))
 }
 
 #[tauri::command]
@@ -503,12 +537,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", format!("Open memeity ({SHORTCUT_LABEL})"), true, None::<&str>)?;
     let sync_now = MenuItem::with_id(app, "sync", "Sync now", true, None::<&str>)?;
     let local = MenuItem::with_id(app, "local", "Open local meme folder", true, None::<&str>)?;
-    let folder = MenuItem::with_id(app, "folder", "Change Drive folder…", true, None::<&str>)?;
     let signout = MenuItem::with_id(app, "signout", "Sign out of Google", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit memeity", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &sep1, &sync_now, &local, &folder, &signout, &sep2, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &sep1, &sync_now, &local, &signout, &sep2, &quit])?;
 
     TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().cloned().expect("bundle has an icon"))
@@ -519,7 +552,6 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "open" => show_pane(app),
             "sync" => sync::trigger(app),
             "local" => open_local_folder(app),
-            "folder" => change_folder(app),
             "signout" => {
                 sign_out(app);
                 show_pane(app);
@@ -567,10 +599,7 @@ pub fn run() {
             load_client_file,
             sign_in,
             sign_out_cmd,
-            list_drive_folders,
-            create_drive_folder,
-            set_drive_folder,
-            change_drive_folder,
+            setup_drive_folder,
             sync_now,
             open_folder,
             open_setup_link,
@@ -579,9 +608,12 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
             let config_dir = app.path().app_config_dir()?;
-            let creds = std::fs::read(config_dir.join(CLIENT_FILE))
-                .ok()
-                .and_then(|b| google::parse_client_json(&b).ok());
+            // memeity's built-in client; a user-supplied one only for builds without it.
+            let creds = google::embedded_client().or_else(|| {
+                std::fs::read(config_dir.join(CLIENT_FILE))
+                    .ok()
+                    .and_then(|b| google::parse_client_json(&b).ok())
+            });
 
             app.manage(AppState {
                 library: RwLock::new(Library::default()),
@@ -600,6 +632,8 @@ pub fn run() {
                 had_focus: AtomicBool::new(false),
                 window_mode: Mutex::new(None),
             });
+
+            migrate_auth_scope(&handle);
 
             if let Err(e) = app.global_shortcut().register(pane_shortcut()) {
                 let msg = format!("Couldn't register {SHORTCUT_LABEL} (another app may own it): {e}");
