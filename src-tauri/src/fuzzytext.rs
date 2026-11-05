@@ -6,6 +6,12 @@
 //! spaces) against the squashed text of every meme, allowing a few typos. That makes
 //! "i will be there" find "IWILL BE THERE", and "be there" find "BE THEFE".
 //!
+//! Failing that, a query of several words still matches if *every* word turns up
+//! somewhere in the text, in any order (each allowed its own few typos). OCR often
+//! picks up stray text between the words you remember (usernames, "Reply" buttons), so
+//! "will it work hi lol" finds "WILLIT WORK? wavy.khOlil 2 hi lol Reply". These rank a
+//! little below whole-phrase matches.
+//!
 //! The squashed texts live in memory (a few KB per thousand memes), so this stays
 //! instant on every keystroke.
 
@@ -72,6 +78,12 @@ fn could_match(pattern: &[char], text: &[char], max: usize) -> bool {
     })
 }
 
+/// Total typos if every word appears somewhere in `text` (any order, overlaps allowed),
+/// each within its own typo allowance.
+fn all_words(words: &[Vec<char>], text: &[char]) -> Option<usize> {
+    words.iter().try_fold(0, |total, w| Some(total + substring_distance(w, text, allowed_errors(w.len()))?))
+}
+
 /// Squashed image text (and tags) per meme, keyed by library-relative path.
 #[derive(Default)]
 pub struct TextCache {
@@ -99,16 +111,24 @@ impl TextCache {
         self.texts.retain(|rel, _| keep.contains(rel));
     }
 
-    /// Memes whose text loosely contains `query`, with how many typos it took.
+    /// Memes whose text loosely contains `query`, with how many typos it took (an
+    /// all-the-words match counts one more, so it ranks below the same phrase match).
     pub fn matches(&self, query: &str) -> Vec<(String, usize)> {
         let q = squash(query);
         if q.len() < 3 {
             return Vec::new(); // too short to say anything useful; word search covers it
         }
         let max = allowed_errors(q.len());
+        let words: Vec<Vec<char>> = query.split_whitespace().map(squash).filter(|w| !w.is_empty()).collect();
+        // A couple of one-letter words ("a b") would match nearly everything.
+        let by_words = words.len() >= 2 && q.len() >= 4;
         self.texts
             .iter()
-            .filter_map(|(rel, text)| substring_distance(&q, text, max).map(|d| (rel.clone(), d)))
+            .filter_map(|(rel, text)| {
+                let typos = substring_distance(&q, text, max)
+                    .or_else(|| by_words.then(|| all_words(&words, text)).flatten().map(|t| t + 1))?;
+                Some((rel.clone(), typos))
+            })
             .collect()
     }
 }
@@ -142,6 +162,19 @@ mod tests {
         assert_eq!(dist("be there", "IWILL BE THEFE", 1), Some(1), "one substitution");
         assert_eq!(dist("compiles", "COMPLIES", 2), Some(2), "transposed letters");
         assert_eq!(dist("hello", "WORLD", 1), None, "unrelated text doesn't match");
+    }
+
+    #[test]
+    fn every_word_somewhere_matches_in_any_order() {
+        let mut cache = TextCache::default();
+        cache.set("will.png", "WILLIT\nWORK?\nwavy.khOlil 2\nhi lol\nReply", &[]);
+        cache.set("other.png", "will it blend", &[]);
+        assert_eq!(cache.matches("will it work hi lol"), vec![("will.png".to_string(), 1)], "stray text in between");
+        assert_eq!(cache.matches("lol will work").len(), 1, "any order");
+        assert!(cache.matches("will it work tomorrow").is_empty(), "every word must be there");
+        let mut phrase = cache.matches("will it blend");
+        phrase.sort();
+        assert_eq!(phrase, vec![("other.png".to_string(), 0)], "a whole phrase still counts as 0 typos");
     }
 
     #[test]

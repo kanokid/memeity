@@ -104,6 +104,10 @@
     error = null;
     preview = [];
     recording = true;
+    // Keys are read from the whole window, so the recorder button doesn't need focus.
+    // Keeping it would let the Space of a shortcut like Ctrl+Space "click" it again on
+    // key-up and restart recording, as if the new shortcut never took.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -347,7 +351,16 @@
             <h3>Open memeity</h3>
             <p>Shortcut that opens the search pane from anywhere.</p>
           </div>
-          <button class="recorder" class:recording onclick={startRecording} disabled={busy}>
+          <button
+            class="recorder"
+            class:recording
+            onclick={startRecording}
+            onkeyup={(e) => {
+              // Belt and braces for the above: Space/Enter never re-trigger it from the keyboard.
+              if (e.key === " " || e.key === "Enter") e.preventDefault();
+            }}
+            disabled={busy}
+          >
             {#if recording}
               {#if preview.length}
                 {#each preview as k, i (i)}<kbd>{k}</kbd>{/each}

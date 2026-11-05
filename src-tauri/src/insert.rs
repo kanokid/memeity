@@ -28,7 +28,7 @@ const RESTORE_AFTER: Duration = Duration::from_millis(800);
 pub fn insert(app: &AppHandle, path: &Path, target: isize) -> Result<(), String> {
     // Prepare everything first: if this fails, the clipboard hasn't been touched.
     let content = if crate::clipboard::is_animated(path) {
-        win::Content::File(path.to_path_buf())
+        win::Content::File(crate::clipboard::shareable(path)?)
     } else {
         let (png, dib) = encode(path)?;
         win::Content::Image { png, dib }

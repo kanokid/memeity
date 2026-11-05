@@ -1,6 +1,6 @@
 [package]
 name = "memeity"
-version = "0.1.3"
+version = "0.2.0"
 description = "One meme folder, everywhere, with a Raycast-style search pane"
 edition = "2024"
 
@@ -50,6 +50,9 @@ oar-ocr = { version = "0.10", optional = true }
 tauri-plugin-updater = "2"
 log = "0.4"
 tauri-plugin-log = "2"
+# Dragging memes out of the pane into other apps (CrabNebula's drag, without its Tauri
+# plugin: that would let the webview drag any file; our command checks the library).
+drag = "2.1.1"
 
 [target.'cfg(windows)'.dependencies]
 # Instant insert: save/restore the clipboard and refocus the previous app.
@@ -67,7 +70,9 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dw
 # Same versions Tauri itself uses.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSWindow", "NSView", "NSResponder", "NSColor", "objc2-quartz-core"] }
+# Rounded pane corners (the content view's layer).
+objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
 objc2-foundation = { version = "0.3", features = ["NSData"] }
 
 # `tauri dev` builds are unoptimized, which makes image decoding/encoding ~50x slower

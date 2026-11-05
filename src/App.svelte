@@ -108,7 +108,7 @@
   $effect(() => {
     const path = current?.path;
     const ocrProgress = status?.ocr.done;
-    if (!showDetails || !path) return;
+    if ((!showDetails && view !== "list") || !path) return;
     void ocrProgress;
     const seq = ++detailsSeq;
     invoke<MemeText>("meme_text", { path })
@@ -163,12 +163,31 @@
     act(async () => {
       if (!current) return;
       const path = current.path;
+      const oldStem = stemOf(current.name);
       const renamed = await invoke<string>("rename_meme", { path, name: nameDraft });
       stopEditing();
       // Keep the renamed meme selected (its rank, and so its index, may have changed).
       pendingSelectPath = renamed;
       await refresh();
+      if (renamed !== path) {
+        const undo = () => undoRename(renamed, oldStem);
+        offerUndo(undo, UNDO_MS);
+        showToast({ message: `Renamed to ${baseName(renamed)}`, action: { label: "Undo", run: undo } }, DELETED_TOAST_MS);
+      }
     });
+
+  /** Puts a rename back (the extension never changed, so the old stem is enough). */
+  const undoRename = (path: string, oldStem: string) =>
+    act(async () => {
+      lastUndo = null;
+      toast = null;
+      const restored = await invoke<string>("rename_meme", { path, name: oldStem });
+      pendingSelectPath = restored;
+      await refresh();
+      showToast({ message: `Renamed back to ${baseName(restored)}` }, 2000);
+    });
+
+  const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
   /**
    * Opens the text editor pre-filled with the meme's current text. Waits for that text to
@@ -339,6 +358,7 @@
 
   /** Scrolls the grid just enough to show tile `i` (it may not be rendered yet). */
   function scrollToTile(i: number) {
+    if (view === "list") return scrollToRow(i);
     if (!grid || masonry.top[i] === undefined) return;
     measureGrid();
     const margin = 6; // room for the selection ring
@@ -359,6 +379,10 @@
 
   function move(dir: "up" | "down" | "left" | "right", steps = 1) {
     if (hits.length === 0) return;
+    if (view === "list") {
+      if (dir === "up" || dir === "down") select(selected + (dir === "down" ? 1 : -1) * (steps > 1 ? LIST_PAGE : 1));
+      return;
+    }
     const i = selected;
     const c = masonry.col[i];
     const r = masonry.row[i];
@@ -382,6 +406,130 @@
       if (nc >= 0 && nc < COLS) select(nearestIn(nc, i));
     }
   }
+
+  // ---------- drag a meme out into another app ----------
+
+  /** Our own drag is under way: the pane mustn't treat it as something dropped in. */
+  let draggingOut = $state(false);
+  /** When our last drag ended. Its drop on the pane can arrive just after the OS says it's over. */
+  let dragOutEndedAt = 0;
+  const ownDrag = () => draggingOut || Date.now() - dragOutEndedAt < 1000;
+  /** Mouse pressed on a tile/row; becomes a drag once it moves a few pixels. */
+  let pressed: { i: number; x: number; y: number } | null = null;
+  /** A drag just started from a press: swallow the click that may follow it. */
+  let swallowClick = false;
+  const DRAG_THRESHOLD = 6;
+
+  function pressItem(e: MouseEvent, i: number) {
+    e.preventDefault(); // keep focus (and the arrow keys) in the search box
+    swallowClick = false;
+    pressed = e.button === 0 ? { i, x: e.clientX, y: e.clientY } : null;
+  }
+
+  function onMouseMove(e: MouseEvent) {
+    if (!pressed) return;
+    if (!(e.buttons & 1)) {
+      pressed = null;
+      return;
+    }
+    if (Math.hypot(e.clientX - pressed.x, e.clientY - pressed.y) < DRAG_THRESHOLD) return;
+    const hit = hits[pressed.i];
+    pressed = null;
+    if (!hit) return;
+    swallowClick = true;
+    draggingOut = true;
+    invoke("drag_meme", { path: hit.path }).catch((err) => {
+      draggingOut = false;
+      error = String(err);
+    });
+  }
+
+  /** True (once) if this click is the tail end of a drag. */
+  function clickWasDrag() {
+    const was = swallowClick;
+    swallowClick = false;
+    return was;
+  }
+
+  // ---------- Ctrl/Cmd + 1-9: act on the Nth result ----------
+
+  /** Ctrl/Cmd held a moment: number badges show on the first nine results. */
+  let showNumbers = $state(false);
+  let numbersTimer: ReturnType<typeof setTimeout> | undefined;
+  const isModKey = (key: string) => key === (isMac ? "Meta" : "Control");
+
+  function hideNumbers() {
+    clearTimeout(numbersTimer);
+    showNumbers = false;
+  }
+
+  // ---------- list view (Ctrl+L): results on the left, preview + details on the right ----------
+
+  type View = "grid" | "list";
+  let view = $state<View>(readView());
+  let list: HTMLDivElement | undefined = $state();
+  /** Row height and top/bottom padding of the list, in px (must match `.row` / `.list-rows`). */
+  const ROW_H = 48;
+  const LIST_PAD = 8;
+  /** PageUp / PageDown moves this many rows in the list. */
+  const LIST_PAGE = 8;
+  let listScroll = $state(0);
+  let listH = $state(0);
+
+  function readView(): View {
+    try {
+      return localStorage.getItem("view") === "list" ? "list" : "grid";
+    } catch {
+      return "grid";
+    }
+  }
+
+  async function toggleView() {
+    view = view === "grid" ? "list" : "grid";
+    menu = null;
+    try {
+      localStorage.setItem("view", view);
+    } catch {
+      // private mode etc.: the choice just isn't remembered
+    }
+    await tick();
+    scrollToTile(selected);
+    maybeLoadMore();
+  }
+
+  function measureList() {
+    if (!list) return;
+    listH = list.clientHeight;
+    listScroll = list.scrollTop;
+  }
+
+  $effect(() => {
+    const el = list;
+    if (!el) return;
+    measureList();
+    const ro = new ResizeObserver(measureList);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  /** Rows near the viewport (the rest are just space in a tall container). */
+  const listRows = $derived.by(() => {
+    const h = listH || 600;
+    const first = Math.max(0, Math.floor((listScroll - LIST_PAD - h) / ROW_H));
+    const last = Math.min(hits.length, Math.ceil((listScroll - LIST_PAD + 2 * h) / ROW_H));
+    return Array.from({ length: Math.max(0, last - first) }, (_, k) => first + k);
+  });
+
+  function scrollToRow(i: number) {
+    if (!list) return;
+    const top = LIST_PAD + i * ROW_H;
+    if (top < list.scrollTop) list.scrollTop = top - LIST_PAD;
+    else if (top + ROW_H > list.scrollTop + list.clientHeight) list.scrollTop = top + ROW_H + LIST_PAD - list.clientHeight;
+  }
+
+  const fileType = (hit: Hit) => (extOf(hit.name) || "image").toUpperCase();
+  const folderOf = (hit: Hit) => (hit.rel.includes("/") ? hit.rel.slice(0, hit.rel.lastIndexOf("/")) : "");
+  const sizeLabel = (hit: Hit) => (hit.width && hit.height ? `${hit.width} × ${hit.height}` : "");
 
   // ---------- shared ----------
 
@@ -497,7 +645,7 @@
     pendingSelectPath = null;
     const found = follow ? hits.findIndex((h) => h.path === follow) : -1;
     if (found >= 0) selected = found;
-    if (resetSelection) grid?.scrollTo({ top: 0 });
+    if (resetSelection) (view === "list" ? list : grid)?.scrollTo({ top: 0 });
     await tick();
     if (found >= 0) scrollToTile(found);
     maybeLoadMore(); // the first page might not fill the pane
@@ -525,8 +673,9 @@
 
   /** Loads more if the grid is scrolled near its end (or doesn't overflow yet). */
   function maybeLoadMore() {
-    if (!grid) return;
-    if (grid.scrollTop + grid.clientHeight >= grid.scrollHeight - LOAD_AHEAD_PX) loadMore();
+    const el = view === "list" ? list : grid;
+    if (!el) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - LOAD_AHEAD_PX) loadMore();
   }
 
   async function select(i: number) {
@@ -559,8 +708,17 @@
       if (hit) await invoke("reveal_meme", { path: hit.path });
     });
 
-  /** The most recent delete, undoable (toast button or Ctrl+Z) until its toast expires. */
-  let undoToken: string | null = null;
+  /** The most recent delete or rename, undoable with Ctrl+Z (or its toast's button) for a while. */
+  let lastUndo: { id: number; run: () => void } | null = null;
+  let undoSeq = 0;
+
+  function offerUndo(run: () => void, ms: number) {
+    const id = ++undoSeq;
+    lastUndo = { id, run };
+    setTimeout(() => {
+      if (lastUndo?.id === id) lastUndo = null;
+    }, ms);
+  }
   /** Ctrl+Z works this long after a delete (matches the backend's undo window)... */
   const UNDO_MS = 10_000;
   /** ...while the "Deleted" notice itself gets out of the way sooner. */
@@ -570,20 +728,17 @@
     act(async () => {
       confirmDelete = null;
       const token = await invoke<string>("delete_meme", { path: hit.path });
-      undoToken = token;
+      offerUndo(() => undoDelete(token), UNDO_MS);
       showToast(
         { message: `Deleted ${hit.name}`, danger: true, action: { label: "Undo", run: () => undoDelete(token) } },
         DELETED_TOAST_MS,
       );
-      setTimeout(() => {
-        if (undoToken === token) undoToken = null;
-      }, UNDO_MS);
       await refresh();
     });
 
   const undoDelete = (token: string) =>
     act(async () => {
-      if (undoToken === token) undoToken = null;
+      lastUndo = null;
       toast = null;
       await invoke("undo_delete", { token });
       await refresh();
@@ -680,7 +835,11 @@
   }
 
   function onDrop(e: DragEvent) {
-    e.preventDefault();
+    e.preventDefault(); // never let the webview open the dropped file itself
+    if (ownDrag() || stage !== "ready") {
+      dragDepth = 0;
+      return; // a meme dragged out of the pane and dropped back on it: nothing to do
+    }
     dragDepth = 0;
     invoke("set_dragging", { active: false, refocus: true });
     if (!e.dataTransfer) return;
@@ -784,14 +943,22 @@
   function onKeydown(e: KeyboardEvent) {
     const key = e.key;
     const ctrl = e.ctrlKey || e.metaKey;
+    if (isModKey(key) && !e.repeat && stage === "ready") {
+      clearTimeout(numbersTimer);
+      numbersTimer = setTimeout(() => (showNumbers = true), 250); // only when held, not for Ctrl+K etc.
+    } else if (!isModKey(key)) {
+      hideNumbers();
+    }
 
     // Typing in an edit field (rename, text): leave the keys to it.
     const target = e.target;
     if (target instanceof HTMLTextAreaElement || (target instanceof HTMLInputElement && target !== input)) return;
     // Ctrl+Z right after a delete brings it back (otherwise it undoes typing as usual).
-    if (ctrl && key.toLowerCase() === "z" && !e.shiftKey && undoToken && stage === "ready") {
+    if (ctrl && key.toLowerCase() === "z" && !e.shiftKey && lastUndo && stage === "ready") {
       e.preventDefault();
-      undoDelete(undoToken);
+      const undo = lastUndo;
+      lastUndo = null;
+      undo.run();
       return;
     }
     if (key === "F2" && stage === "ready" && current) {
@@ -850,6 +1017,18 @@
         if (key === "Enter") { e.preventDefault(); doDelete(confirmDelete); }
         return;
       }
+      if (ctrl && /^Digit[1-9]$/.test(e.code)) {
+        e.preventDefault();
+        const n = Number(e.code.slice(5)) - 1;
+        if (hits[n]) {
+          hideNumbers();
+          select(n);
+          if (e.shiftKey) secondary(n);
+          else primary(n);
+        }
+        return;
+      }
+      if (ctrl && key.toLowerCase() === "l") { e.preventDefault(); toggleView(); return; }
       if (ctrl && key.toLowerCase() === "k") { e.preventDefault(); openActions(); return; }
       if (ctrl && key.toLowerCase() === "i") { e.preventDefault(); toggleDetails(); return; }
       if (ctrl && e.shiftKey && key.toLowerCase() === "f") { e.preventDefault(); reveal(); return; }
@@ -875,7 +1054,13 @@
   onMount(() => {
     checkDuplicates();
     const unlisten = [
+      listen("drag-out-ended", () => {
+        draggingOut = false;
+        dragOutEndedAt = Date.now();
+      }),
       listen("pane-shown", () => {
+        hideNumbers();
+        draggingOut = false;
         checkDuplicates();
         error = null;
         confirmDelete = null;
@@ -926,18 +1111,30 @@
 
 <svelte:window
   onkeydown={onKeydown}
+  onkeyup={(e) => {
+    if (isModKey(e.key)) hideNumbers();
+  }}
+  onmousemove={onMouseMove}
+  onmouseup={() => (pressed = null)}
   oncontextmenu={onContextMenu}
   onmousedown={(e) => {
     if (menu && !(e.target instanceof Element && e.target.closest(".menu"))) menu = null;
   }}
-  onblur={() => (menu = null)}
+  onblur={() => {
+    menu = null;
+    hideNumbers();
+  }}
   ondragenter={(e) => {
-    if (stage !== "ready") return;
+    // Always claim drags: a drop the page doesn't handle makes the webview open the file
+    // as a page (replacing memeity with just the image).
     e.preventDefault();
+    if (stage !== "ready" || ownDrag()) return; // our own drag passing over the pane
     if (dragDepth++ === 0) invoke("set_dragging", { active: true }); // keep the pane open
   }}
   ondragover={(e) => {
-    if (stage === "ready") e.preventDefault(); // allow dropping
+    e.preventDefault(); // see ondragenter
+    // Our own meme, or not ready for memes: show "can't drop here".
+    if (e.dataTransfer && (stage !== "ready" || ownDrag())) e.dataTransfer.dropEffect = "none";
   }}
   ondragleave={() => {
     dragDepth = Math.max(0, dragDepth - 1);
@@ -975,6 +1172,25 @@
           {status.drive_folder.name}
         </button>
       {/if}
+      <button
+        class="icon-btn"
+        title={`${view === "grid" ? "List" : "Grid"} view (${MOD}${isMac ? "" : "+"}L)`}
+        aria-label={view === "grid" ? "Switch to list view" : "Switch to grid view"}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={toggleView}
+      >
+        {#if view === "grid"}
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="4" width="6" height="6" rx="1" /><path d="M13 6h8M13 9h5" />
+            <rect x="3" y="14" width="6" height="6" rx="1" /><path d="M13 16h8M13 19h5" />
+          </svg>
+        {:else}
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="3" width="7" height="9" rx="1" /><rect x="14" y="3" width="7" height="5" rx="1" />
+            <rect x="14" y="12" width="7" height="9" rx="1" /><rect x="3" y="16" width="7" height="5" rx="1" />
+          </svg>
+        {/if}
+      </button>
       <button
         class="icon-btn"
         title={`Settings (${MOD}${isMac ? "" : "+"},)`}
@@ -1072,6 +1288,90 @@
           <h2>No results</h2>
           <p>Nothing matches “{query}”.</p>
         </div>
+      {:else if view === "list"}
+        <div class="list-view">
+          <div
+            class="list"
+            bind:this={list}
+            role="listbox"
+            aria-label="Memes"
+            onscroll={() => {
+              menu = null;
+              if (list) listScroll = list.scrollTop;
+              maybeLoadMore();
+            }}
+          >
+            <div class="list-rows" style:height="{hits.length * ROW_H + 2 * LIST_PAD}px">
+              {#each listRows as i (hits[i].path)}
+                {@const hit = hits[i]}
+                <button
+                  class="row"
+                  class:selected={i === selected}
+                  class:doomed={confirmDelete?.path === hit.path}
+                  role="option"
+                  aria-selected={i === selected}
+                  tabindex="-1"
+                  style:top="{LIST_PAD + i * ROW_H}px"
+                  title={hit.rel}
+                  onmousedown={(e) => pressItem(e, i)}
+                  onclick={() => {
+                    if (!clickWasDrag()) select(i);
+                  }}
+                  ondblclick={(e) => (e.shiftKey ? secondary(i) : primary(i))}
+                  oncontextmenu={(e) => openMenuAt(e, i)}
+                >
+                  {#if showNumbers && i < 9}<kbd class="num">{i + 1}</kbd>{/if}
+                  <img src={tileSrc(hit, false)} alt="" loading="lazy" decoding="async" draggable="false" />
+                  <span class="row-text">
+                    <span class="row-name">{stemOf(hit.name)}</span>
+                    <span class="row-meta">{[fileType(hit), sizeLabel(hit), folderOf(hit)].filter(Boolean).join(" · ")}</span>
+                  </span>
+                </button>
+              {/each}
+            </div>
+          </div>
+          {#if current}
+            <div class="list-preview">
+              <div class="preview-stage">
+                <!-- The cached thumbnail shows at once; the original covers it when loaded. -->
+                <img src={tileSrc(current, false)} alt="" draggable="false" />
+                {#key current.path}
+                  <img src={`${convertFileSrc(current.path, "thumb")}?full=1&v=${current.version}`} alt={current.name} draggable="false" />
+                {/key}
+              </div>
+              <div class="file-row">
+                <p class="preview-name" title={current.rel}>{current.name}</p>
+                <button class="link-btn" onclick={startRename} title="Rename (F2)">Rename</button>
+              </div>
+              <p class="facts">
+                {[fileType(current) + (current.animated ? " (animated)" : ""), sizeLabel(current)].filter(Boolean).join(" · ")}
+              </p>
+              <!-- A meme with no text in it gets no text section at all (Edit Text… in the
+                   actions menu can still add some). -->
+              {#if !(details?.state === "read" && !details.text)}
+                <div class="file-row">
+                  <p class="label">Text in image</p>
+                  {#if details}
+                    <button class="link-btn" onclick={startEditText}>{details.text ? "Edit" : "Add text"}</button>
+                  {/if}
+                </div>
+              {/if}
+              {#if !details}
+                <div class="list-text skeleton-text"></div>
+              {:else if details.state === "read" && details.text}
+                <div class="list-text">{details.text}</div>
+              {:else if details.state === "read"}
+                <!-- no text: nothing to show -->
+              {:else if details.state === "pending"}
+                <p class="note">
+                  {status.ocr.state === "unavailable" ? "Text recognition isn't available on this device." : "Not read yet. It's in the queue."}
+                </p>
+              {:else}
+                <p class="note">Couldn't read this image.</p>
+              {/if}
+            </div>
+          {/if}
+        </div>
       {:else}
         <div
           class="masonry"
@@ -1095,8 +1395,9 @@
                   tabindex="-1"
                   style:aspect-ratio="1 / {ratioOf(hit)}"
                   title={hit.name}
-                  onmousedown={(e) => e.preventDefault()}
+                  onmousedown={(e) => pressItem(e, i)}
                   onclick={(e) => {
+                    if (clickWasDrag()) return;
                     // GIF-picker style: one click acts, same as Enter (Shift = Shift+Enter).
                     select(i);
                     if (e.shiftKey) secondary(i);
@@ -1107,6 +1408,7 @@
                   onmouseleave={() => (hovered = -1)}
                 >
                   <img src={tileSrc(hit, active)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
+                  {#if showNumbers && i < 9}<kbd class="num">{i + 1}</kbd>{/if}
                 </button>
               {/each}
             </div>
@@ -1639,6 +1941,195 @@
   }
 
   /* ---------- masonry ---------- */
+
+  /* Ctrl/Cmd held: which number key acts on which result. */
+  .num {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 1;
+    min-width: 20px;
+    padding: 1px 6px;
+    border-radius: 6px;
+    background: var(--fg);
+    color: var(--bg);
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+  }
+
+  .row .num {
+    position: static;
+    flex-shrink: 0;
+    box-shadow: none;
+  }
+
+  /* ---------- list view ---------- */
+
+  .list-view {
+    flex: 1;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .list {
+    position: relative;
+    width: 42%;
+    flex-shrink: 0;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+  }
+
+  .list-rows {
+    position: relative;
+  }
+
+  .row {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    height: 44px; /* ROW_H minus the 4px between rows */
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 8px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--fg);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .row:hover {
+    background: color-mix(in srgb, var(--muted) 60%, transparent);
+  }
+
+  .row.selected {
+    background: var(--muted);
+    box-shadow: inset 0 0 0 1px var(--ring);
+  }
+
+  .row.doomed {
+    box-shadow: inset 0 0 0 1px var(--destructive);
+  }
+
+  .row img {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border-radius: 5px;
+    object-fit: cover;
+    background: var(--muted);
+  }
+
+  .row-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .row-name,
+  .row-meta {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .row-name {
+    font-size: 13px;
+  }
+
+  .row-meta {
+    font-size: 11px;
+    color: var(--muted-fg);
+  }
+
+  .list-preview {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px 20px;
+    /* Doesn't scroll: the preview takes whatever height the details leave, so the image
+       always has a definite box to fit into. */
+    overflow: hidden;
+  }
+
+  .preview-stage {
+    position: relative;
+    flex: 1 1 0;
+    /* Never less than half the column, however long the details below get. */
+    min-height: 50%;
+    border-radius: 10px;
+    background: var(--muted);
+    overflow: hidden;
+  }
+
+  /* Pinned to the box and scaled to fit whole (letterboxed), whatever its proportions. */
+  .preview-stage img {
+    position: absolute;
+    inset: 8px;
+    width: calc(100% - 16px);
+    height: calc(100% - 16px);
+    object-fit: contain;
+  }
+
+  .preview-name {
+    margin: 0;
+    overflow: hidden;
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .list-preview > :not(.preview-stage) {
+    flex-shrink: 0;
+  }
+
+  /* When space runs short, the text box gives way (it scrolls), never the preview. */
+  .list-preview > .list-text {
+    flex-shrink: 1;
+    min-height: 2.6em;
+  }
+
+  .facts {
+    margin: -6px 0 0; /* reads as a subtitle of the name above */
+    font-size: 12px;
+    color: var(--muted-fg);
+  }
+
+  .list-text {
+    max-height: 84px;
+    flex-shrink: 0;
+    overflow-y: auto;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--muted);
+    font: 12px/1.5 "Geist Mono Variable", ui-monospace, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  .list-preview .note {
+    flex: none; /* the preview image takes the spare height, not the note */
+  }
+
+  .list-preview .label {
+    margin: 0;
+  }
+
+  .list-text.skeleton-text {
+    height: 32px;
+  }
 
   .masonry {
     flex: 1;

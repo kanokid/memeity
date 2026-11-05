@@ -176,12 +176,65 @@ fn apply_window_mode(app: &AppHandle) {
     // macOS: menu-bar only once set up; a regular Dock app during setup.
     settings::update_activation_policy(app);
     lock_size(&win);
+    set_rounded(&win, ready);
     if ready {
         position_pane(app, &win);
     } else {
         let _ = win.center();
     }
 }
+
+/// Corner radius of the search pane on macOS, in points (Windows 11 has its own fixed one).
+#[cfg(target_os = "macos")]
+const PANE_RADIUS: f64 = 16.0;
+
+/// Rounds the frameless search pane's corners (or squares them again for the normal,
+/// decorated setup window, which the OS already rounds itself). Done natively, so the
+/// window keeps its drop shadow.
+#[cfg(target_os = "macos")]
+fn set_rounded(win: &WebviewWindow, rounded: bool) {
+    let Ok(ptr) = win.ns_window() else { return };
+    let ptr = ptr as usize;
+    let _ = win.run_on_main_thread(move || {
+        use objc2_app_kit::{NSColor, NSWindow};
+        // SAFETY: Tauri's live NSWindow for this window, used on the main thread.
+        let window: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
+        // Clear, see-through window background: the corners outside the rounded content show through.
+        window.setOpaque(!rounded);
+        let background = if rounded { NSColor::clearColor() } else { NSColor::windowBackgroundColor() };
+        window.setBackgroundColor(Some(&background));
+        if let Some(view) = window.contentView() {
+            view.setWantsLayer(true);
+            if let Some(layer) = view.layer() {
+                layer.setCornerRadius(if rounded { PANE_RADIUS } else { 0.0 });
+                layer.setMasksToBounds(rounded);
+            }
+        }
+        // Recompute the shadow from the new (rounded) shape.
+        window.invalidateShadow();
+    });
+}
+
+/// Windows 11: ask DWM for rounded corners (Windows 10 ignores it and stays square).
+#[cfg(windows)]
+fn set_rounded(win: &WebviewWindow, rounded: bool) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE,
+    };
+    let Ok(hwnd) = win.hwnd() else { return };
+    let preference: DWM_WINDOW_CORNER_PREFERENCE = if rounded { DWMWCP_ROUND } else { DWMWCP_DEFAULT };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&preference as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn set_rounded(_win: &WebviewWindow, _rounded: bool) {}
 
 fn status(app: &AppHandle) -> Status {
     apply_window_mode(app);
@@ -774,6 +827,56 @@ async fn insert_meme(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Drag a meme out of the pane into another app (a chat, a document, a folder). Hands
+/// over the same file a copy would (converted if its format is picky), with a small
+/// thumbnail under the cursor. Emits `drag-out-ended` when the drag is over.
+#[tauri::command]
+async fn drag_meme(app: AppHandle, window: WebviewWindow, path: String) -> Result<(), String> {
+    /// Longest side of the image under the cursor, in pixels.
+    const ICON_SIDE: u32 = 96;
+    let path = PathBuf::from(path);
+    if !app.state::<AppState>().library.read().unwrap().contains(&path) {
+        return Err("That file isn't in your meme folder.".into());
+    }
+    let cache = thumbs::cache_dir(&app).ok_or("No cache folder.")?;
+    let source = path.clone();
+    let (file, icon) = tauri::async_runtime::spawn_blocking(move || {
+        let file = clipboard::shareable(&source)?;
+        let (thumb, _) = thumbs::thumbnail(&cache, &source)?;
+        let small = image::load_from_memory(&thumb).map_err(|e| e.to_string())?.thumbnail(ICON_SIDE, ICON_SIDE);
+        let mut png = Vec::new();
+        small
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((file, png))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // The OS drag has to start on the main thread (macOS returns right away and the drag
+    // carries on; Windows returns once it's over).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let done = handle.clone();
+        let result = drag::start_drag(
+            &window,
+            drag::DragItem::Files(vec![file]),
+            drag::Image::Raw(icon),
+            move |result, _| {
+                if matches!(result, drag::DragResult::Dropped) {
+                    record_use(&done, &path);
+                }
+                let _ = done.emit("drag-out-ended", ());
+            },
+            drag::Options { skip_animatation_on_cancel_or_failure: false, mode: drag::DragMode::Copy },
+        );
+        let _ = tx.send(result.map_err(|e| format!("Couldn't start dragging: {e}")));
+    })
+    .map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())?
+}
+
 /// Show in folder (Ctrl+Shift+F): open Explorer/Finder with the meme selected.
 #[tauri::command]
 fn reveal_meme(app: AppHandle, path: String) -> Result<(), String> {
@@ -869,6 +972,19 @@ fn sign_out_cmd(app: AppHandle) -> Status {
 async fn setup_drive_folder(app: AppHandle) -> Result<Status, String> {
     setup_library_folder(&app).await?;
     Ok(status(&app))
+}
+
+/// The app's own pages: `tauri://localhost` (macOS/Linux), `http(s)://tauri.localhost`
+/// (Windows), and the Vite dev server in `tauri dev`.
+fn is_app_url(url: &tauri::Url) -> bool {
+    match (url.scheme(), url.host_str()) {
+        ("tauri", Some("localhost")) => true,
+        ("http" | "https", Some("tauri.localhost")) => true,
+        ("http", Some("localhost")) => cfg!(debug_assertions) && url.port() == Some(1420),
+        // about:blank and the like: harmless, and webviews use them internally.
+        ("about", _) => true,
+        _ => false,
+    }
 }
 
 /// Copies a bug-report-ready summary to the clipboard: version, OS, sync and text-search
@@ -1036,6 +1152,19 @@ pub fn run() {
                 .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
                 .build(),
         )
+        // memeity's windows only ever show memeity. Without this, a file dropped where the
+        // page doesn't catch it (or any stray link) would replace the app with that file.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("navigation-guard")
+                .on_navigation(|_webview, url| {
+                    let allowed = is_app_url(url);
+                    if !allowed {
+                        log::warn!("blocked navigation to {}", url.scheme());
+                    }
+                    allowed
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1064,6 +1193,7 @@ pub fn run() {
             set_meme_text,
             insert_meme,
             reveal_meme,
+            drag_meme,
             delete_meme,
             undo_delete,
             load_client_file,
@@ -1104,6 +1234,10 @@ pub fn run() {
                     .ok()
                     .and_then(|b| google::parse_client_json(&b).ok())
             });
+
+            if let Ok(cache) = app.path().app_cache_dir() {
+                clipboard::set_share_dir(cache.join("shared"));
+            }
 
             app.manage(AppState {
                 library: RwLock::new(Library::default()),
@@ -1197,4 +1331,20 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running memeity");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_app_url;
+
+    #[test]
+    fn only_the_app_itself_can_load() {
+        let ok = |u: &str| is_app_url(&u.parse().unwrap());
+        assert!(ok("tauri://localhost/index.html"));
+        assert!(ok("http://tauri.localhost/index.html#duplicates"));
+        assert!(!ok("file:///Users/me/memeity/memeity/cat.gif"));
+        assert!(!ok("https://example.com/"));
+        assert!(!ok("http://tauri.localhost.evil.example/"));
+        assert_eq!(ok("http://localhost:1420/"), cfg!(debug_assertions));
+    }
 }

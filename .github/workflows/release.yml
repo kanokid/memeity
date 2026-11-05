@@ -44,6 +44,7 @@ jobs:
                 "Download the installer for your computer below.",
                 "",
                 "- **Windows:** `memeity_*_x64-setup.exe`",
+                "- **Windows on ARM** (e.g. Snapdragon laptops): `memeity_*_arm64-setup.exe`",
                 "- **Mac (Apple Silicon):** `memeity_*_aarch64.dmg`",
                 "- **Mac (Intel):** `memeity_*_x64.dmg` (no text recognition: search by name, plus text read on your other devices)",
                 "",
@@ -59,6 +60,10 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
+            args: ""
+          # Windows on ARM (Snapdragon laptops etc.), built natively on an ARM runner.
+          # ONNX Runtime ships prebuilt ARM64 Windows binaries, so text recognition stays in.
+          - platform: windows-11-arm
             args: ""
           - platform: macos-latest
             args: --target aarch64-apple-darwin
