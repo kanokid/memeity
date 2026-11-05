@@ -16,7 +16,39 @@ permissions:
   contents: write # create the release and upload assets
 
 jobs:
+  # One draft release up front, which every build uploads into. (If each build created
+  # its own, parallel builds race and you get duplicate drafts.)
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - id: create
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `memeity ${tag}`,
+              draft: true,
+              prerelease: false,
+              body: [
+                "Download the installer for your computer below.",
+                "",
+                "- **Windows:** `memeity_*_x64-setup.exe`",
+                "- **Mac (Apple Silicon):** `memeity_*_aarch64.dmg`",
+                "- **Mac (Intel):** `memeity_*_x64.dmg` (no text recognition: search by name, plus text read on your other devices)",
+                "",
+                "These builds aren't code-signed yet. Windows may show \"Windows protected your PC\" (click **More info → Run anyway**); on a Mac, open it once from System Settings → Privacy & Security → **Open Anyway**.",
+              ].join("\n"),
+            });
+            return data.id;
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -25,11 +57,13 @@ jobs:
             args: ""
           - platform: macos-latest
             args: --target aarch64-apple-darwin
+          # Intel Macs: ONNX Runtime has no prebuilt binaries for them, so this build
+          # leaves out text recognition (the `ocr` feature). See src-tauri/src/ocr.rs.
           - platform: macos-latest
-            args: --target x86_64-apple-darwin
+            args: --target x86_64-apple-darwin -- --no-default-features
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check required secrets
         shell: bash
@@ -53,7 +87,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: lts/*
           cache: npm
@@ -77,16 +111,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: memeity ${{ github.ref_name }}
-          releaseBody: |
-            Download the installer for your computer below.
-
-            - **Windows:** `memeity_*_x64-setup.exe`
-            - **Mac (Apple Silicon):** `memeity_*_aarch64.dmg`
-            - **Mac (Intel):** `memeity_*_x64.dmg`
-
-            These builds aren't code-signed yet. Windows may show "Windows protected your PC" (click **More info → Run anyway**); on a Mac, open it once from System Settings → Privacy & Security → **Open Anyway**.
-          releaseDraft: true
-          prerelease: false
+          # Upload into the draft made by `create-release` (also merges each platform
+          # into one latest.json for the updater).
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          # The updater reads signatures from latest.json; separate .sig files would just
+          # clutter the release's download list.
+          uploadUpdaterSignatures: false
+          # Windows ships only the setup.exe (no MSI): point updates at it.
+          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}

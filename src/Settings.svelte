@@ -968,11 +968,12 @@
     font-weight: 500;
   }
 
+  /* The button, with "memeity is up to date" (when shown) centred underneath it. */
   .update-row {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
-    gap: 10px;
+    gap: 6px;
     margin: -6px 0 18px;
   }
 

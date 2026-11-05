@@ -251,6 +251,10 @@ fn lock_size(win: &WebviewWindow) {
 fn show_pane(app: &AppHandle) {
     let Some(win) = pane(app) else { return };
     remember_foreground(app, &win);
+    // Paste-to-app hides memeity as a whole app on macOS; un-hide it, or its window
+    // stays invisible.
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     apply_window_mode(app);
     if is_ready(app) {
         lock_size(&win);

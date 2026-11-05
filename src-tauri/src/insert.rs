@@ -58,7 +58,33 @@ pub fn insert(app: &AppHandle, path: &Path, target: isize) -> Result<(), String>
 
 /// Other platforms: paste via the clipboard, without restoring it yet.
 /// (macOS needs Accessibility permission for the simulated Cmd+V.)
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn insert(app: &AppHandle, path: &Path, _target: isize) -> Result<(), String> {
+    crate::clipboard::copy(path)?;
+    crate::hide_pane(app);
+    // Hide memeity as an app, not just its window: that's what makes macOS hand focus
+    // back to the app you were in, so the Cmd+V lands there. (show_pane un-hides it.)
+    let _ = app.hide();
+    std::thread::sleep(FOCUS_SETTLE);
+    on_main_thread(app, send_paste)?
+}
+
+/// Runs `f` on the main thread and waits for its result. enigo looks up which key types
+/// "v" on the current keyboard layout, and macOS aborts the whole app if those keyboard
+/// APIs are called from any other thread. (This thread just waits, so the app stays
+/// responsive.)
+#[cfg(target_os = "macos")]
+fn on_main_thread<T: Send + 'static>(app: &AppHandle, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(f());
+    })
+    .map_err(|e| format!("Couldn't send paste: {e}"))?;
+    rx.recv().map_err(|_| "Couldn't send paste.".to_string())
+}
+
+/// Linux (not shipped yet): paste via the clipboard, no restore.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn insert(app: &AppHandle, path: &Path, _target: isize) -> Result<(), String> {
     crate::clipboard::copy(path)?;
     crate::hide_pane(app);

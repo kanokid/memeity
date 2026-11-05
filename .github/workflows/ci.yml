@@ -19,9 +19,9 @@ jobs:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: lts/*
           cache: npm
@@ -50,3 +50,8 @@ jobs:
       - name: Tests
         working-directory: src-tauri
         run: cargo test
+
+      # The Intel Mac release build leaves out OCR; make sure that still compiles.
+      - name: Clippy (without OCR)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --no-default-features -- -D warnings

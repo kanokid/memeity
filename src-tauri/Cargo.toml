@@ -1,6 +1,6 @@
 [package]
 name = "memeity"
-version = "0.1.0"
+version = "0.1.1"
 description = "One meme folder, everywhere, with a Raycast-style search pane"
 edition = "2024"
 
@@ -8,6 +8,12 @@ edition = "2024"
 # The `_lib` suffix avoids a lib/bin name clash on Windows (cargo#8519).
 name = "memeity_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["ocr"]
+# Reading text in images (PaddleOCR on ONNX Runtime). Turned off only for targets
+# ONNX Runtime has no prebuilt binaries for (Intel Macs); see src/ocr.rs.
+ocr = ["dep:oar-ocr"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -40,7 +46,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tauri-plugin-autostart = "2"
 enigo = "0.6"
 # OCR: PaddleOCR (PP-OCRv6) models on ONNX Runtime. Needs Rust 1.95+.
-oar-ocr = "0.10"
+oar-ocr = { version = "0.10", optional = true }
 tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
