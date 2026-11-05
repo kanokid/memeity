@@ -1,14 +1,16 @@
-# Type-check, lint and test on every push to main and every pull request,
-# on both platforms memeity ships for (macOS also compiles the Mac-only code).
+# Type-check, lint and test on both platforms memeity ships for (macOS also compiles
+# the Mac-only code). Runs on pull requests, before every release build (the Release
+# workflow calls it), or by hand (Actions > CI > Run workflow). Not on plain commits.
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # `ci-` prefix so a release's CI run doesn't share (and cancel) the Release group.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

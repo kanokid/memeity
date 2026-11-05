@@ -16,9 +16,14 @@ permissions:
   contents: write # create the release and upload assets
 
 jobs:
+  # Type-check, lint and test first (ci.yml): a release is only built if they pass.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   # One draft release up front, which every build uploads into. (If each build created
   # its own, parallel builds race and you get duplicate drafts.)
   create-release:
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create.outputs.result }}
