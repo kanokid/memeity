@@ -6,9 +6,13 @@
 
 <p align="center"><i>hey, it's me, it's memeity</i></p>
 
+<br />
+
 <div align="center">
   <img width="770" height="495" alt="screenshot" src="https://github.com/user-attachments/assets/7b1b1057-98df-4f05-b510-83d8097307c0" />
 </div>
+
+<br />
 
 ## What is this?
 Picture this: you're chatting with your friends, when all of a sudden, you've thought of the perfect meme for the occasion! Quickly, you search your downloads folder, only to realize that you've forgotten the filename! (or worse, that the meme is on your other computer!)
