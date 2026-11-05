@@ -26,6 +26,8 @@ pub struct Meme {
     /// Pixel size, read from the file header. Lets the pane lay out its masonry grid
     /// before images load. `None` until `fill_dims` runs (or if the header is unreadable).
     dims: Option<(u32, u32)>,
+    /// GIF / animated WebP. The grid shows a still thumbnail and animates on hover.
+    animated: bool,
 }
 
 /// Score bonus for memes whose image text matched (nucleo filename scores for a good
@@ -45,6 +47,14 @@ pub fn fuzzy_text_bonus(typos: usize) -> u32 {
     }
 }
 
+/// Search boost for a used meme: enough to break ties and lift favourites a little,
+/// never enough to beat a clearly better match (good matches score in the hundreds).
+const USAGE_BOOST_MAX: u32 = 60;
+
+fn usage_boost(score: f64) -> u32 {
+    ((score * 15.0) as u32).min(USAGE_BOOST_MAX)
+}
+
 /// Text-match bonuses per meme: word matches from FTS (`ranked`, best first) and loose
 /// matches (`loose`: rel, typos). A meme keeps its best bonus.
 pub fn text_bonuses(ranked: &[String], loose: &[(String, usize)]) -> HashMap<String, u32> {
@@ -61,8 +71,9 @@ pub fn text_bonuses(ranked: &[String], loose: &[(String, usize)]) -> HashMap<Str
     bonus
 }
 
-/// Previously-read dimensions, keyed by path, valid while the mtime is unchanged.
-pub type DimsCache = HashMap<PathBuf, (SystemTime, (u32, u32))>;
+/// Previously-read dimensions and animation flags, keyed by path, valid while the mtime
+/// is unchanged.
+pub type DimsCache = HashMap<PathBuf, (SystemTime, (u32, u32), bool)>;
 
 #[derive(Default)]
 pub struct Library {
@@ -78,6 +89,10 @@ pub struct Hit {
     pub rel: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Plays on hover/selection in the grid (which otherwise shows a still thumbnail).
+    pub animated: bool,
+    /// Changes whenever the file does (its modified time), so cached thumbnails refresh.
+    pub version: u64,
 }
 
 #[derive(Serialize)]
@@ -101,6 +116,8 @@ impl From<&Meme> for Hit {
             rel: m.rel.clone(),
             width: m.dims.map(|d| d.0),
             height: m.dims.map(|d| d.1),
+            animated: m.animated,
+            version: m.modified.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
         }
     }
 }
@@ -143,7 +160,7 @@ impl Library {
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(UNIX_EPOCH);
-                Meme { path, rel, haystack, modified, dims: None }
+                Meme { path, rel, haystack, modified, dims: None, animated: false }
             })
             .collect();
         memes.sort_by_key(|m| std::cmp::Reverse(m.modified));
@@ -154,7 +171,7 @@ impl Library {
     pub fn dims_cache(&self) -> DimsCache {
         self.memes
             .iter()
-            .filter_map(|m| Some((m.path.clone(), (m.modified, m.dims?))))
+            .filter_map(|m| Some((m.path.clone(), (m.modified, m.dims?, m.animated))))
             .collect()
     }
 
@@ -162,31 +179,54 @@ impl Library {
     /// just the header (not the whole image) for new or changed ones.
     pub fn fill_dims(&mut self, cache: &DimsCache) {
         for m in &mut self.memes {
-            m.dims = match cache.get(&m.path) {
-                Some((modified, dims)) if *modified == m.modified => Some(*dims),
-                _ => image::ImageReader::open(&m.path)
-                    .ok()
-                    .and_then(|r| r.with_guessed_format().ok())
-                    .and_then(|r| r.into_dimensions().ok()),
+            (m.dims, m.animated) = match cache.get(&m.path) {
+                Some((modified, dims, animated)) if *modified == m.modified => (Some(*dims), *animated),
+                _ => (
+                    image::ImageReader::open(&m.path)
+                        .ok()
+                        .and_then(|r| r.with_guessed_format().ok())
+                        .and_then(|r| r.into_dimensions().ok()),
+                    crate::clipboard::is_animated(&m.path),
+                ),
             };
         }
     }
 
     /// `text_bonus` holds memes whose image text/tags matched the query (see
     /// `text_bonuses`). A meme can match by filename, by text, or both (ranks highest).
+    /// Returns the page `offset..offset + limit` of the ranked results (the pane loads
+    /// more pages as you scroll).
+    ///
+    /// `usage` holds recently/frequently used memes (decayed scores): with no query they
+    /// come first; with one they get a modest boost.
     pub fn search(
         &self,
         query: &str,
+        offset: usize,
         limit: usize,
         matcher: &mut Matcher,
         text_bonus: &HashMap<String, u32>,
+        usage: &HashMap<String, f64>,
     ) -> SearchResult {
         let start = Instant::now();
         let query = query.trim();
 
         if query.is_empty() {
+            // Used memes first (most used first), then everything else newest-first.
+            let mut used: Vec<(usize, f64)> = self
+                .memes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| usage.get(&m.rel).map(|&u| (i, u)))
+                .collect();
+            used.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let used_set: std::collections::HashSet<usize> = used.iter().map(|&(i, _)| i).collect();
+            let order = used
+                .iter()
+                .map(|&(i, _)| i)
+                .chain((0..self.memes.len()).filter(|i| !used_set.contains(i)));
             return SearchResult {
-                hits: self.memes.iter().take(limit).map(Hit::from).collect(),
+                hits: order.skip(offset).take(limit).map(|i| Hit::from(&self.memes[i])).collect(),
                 total: self.memes.len(),
                 micros: start.elapsed().as_micros(),
             };
@@ -204,7 +244,8 @@ impl Library {
                 if fuzzy.is_none() && text.is_none() {
                     return None;
                 }
-                Some((fuzzy.unwrap_or(0) + text.unwrap_or(0), i))
+                let boost = usage.get(&m.rel).map_or(0, |&u| usage_boost(u));
+                Some((fuzzy.unwrap_or(0) + text.unwrap_or(0) + boost, i))
             })
             .collect();
         // Stable sort: equal scores keep newest-first order.
@@ -214,11 +255,17 @@ impl Library {
             total: scored.len(),
             hits: scored
                 .into_iter()
+                .skip(offset)
                 .take(limit)
                 .map(|(_, i)| Hit::from(&self.memes[i]))
                 .collect(),
             micros: start.elapsed().as_micros(),
         }
+    }
+
+    /// Display info for one meme, by library-relative path.
+    pub fn hit_for(&self, rel: &str) -> Option<Hit> {
+        self.memes.iter().find(|m| m.rel == rel).map(Hit::from)
     }
 
     pub fn contains(&self, path: &Path) -> bool {
@@ -243,17 +290,17 @@ mod tests {
         assert_eq!(lib.memes.len(), 2, "skips non-images and dot-folders");
 
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
-        let res = lib.search("spika", 10, &mut m, &HashMap::new());
+        let res = lib.search("spika", 0, 10, &mut m, &HashMap::new(), &HashMap::new());
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
-        assert_eq!(lib.search("", 10, &mut m, &HashMap::new()).hits.len(), 2);
-        assert_eq!(lib.search("zzzz", 10, &mut m, &HashMap::new()).hits.len(), 0);
+        assert_eq!(lib.search("", 0, 10, &mut m, &HashMap::new(), &HashMap::new()).hits.len(), 2);
+        assert_eq!(lib.search("zzzz", 0, 10, &mut m, &HashMap::new(), &HashMap::new()).hits.len(), 0);
 
         // A text-only match (filename doesn't match) still shows up...
-        let res = lib.search("zzzz", 10, &mut m, &text_bonuses(&["this is fine.png".to_string()], &[]));
+        let res = lib.search("zzzz", 0, 10, &mut m, &text_bonuses(&["this is fine.png".to_string()], &[]), &HashMap::new());
         assert_eq!(res.hits.len(), 1);
         // ...and a text hit lifts a meme above a filename-only match.
-        let res = lib.search("i", 10, &mut m, &text_bonuses(&["reactions/surprised pikachu.jpg".to_string()], &[]));
+        let res = lib.search("i", 0, 10, &mut m, &text_bonuses(&["reactions/surprised pikachu.jpg".to_string()], &[]), &HashMap::new());
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -266,5 +313,48 @@ mod tests {
         assert_eq!(bonus["a.png"], TEXT_BONUS_BASE + TEXT_BONUS_SPAN, "best word match");
         assert_eq!(bonus["b.png"], TEXT_BONUS_BASE + TEXT_BONUS_SPAN, "exact loose match lifts b");
         assert!(bonus["c.png"] < bonus["b.png"], "typos rank lower");
+    }
+
+    #[test]
+    fn pages_through_results() {
+        let root = std::env::temp_dir().join(format!("memeity-pages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..5 {
+            std::fs::write(root.join(format!("cat {i}.png")), b"x").unwrap();
+        }
+        let lib = Library::scan(&root);
+        let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
+        let none = HashMap::new();
+        let first = lib.search("cat", 0, 2, &mut m, &none, &HashMap::new());
+        let rest = lib.search("cat", 2, 10, &mut m, &none, &HashMap::new());
+        assert_eq!((first.hits.len(), rest.hits.len(), first.total), (2, 3, 5));
+        let all: Vec<_> = first.hits.iter().chain(&rest.hits).map(|h| h.rel.clone()).collect();
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), 5, "pages don't overlap");
+        assert_eq!(lib.search("", 4, 10, &mut m, &none, &HashMap::new()).hits.len(), 1, "empty query pages too");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn used_memes_come_first_and_get_a_boost() {
+        let root = std::env::temp_dir().join(format!("memeity-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["cat one.png", "cat two.png", "dog.png"] {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        let lib = Library::scan(&root);
+        let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
+        let usage = HashMap::from([("dog.png".to_string(), 3.0), ("cat two.png".to_string(), 1.0)]);
+
+        let empty = lib.search("", 0, 10, &mut m, &HashMap::new(), &usage);
+        let order: Vec<_> = empty.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert_eq!(&order[..2], ["dog.png", "cat two.png"], "most used first");
+        assert_eq!(order.len(), 3, "then the rest");
+
+        let cats = lib.search("cat", 0, 10, &mut m, &HashMap::new(), &usage);
+        assert_eq!(cats.hits[0].rel, "cat two.png", "used meme wins an otherwise equal match");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

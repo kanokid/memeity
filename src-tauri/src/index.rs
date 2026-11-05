@@ -7,7 +7,7 @@
 //! - `meme_fts` holds searchable text per meme: OCR text now, tags in milestone 2.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const SCHEMA: &str = "
@@ -19,7 +19,16 @@ CREATE TABLE IF NOT EXISTS memes (
     md5           TEXT NOT NULL,
     indexed       INTEGER NOT NULL DEFAULT 0,
     sidecar_mtime INTEGER,
-    engine        TEXT
+    engine        TEXT,
+    phash         INTEGER
+);
+-- How much each image (by content hash) gets used on this device: copies and pastes.
+-- `score` decays with a half-life (see USAGE_HALF_LIFE_MS), so it means
+-- recently AND frequently used.
+CREATE TABLE IF NOT EXISTS usage (
+    md5       TEXT PRIMARY KEY,
+    score     REAL NOT NULL,
+    last_used INTEGER NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS meme_fts USING fts5(
     text,
@@ -82,7 +91,7 @@ impl Index {
         self.conn.execute(
             "INSERT INTO memes (rel, size, mtime, md5, indexed, sidecar_mtime)
              VALUES (?1, ?2, ?3, ?4, 0, NULL)
-             ON CONFLICT(rel) DO UPDATE SET size = ?2, mtime = ?3, md5 = ?4, indexed = 0, sidecar_mtime = NULL, engine = NULL",
+             ON CONFLICT(rel) DO UPDATE SET size = ?2, mtime = ?3, md5 = ?4, indexed = 0, sidecar_mtime = NULL, engine = NULL, phash = NULL",
             params![rel, size, mtime, md5],
         )?;
         self.conn.execute(
@@ -134,6 +143,80 @@ impl Index {
         Ok(())
     }
 
+    /// Records that a meme was copied/pasted (by its library-relative path).
+    pub fn record_use(&self, rel: &str, now_ms: i64) -> rusqlite::Result<()> {
+        let Some(md5) = self
+            .conn
+            .query_row("SELECT md5 FROM memes WHERE rel = ?1", [rel], |r| r.get::<_, String>(0))
+            .optional()?
+        else {
+            return Ok(()); // not hashed yet; rare, and harmless to skip
+        };
+        let previous: Option<(f64, i64)> = self
+            .conn
+            .query_row("SELECT score, last_used FROM usage WHERE md5 = ?1", [&md5], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let score = previous.map_or(0.0, |(score, last)| decayed(score, last, now_ms)) + 1.0;
+        self.conn.execute(
+            "INSERT INTO usage (md5, score, last_used) VALUES (?1, ?2, ?3)
+             ON CONFLICT(md5) DO UPDATE SET score = ?2, last_used = ?3",
+            params![md5, score, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Current (decayed) usage score per meme, for memes that have been used.
+    pub fn usage_scores(&self, now_ms: i64) -> rusqlite::Result<HashMap<String, f64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT m.rel, u.score, u.last_used FROM usage u JOIN memes m ON m.md5 = u.md5")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (rel, score, last) = row?;
+            let current = decayed(score, last, now_ms);
+            if current >= MIN_USAGE {
+                out.insert(rel, current);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Memes that don't have a perceptual hash yet (newest first isn't needed: all get one).
+    pub fn missing_phash(&self, limit: usize) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT rel FROM memes WHERE phash IS NULL LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    pub fn set_phash(&self, rel: &str, phash: u64) -> rusqlite::Result<()> {
+        // Stored as SQLite's signed 64-bit integer; same bits.
+        self.conn.execute("UPDATE memes SET phash = ?2 WHERE rel = ?1", params![rel, phash as i64])?;
+        Ok(())
+    }
+
+    /// Every meme's content hash and perceptual hash, for the duplicate finder.
+    pub fn duplicate_candidates(&self) -> rusqlite::Result<Vec<crate::dupes::Candidate>> {
+        let mut stmt = self.conn.prepare("SELECT rel, md5, phash FROM memes")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::dupes::Candidate {
+                rel: r.get(0)?,
+                md5: r.get(1)?,
+                phash: r.get::<_, Option<i64>>(2)?.map(|h| h as u64),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// A meme with exactly these bytes (by MD5), if the library has one.
+    pub fn rel_for_md5(&self, md5: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT rel FROM memes WHERE md5 = ?1 LIMIT 1", [md5], |r| r.get(0))
+            .optional()
+    }
+
     /// Every indexed meme's text and tags (for the in-memory loose-match cache).
     pub fn all_texts(&self) -> rusqlite::Result<Vec<(String, String, Vec<String>)>> {
         let mut stmt = self
@@ -165,17 +248,33 @@ impl Index {
     }
 }
 
+/// Usage counts halve every two weeks: last month's favourites fade, today's rise.
+const USAGE_HALF_LIFE_MS: f64 = 14.0 * 24.0 * 3600.0 * 1000.0;
+/// Below this, a meme no longer counts as "used" (one use ~2 months ago).
+const MIN_USAGE: f64 = 0.05;
+
+fn decayed(score: f64, last_used_ms: i64, now_ms: i64) -> f64 {
+    let age = (now_ms - last_used_ms).max(0) as f64;
+    score * 0.5f64.powf(age / USAGE_HALF_LIFE_MS)
+}
+
 /// Creates the schema, and migrates indexes made by earlier versions.
 fn init(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version < 2 {
-        // v2 added `memes.engine`. Fresh databases already have it from SCHEMA.
-        let has_engine = conn.prepare("SELECT engine FROM memes LIMIT 0").is_ok();
-        if !has_engine {
-            conn.execute_batch("ALTER TABLE memes ADD COLUMN engine TEXT")?;
+    // Each version added a column; fresh databases already have it from SCHEMA.
+    let add_column = |name: &str, kind: &str| -> rusqlite::Result<()> {
+        if conn.prepare(&format!("SELECT {name} FROM memes LIMIT 0")).is_err() {
+            conn.execute_batch(&format!("ALTER TABLE memes ADD COLUMN {name} {kind}"))?;
         }
-        conn.execute_batch("PRAGMA user_version = 2")?;
+        Ok(())
+    };
+    if version < 2 {
+        add_column("engine", "TEXT")?; // which OCR engine produced the text
+    }
+    if version < 3 {
+        add_column("phash", "INTEGER")?; // perceptual hash, for the duplicate finder
+        conn.execute_batch("PRAGMA user_version = 3")?;
     }
     Ok(())
 }
@@ -242,5 +341,28 @@ mod tests {
         init(&conn).unwrap();
         assert!(conn.prepare("SELECT engine FROM memes").is_ok());
         init(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn usage_counts_decay_and_follow_content() {
+        let idx = Index::in_memory();
+        idx.upsert_file("a.png", 1, 1, "aaa").unwrap();
+        idx.upsert_file("b.png", 1, 1, "bbb").unwrap();
+        let day = 24 * 3600 * 1000;
+        idx.record_use("a.png", 0).unwrap();
+        idx.record_use("a.png", 0).unwrap();
+        idx.record_use("b.png", 14 * day).unwrap();
+
+        let now = idx.usage_scores(14 * day).unwrap();
+        assert!((now["a.png"] - 1.0).abs() < 1e-9, "2 uses, one half-life ago -> 1.0");
+        assert!((now["b.png"] - 1.0).abs() < 1e-9, "1 use just now -> 1.0");
+
+        // Renaming keeps the history (it's keyed by content).
+        idx.retain(&HashSet::from(["b.png".to_string()])).unwrap();
+        idx.upsert_file("renamed.png", 1, 1, "aaa").unwrap();
+        assert!(idx.usage_scores(14 * day).unwrap().contains_key("renamed.png"));
+
+        // Long unused memes drop out.
+        assert!(idx.usage_scores(200 * day).unwrap().is_empty());
     }
 }

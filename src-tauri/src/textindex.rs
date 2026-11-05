@@ -18,8 +18,12 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Memes that just arrived from Drive wait this long for their sidecar (made by the
+/// device that added them) before this device reads their text itself.
+const OCR_GRACE: Duration = Duration::from_secs(180);
 
 /// Refresh search results / upload sidecars every this many OCR'd memes.
 const BATCH: usize = 10;
@@ -82,13 +86,16 @@ struct Pending {
 
 fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Result<(), String> {
     let Some((_, root)) = sync_target(app) else { return Ok(()) };
-    let memes: Vec<(String, PathBuf)> = {
+    let (memes, thumb_keys): (Vec<(String, PathBuf)>, HashSet<String>) = {
         let state = app.state::<AppState>();
         let lib = state.library.read().unwrap();
         if lib.root.as_deref() != Some(root.as_path()) {
             return Ok(()); // library not loaded for this folder yet
         }
-        lib.memes.iter().map(|m| (m.rel.clone(), m.path.clone())).collect()
+        (
+            lib.memes.iter().map(|m| (m.rel.clone(), m.path.clone())).collect(),
+            lib.memes.iter().map(|m| crate::thumbs::key(&m.path, m.modified)).collect(),
+        )
     };
 
     // 1. Forget memes that are gone.
@@ -100,6 +107,16 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
 
     // "Re-read all memes" from Settings: OCR everything again, ignoring cached text.
     let force = app.state::<AppState>().reread_text.swap(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Memes downloaded from Drive within the grace period: leave their OCR to the device
+    // that added them (its sidecar is on the way) rather than reading them twice.
+    let waiting: std::collections::HashMap<String, Instant> = {
+        let state = app.state::<AppState>();
+        let mut arrived = state.arrived.lock().unwrap();
+        arrived.retain(|_, at| at.elapsed() < OCR_GRACE);
+        arrived.clone()
+    };
+    let mut wait_until: Option<Instant> = None;
 
     // 2. Work out what needs (re)indexing. Library order is newest first.
     let mut pending = Vec::new();
@@ -126,8 +143,12 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
         let sidecar_path = sidecar::path(&root, &md5);
         let sidecar_mtime = mtime_of(&sidecar_path);
         if force {
-            pending.push(Pending { rel, path, md5 });
-            continue;
+            // "Re-read all" re-runs OCR, but keeps text the user typed themselves.
+            let edited = sidecar::read(&root, &md5).and_then(|sc| sc.ocr).is_some_and(|o| o.edited);
+            if !edited {
+                pending.push(Pending { rel, path, md5 });
+                continue;
+            }
         }
         if indexed && sidecar_mtime == seen_sidecar && current_engine {
             continue; // up to date
@@ -142,19 +163,36 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
                 app.state::<AppState>().text_cache.lock().unwrap().set(&rel, &ocr_text.text, &sc.tags);
                 changed = true;
                 // ...and re-read it if an older engine produced that text.
-                if ocr_text.engine != ocr::ENGINE_NAME {
+                if ocr_text.engine != ocr::ENGINE_NAME && !ocr_text.edited {
                     pending.push(Pending { rel, path, md5 });
                 }
             }
-            _ => pending.push(Pending { rel, path, md5 }),
+            _ => match waiting.get(&rel) {
+                // No sidecar yet for a meme that just arrived: check again after the grace.
+                Some(at) => {
+                    let ready = *at + OCR_GRACE;
+                    wait_until = Some(wait_until.map_or(ready, |w| w.min(ready)));
+                }
+                None => pending.push(Pending { rel, path, md5 }),
+            },
         }
     }
     if changed {
         let _ = app.emit("library-changed", ());
     }
 
+    if let Some(when) = wait_until {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(when.saturating_duration_since(Instant::now()) + Duration::from_secs(1));
+            trigger(&app);
+        });
+    }
+
     if pending.is_empty() {
         set_status(app, OcrStatus { state: "idle", ..Default::default() });
+        fill_phashes(app, &root, rx);
+        prune_thumbs(app, &thumb_keys);
         return Ok(());
     }
 
@@ -190,10 +228,14 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
                 let text = text.trim().to_string();
                 // Merge into any existing sidecar so we never clobber tags/unknown fields.
                 let mut sc: Sidecar = sidecar::read(&root, &item.md5).unwrap_or_default();
+                if sc.ocr.as_ref().is_some_and(|o| o.edited) {
+                    continue; // the user typed this meme's text while OCR was running
+                }
                 sc.ocr = Some(sidecar::Ocr {
                     text: text.clone(),
                     engine: ocr::ENGINE_NAME.to_string(),
                     lang: None, // PP-OCRv6 reads many scripts at once
+                    edited: false,
                     at: Some(humantime::format_rfc3339_seconds(SystemTime::now()).to_string()),
                 });
                 let sidecar_mtime = match sidecar::write(&root, &item.md5, &sc) {
@@ -226,6 +268,44 @@ fn run(app: &AppHandle, rx: &Receiver<()>, engine: &mut Option<Engine>) -> Resul
     sync::trigger(app);
     if rerun {
         trigger(app);
+    } else {
+        fill_phashes(app, &root, rx);
+        prune_thumbs(app, &thumb_keys);
     }
     Ok(())
+}
+
+/// Clears cached thumbnails that no longer belong to any meme in the library.
+fn prune_thumbs(app: &AppHandle, keep: &HashSet<String>) {
+    if let Some(dir) = crate::thumbs::cache_dir(app) {
+        let removed = crate::thumbs::prune(&dir, keep);
+        if removed > 0 {
+            eprintln!("[memeity] cleared {removed} unused thumbnail(s)");
+        }
+    }
+}
+
+/// Background, lowest priority: perceptual hashes for the duplicate finder. Stops as
+/// soon as anything else needs the worker (the next pass picks up where this left off).
+fn fill_phashes(app: &AppHandle, root: &Path, rx: &Receiver<()>) {
+    const CHUNK: usize = 200;
+    loop {
+        let Ok(Some(rels)) = with_index(app, |idx| idx.missing_phash(CHUNK)) else { return };
+        if rels.is_empty() {
+            return;
+        }
+        for rel in &rels {
+            if rx.try_recv().is_ok() {
+                trigger(app); // something changed: handle that first, resume later
+                return;
+            }
+            let path = rel.split('/').fold(root.to_path_buf(), |p, part| p.join(part));
+            // Unreadable images get 0 so they aren't retried every pass (and match nothing
+            // useful: duplicates of a blank hash are still checked by MD5).
+            let hash = crate::dupes::dhash(&path).unwrap_or(0);
+            if with_index(app, |idx| idx.set_phash(rel, hash)).is_err() {
+                return;
+            }
+        }
+    }
 }

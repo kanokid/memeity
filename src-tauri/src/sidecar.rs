@@ -47,6 +47,10 @@ pub struct Ocr {
     /// When the text was recognized (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    /// The user typed/corrected this text. OCR (re-reads, engine upgrades) never
+    /// overwrites it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
 }
 
 fn current_version() -> u32 {
@@ -121,7 +125,7 @@ mod tests {
     fn writes_atomically_and_reads_back() {
         let root = std::env::temp_dir().join(format!("memeity-sidecar-{}", std::process::id()));
         let sc = Sidecar {
-            ocr: Some(Ocr { text: "when the".into(), engine: "test".into(), lang: None, at: None }),
+            ocr: Some(Ocr { text: "when the".into(), engine: "test".into(), lang: None, at: None, edited: false }),
             ..Default::default()
         };
         write(&root, "deadbeef", &sc).unwrap();

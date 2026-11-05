@@ -3,8 +3,10 @@
 
 mod clipboard;
 mod config;
+mod dupes;
 mod fuzzytext;
 mod google;
+mod import;
 mod index;
 mod insert;
 mod library;
@@ -13,6 +15,7 @@ mod settings;
 mod sidecar;
 mod sync;
 mod textindex;
+mod thumbs;
 mod watcher;
 
 use config::{Config, DriveFolder};
@@ -41,7 +44,7 @@ const PANE_HEIGHT: f64 = 475.0;
 pub struct AppState {
     pub library: RwLock<Library>,
     pub google: Google,
-    pub sync_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    pub sync_tx: tokio::sync::mpsc::UnboundedSender<sync::SyncKind>,
     /// Serializes sync passes and deletes.
     pub sync_lock: tokio::sync::Mutex<()>,
     pub sync_status: Mutex<SyncStatus>,
@@ -53,12 +56,19 @@ pub struct AppState {
     /// Wakes the background OCR/indexing worker.
     pub text_tx: std::sync::mpsc::Sender<()>,
     pub ocr_status: Mutex<textindex::OcrStatus>,
+    /// Memes this device just downloaded from Drive, and when. OCR waits a little for
+    /// their sidecars (the device that added them is already reading their text).
+    pub arrived: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Deletes that can still be undone, by token.
+    pub pending_deletes: Mutex<std::collections::HashMap<String, sync::HeldDelete>>,
     config: Mutex<Config>,
     matcher: Mutex<Matcher>,
     watcher: Mutex<Option<RecommendedWatcher>>,
     shortcut_error: Mutex<Option<String>>,
     /// Set while a native dialog is open so the pane doesn't hide on blur.
     dialog_open: AtomicBool,
+    /// A drag (files/images/links) is over the pane: don't hide it.
+    dragging: AtomicBool,
     /// Whether the pane has actually received focus since it was last shown. Windows
     /// may refuse to focus a window (e.g. right after launch); we only hide on blur
     /// once it really had focus, so it can't vanish before you ever see it.
@@ -246,6 +256,51 @@ fn show_pane(app: &AppHandle) {
     sync::trigger_if_stale(app);
 }
 
+/// Hides the pane after it loses focus, except when the user is dragging something onto
+/// it: dragging from Explorer means clicking Explorer first, which takes focus. So if
+/// the mouse button is down when focus goes, wait for the release and only hide if no
+/// drag arrived over the pane (a plain click elsewhere hides on mouse-up).
+#[cfg(windows)]
+fn hide_on_blur(app: &AppHandle) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    let button_down = || unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000 != 0;
+    if !button_down() {
+        hide_pane(app);
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        while button_down() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // Give a drop on the pane a moment to be reported before deciding.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let state = app.state::<AppState>();
+        let refocused = pane(&app).is_some_and(|w| w.is_focused().unwrap_or(false));
+        if !state.dragging.load(Ordering::SeqCst) && !refocused {
+            hide_pane(&app);
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn hide_on_blur(app: &AppHandle) {
+    hide_pane(app);
+}
+
+/// The pane reports drags entering/leaving it. After a drop (`refocus`) it takes focus
+/// back, so clicking away afterwards hides it as usual.
+#[tauri::command]
+fn set_dragging(app: AppHandle, active: bool, refocus: Option<bool>) {
+    app.state::<AppState>().dragging.store(active, Ordering::SeqCst);
+    if refocus == Some(true)
+        && let Some(win) = pane(&app)
+        && win.is_visible().unwrap_or(false)
+    {
+        let _ = win.set_focus();
+    }
+}
+
 /// Notes which app the user was in, so instant insert can paste back into it.
 #[cfg(windows)]
 fn remember_foreground(app: &AppHandle, win: &WebviewWindow) {
@@ -318,6 +373,7 @@ fn load_library(app: &AppHandle) {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("[memeity] couldn't create {}: {e}", dir.display());
     }
+    sync::sweep_held_deletes(&dir);
     if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
         eprintln!("[memeity] couldn't allow asset scope: {e}");
     }
@@ -408,7 +464,7 @@ fn get_status(app: AppHandle) -> Status {
 }
 
 #[tauri::command]
-fn search(state: State<'_, AppState>, query: String, limit: usize) -> SearchResult {
+fn search(state: State<'_, AppState>, query: String, offset: Option<usize>, limit: usize) -> SearchResult {
     /// How many image-text matches to consider for ranking.
     const TEXT_HITS: usize = 500;
     let text_bonus = if query.trim().is_empty() {
@@ -425,9 +481,35 @@ fn search(state: State<'_, AppState>, query: String, limit: usize) -> SearchResu
         let loose = state.text_cache.lock().unwrap().matches(&query);
         library::text_bonuses(&words, &loose)
     };
+    let usage = state
+        .index
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|idx| idx.usage_scores(now_ms()).ok())
+        .unwrap_or_default();
     let lib = state.library.read().unwrap();
     let mut matcher = state.matcher.lock().unwrap();
-    lib.search(&query, limit, &mut matcher, &text_bonus)
+    lib.search(&query, offset.unwrap_or(0), limit, &mut matcher, &text_bonus, &usage)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Counts a copy/paste towards "recently & frequently used".
+fn record_use(app: &AppHandle, path: &std::path::Path) {
+    let Some((_, root)) = sync_target(app) else { return };
+    let Ok(rel) = path.strip_prefix(&root) else { return };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if let Some(idx) = app.state::<AppState>().index.lock().unwrap().as_ref()
+        && let Err(e) = idx.record_use(&rel, now_ms())
+    {
+        eprintln!("[memeity] couldn't record use: {e}");
+    }
 }
 
 #[tauri::command]
@@ -438,6 +520,7 @@ async fn copy_meme(app: AppHandle, path: String) -> Result<(), String> {
         return Err("That file isn't in your meme folder.".into());
     }
     clipboard::copy(&path)?;
+    record_use(&app, &path);
     hide_pane_after_copy(&app);
     Ok(())
 }
@@ -450,6 +533,8 @@ struct MemeText {
     lang: Option<String>,
     /// When it was read (RFC 3339).
     at: Option<String>,
+    /// The user edited the text.
+    edited: bool,
 }
 
 /// What OCR found in a meme, from its sidecar.
@@ -464,14 +549,151 @@ fn meme_text(app: AppHandle, path: String) -> Result<MemeText, String> {
         .replace('\\', "/");
     let state = app.state::<AppState>();
     let entry = state.index.lock().unwrap().as_ref().and_then(|idx| idx.lookup(&rel).ok().flatten());
-    let pending = MemeText { state: "pending", text: None, lang: None, at: None };
+    let pending = MemeText { state: "pending", text: None, lang: None, at: None, edited: false };
     let Some(entry) = entry else { return Ok(pending) };
     match sidecar::read(&root, &entry.md5).and_then(|sc| sc.ocr) {
-        Some(ocr) => Ok(MemeText { state: "read", text: Some(ocr.text), lang: ocr.lang, at: ocr.at }),
+        Some(ocr) => Ok(MemeText { state: "read", text: Some(ocr.text), lang: ocr.lang, at: ocr.at, edited: ocr.edited }),
         // Indexed without a sidecar means the image couldn't be decoded/read.
         None if entry.indexed => Ok(MemeText { state: "failed", ..pending }),
         None => Ok(pending),
     }
+}
+
+#[derive(Serialize)]
+struct DuplicateItem {
+    #[serde(flatten)]
+    hit: library::Hit,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroup {
+    /// All identical files (vs. visually similar).
+    exact: bool,
+    /// Best copy to keep first: highest resolution, then biggest file, then oldest.
+    items: Vec<DuplicateItem>,
+}
+
+#[derive(Serialize)]
+struct Duplicates {
+    groups: Vec<DuplicateGroup>,
+    /// Memes not yet fingerprinted (near-duplicates among them aren't found yet).
+    pending: usize,
+}
+
+#[tauri::command]
+fn find_duplicates(app: AppHandle) -> Result<Duplicates, String> {
+    let state = app.state::<AppState>();
+    let (candidates, pending) = {
+        let guard = state.index.lock().unwrap();
+        let idx = guard.as_ref().ok_or("The search index isn't available.")?;
+        let candidates = idx.duplicate_candidates().map_err(|e| e.to_string())?;
+        let pending = idx.missing_phash(100_000).map(|v| v.len()).unwrap_or(0);
+        (candidates, pending)
+    };
+    let groups = dupes::group(&candidates);
+    let lib = state.library.read().unwrap();
+    let groups = groups
+        .into_iter()
+        .filter_map(|g| {
+            let mut items: Vec<DuplicateItem> = g
+                .rels
+                .iter()
+                .filter_map(|rel| lib.hit_for(rel))
+                .map(|hit| {
+                    let bytes = std::fs::metadata(&hit.path).map(|m| m.len()).unwrap_or(0);
+                    DuplicateItem { hit, bytes }
+                })
+                .collect();
+            items.sort_by_key(|i| {
+                let area = u64::from(i.hit.width.unwrap_or(0)) * u64::from(i.hit.height.unwrap_or(0));
+                (std::cmp::Reverse(area), std::cmp::Reverse(i.bytes), i.hit.version)
+            });
+            (items.len() > 1).then_some(DuplicateGroup { exact: g.exact, items })
+        })
+        .collect();
+    Ok(Duplicates { groups, pending })
+}
+
+/// The meme's library root and relative path, checking it's actually in the library.
+fn library_rel(app: &AppHandle, path: &std::path::Path) -> Result<(PathBuf, String), String> {
+    let (_, root) = sync_target(app).ok_or("No meme folder selected.")?;
+    if !app.state::<AppState>().library.read().unwrap().contains(path) {
+        return Err("That file isn't in your meme folder.".into());
+    }
+    let rel = path
+        .strip_prefix(&root)
+        .map_err(|_| "That file isn't in your meme folder.".to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok((root, rel))
+}
+
+/// Renames a meme (keeping its extension and folder). Sync spots the rename (same
+/// bytes, new name) and renames it on Drive too. Returns the new path.
+#[tauri::command]
+fn rename_meme(app: AppHandle, path: String, name: String) -> Result<String, String> {
+    let path = PathBuf::from(path);
+    library_rel(&app, &path)?;
+    let stem = sync::sanitize(name.trim());
+    if stem.is_empty() {
+        return Err("Give it a name.".into());
+    }
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let file_name = if ext.is_empty() { stem } else { format!("{stem}.{ext}") };
+    let dest = path.with_file_name(&file_name);
+    if dest == path {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    // Windows/macOS names are case-insensitive: "Cat.png" -> "cat.png" is a rename, not a clash.
+    let same_file = dest.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
+    if dest.exists() && !same_file {
+        return Err(format!("There's already a meme called {file_name}."));
+    }
+    std::fs::rename(&path, &dest).map_err(|e| format!("Couldn't rename: {e}"))?;
+    refresh_library(&app);
+    sync::trigger(&app);
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Replaces a meme's recognized text with what the user typed. Stored in its sidecar
+/// (so it syncs everywhere) and marked as edited, so OCR never overwrites it.
+#[tauri::command]
+fn set_meme_text(app: AppHandle, path: String, text: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let (root, rel) = library_rel(&app, &path)?;
+    let state = app.state::<AppState>();
+    let md5 = state
+        .index
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|idx| idx.lookup(&rel).ok().flatten())
+        .map(|e| e.md5)
+        .ok_or("memeity is still indexing this meme. Try again in a moment.")?;
+
+    let text = text.trim().to_string();
+    let mut sc = sidecar::read(&root, &md5).unwrap_or_default();
+    let engine = sc.ocr.as_ref().map(|o| o.engine.clone()).unwrap_or_else(|| ocr::ENGINE_NAME.to_string());
+    sc.ocr = Some(sidecar::Ocr {
+        text: text.clone(),
+        engine: engine.clone(),
+        lang: None,
+        at: Some(humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()),
+        edited: true,
+    });
+    sidecar::write(&root, &md5, &sc).map_err(|e| format!("Couldn't save the text: {e}"))?;
+    let sidecar_mtime = std::fs::metadata(sidecar::path(&root, &md5))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    if let Some(idx) = state.index.lock().unwrap().as_ref() {
+        idx.set_text(&rel, &text, &sc.tags, sidecar_mtime, Some(&engine)).map_err(|e| e.to_string())?;
+    }
+    state.text_cache.lock().unwrap().set(&rel, &text, &sc.tags);
+    sync::trigger(&app); // upload the edited sidecar
+    Ok(())
 }
 
 /// Instant insert (Shift+Enter): paste the meme into the app the user was in, then
@@ -485,9 +707,12 @@ async fn insert_meme(app: AppHandle, path: String) -> Result<(), String> {
     }
     let target = state.prev_window.load(Ordering::SeqCst);
     let handle = app.clone();
+    let used = path.clone();
     tauri::async_runtime::spawn_blocking(move || insert::insert(&handle, &path, target))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    record_use(&app, &used);
+    Ok(())
 }
 
 /// Show in folder (Ctrl+Shift+F): open Explorer/Finder with the meme selected.
@@ -501,17 +726,26 @@ fn reveal_meme(app: AppHandle, path: String) -> Result<(), String> {
     app.opener().reveal_item_in_dir(&path).map_err(|e| format!("Couldn't show the file: {e}"))
 }
 
-/// Trash a meme on Drive and remove it from this device.
+/// Trash a meme on Drive and remove it from this device. Returns a token that
+/// `undo_delete` accepts for the next few seconds.
 #[tauri::command]
-async fn delete_meme(app: AppHandle, path: String) -> Result<(), String> {
+async fn delete_meme(app: AppHandle, path: String) -> Result<String, String> {
     let path = PathBuf::from(path);
     let known = app.state::<AppState>().library.read().unwrap().contains(&path);
     if !known {
         return Err("That file isn't in your meme folder.".into());
     }
-    sync::delete(&app, &path).await?;
+    let token = sync::delete(&app, &path).await?;
     refresh_library(&app);
-    Ok(())
+    Ok(token)
+}
+
+#[tauri::command]
+async fn undo_delete(app: AppHandle, token: String) -> Result<String, String> {
+    let restored = sync::undo_delete(&app, &token).await?;
+    refresh_library(&app);
+    sync::trigger(&app);
+    Ok(restored.to_string_lossy().into_owned())
 }
 
 /// Pick the OAuth client JSON downloaded from Google Cloud Console.
@@ -668,6 +902,14 @@ pub fn run() {
     let (text_tx, text_rx) = std::sync::mpsc::channel();
 
     tauri::Builder::default()
+        // Grid thumbnails: `thumb://<path>`, made on demand and cached (see thumbs.rs).
+        .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let uri_path = request.uri().path().to_string();
+            tauri::async_runtime::spawn(async move {
+                responder.respond(thumbs::respond(app, uri_path).await);
+            });
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -688,9 +930,13 @@ pub fn run() {
             search,
             copy_meme,
             meme_text,
+            rename_meme,
+            find_duplicates,
+            set_meme_text,
             insert_meme,
             reveal_meme,
             delete_meme,
+            undo_delete,
             load_client_file,
             sign_in,
             sign_out_cmd,
@@ -705,7 +951,10 @@ pub fn run() {
             settings::set_autostart,
             settings::set_primary_action,
             settings::reread_all_text,
-            settings::open_link
+            settings::open_link,
+            import::import_bytes,
+            import::import_url,
+            set_dragging
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -727,11 +976,14 @@ pub fn run() {
                 text_cache: Mutex::new(fuzzytext::TextCache::default()),
                 text_tx,
                 ocr_status: Mutex::new(textindex::OcrStatus { state: "idle", ..Default::default() }),
+                arrived: Mutex::new(Default::default()),
+                pending_deletes: Mutex::new(Default::default()),
                 config: Mutex::new(Config::load(&config_dir)),
                 matcher: Mutex::new(Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths())),
                 watcher: Mutex::new(None),
                 shortcut_error: Mutex::new(None),
                 dialog_open: AtomicBool::new(false),
+                dragging: AtomicBool::new(false),
                 had_focus: AtomicBool::new(false),
                 window_mode: Mutex::new(None),
                 shortcut: Mutex::new(settings::DEFAULT_SHORTCUT.parse().expect("default shortcut is valid")),
@@ -770,7 +1022,7 @@ pub fn run() {
                         && state.had_focus.load(Ordering::SeqCst)
                         && !state.dialog_open.load(Ordering::SeqCst)
                     {
-                        hide_pane(&h);
+                        hide_on_blur(&h);
                     }
                 }
                 WindowEvent::CloseRequested { api, .. } => {

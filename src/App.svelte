@@ -5,7 +5,17 @@
   import Setup from "./Setup.svelte";
   import logo from "./assets/logo.png";
 
-  type Hit = { path: string; name: string; rel: string; width: number | null; height: number | null };
+  type Hit = {
+    path: string;
+    name: string;
+    rel: string;
+    width: number | null;
+    height: number | null;
+    /** GIF / animated WebP: shown as a still thumbnail, animated on hover or selection. */
+    animated: boolean;
+    /** Changes when the file does, so its cached thumbnail refreshes. */
+    version: number;
+  };
   type SearchResult = { hits: Hit[]; total: number; micros: number };
   type DriveFolder = { id: string; name: string };
   type SyncStatus = {
@@ -37,7 +47,10 @@
 
   /** GIF-picker style: a few big columns of images, no captions. */
   const COLS = 3;
-  const LIMIT = 200;
+  /** Results per page; more load as you scroll (infinite scroll). */
+  const PAGE = 90;
+  /** Start loading the next page this many pixels before the bottom. */
+  const LOAD_AHEAD_PX = 700;
   /** Tile aspect (height / width) is clamped so panoramas and tall screenshots stay usable. */
   const MIN_RATIO = 0.5;
   const MAX_RATIO = 1.6;
@@ -53,6 +66,13 @@
   // ready stage
   let hits = $state<Hit[]>([]);
   let selected = $state(0);
+  let hovered = $state(-1);
+
+  /** Small cached thumbnail (see thumbs.rs), or the original for animated memes in play. */
+  function tileSrc(hit: Hit, i: number) {
+    if (hit.animated && (i === selected || i === hovered)) return convertFileSrc(hit.path);
+    return `${convertFileSrc(hit.path, "thumb")}?v=${hit.version}`;
+  }
   let confirmDelete = $state<Hit | null>(null);
   let searchSeq = 0;
 
@@ -61,7 +81,14 @@
   let menuSel = $state(0);
 
   /** Details view (Ctrl+I): big preview + the text OCR read from the selected meme. */
-  type MemeText = { state: "read" | "pending" | "failed"; text: string | null; lang: string | null; at: string | null };
+  type MemeText = {
+    state: "read" | "pending" | "failed";
+    text: string | null;
+    lang: string | null;
+    at: string | null;
+    /** The user typed/corrected this text; OCR won't overwrite it. */
+    edited: boolean;
+  };
   let showDetails = $state(false);
   let details = $state<MemeText | null>(null);
   let copiedText = $state(false);
@@ -89,6 +116,79 @@
     showDetails = open;
     details = null;
     copiedText = false;
+    renaming = false;
+    editingText = false;
+  }
+
+  // ---------- editing (rename, retype text) ----------
+
+  let renaming = $state(false);
+  let nameDraft = $state("");
+  let editingText = $state(false);
+  let textDraft = $state("");
+  let nameInput: HTMLInputElement | undefined = $state();
+  let textInput: HTMLTextAreaElement | undefined = $state();
+
+  const stemOf = (name: string) => (name.lastIndexOf(".") > 0 ? name.slice(0, name.lastIndexOf(".")) : name);
+  const extOf = (name: string) => (name.lastIndexOf(".") > 0 ? name.slice(name.lastIndexOf(".") + 1) : "");
+
+  /** Rename (F2): opens the details view with the name field ready to type. */
+  async function startRename() {
+    if (!current) return;
+    if (!showDetails) toggleDetails(true);
+    editingText = false;
+    nameDraft = stemOf(current.name);
+    renaming = true;
+    await tick();
+    nameInput?.focus();
+    nameInput?.select();
+  }
+
+  function stopEditing() {
+    renaming = false;
+    editingText = false;
+    input?.focus(); // back to the search box, so the arrow keys work again
+  }
+
+  const saveRename = () =>
+    act(async () => {
+      if (!current) return;
+      const path = current.path;
+      await invoke<string>("rename_meme", { path, name: nameDraft });
+      stopEditing();
+      await refresh();
+    });
+
+  async function startEditText() {
+    if (!current) return;
+    if (!showDetails) toggleDetails(true);
+    renaming = false;
+    textDraft = details?.text ?? "";
+    editingText = true;
+    await tick();
+    textInput?.focus();
+  }
+
+  const saveText = () =>
+    act(async () => {
+      if (!current) return;
+      await invoke("set_meme_text", { path: current.path, text: textDraft });
+      stopEditing();
+      details = await invoke<MemeText>("meme_text", { path: current.path });
+      await runSearch(false); // the new text is searchable right away
+    });
+
+  /** Enter/Esc inside the edit fields (they handle their own keys). */
+  function onEditKey(e: KeyboardEvent, save: () => void, multiline: boolean) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      stopEditing();
+    } else if (e.key === "Enter" && (!multiline || e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      save();
+    }
   }
 
   async function copyText() {
@@ -223,13 +323,43 @@
 
   // ---------- search grid ----------
 
+  /** Total matches for the current query (hits may hold fewer: pages load as you scroll). */
+  let total = $state(0);
+  let loadingMore = false;
+
   async function runSearch(resetSelection: boolean) {
     const seq = ++searchSeq;
-    const res = await invoke<SearchResult>("search", { query, limit: LIMIT });
+    // A refresh (library changed) keeps however many pages were already loaded.
+    const limit = resetSelection ? PAGE : Math.max(PAGE, hits.length);
+    const res = await invoke<SearchResult>("search", { query, offset: 0, limit });
     if (seq !== searchSeq) return; // a newer keystroke already won
     hits = res.hits;
+    total = res.total;
     selected = resetSelection ? 0 : Math.min(selected, Math.max(hits.length - 1, 0));
     if (resetSelection) grid?.scrollTo({ top: 0 });
+    await tick();
+    maybeLoadMore(); // the first page might not fill the pane
+  }
+
+  /** Appends the next page of results. */
+  async function loadMore() {
+    if (loadingMore || hits.length >= total) return;
+    loadingMore = true;
+    const seq = searchSeq;
+    try {
+      const res = await invoke<SearchResult>("search", { query, offset: hits.length, limit: PAGE });
+      if (seq !== searchSeq) return; // the query changed meanwhile
+      hits = [...hits, ...res.hits];
+      total = res.total;
+    } finally {
+      loadingMore = false;
+    }
+  }
+
+  /** Loads more if the grid is scrolled near its end (or doesn't overflow yet). */
+  function maybeLoadMore() {
+    if (!grid) return;
+    if (grid.scrollTop + grid.clientHeight >= grid.scrollHeight - LOAD_AHEAD_PX) loadMore();
   }
 
   async function select(i: number) {
@@ -238,6 +368,8 @@
     selected = Math.max(0, Math.min(hits.length - 1, i));
     await tick();
     grid?.querySelector(`[data-i="${selected}"]`)?.scrollIntoView({ block: "nearest" });
+    // Arrowing towards the end loads the next page before you hit it.
+    if (selected >= hits.length - COLS * 3) loadMore();
   }
 
   const copy = (i = selected) =>
@@ -260,12 +392,135 @@
       if (hit) await invoke("reveal_meme", { path: hit.path });
     });
 
+  /** The most recent delete, undoable (toast button or Ctrl+Z) until its toast expires. */
+  let undoToken: string | null = null;
+  /** Ctrl+Z works this long after a delete (matches the backend's undo window)... */
+  const UNDO_MS = 10_000;
+  /** ...while the "Deleted" notice itself gets out of the way sooner. */
+  const DELETED_TOAST_MS = 5_000;
+
   const doDelete = (hit: Hit) =>
     act(async () => {
       confirmDelete = null;
-      await invoke("delete_meme", { path: hit.path });
+      const token = await invoke<string>("delete_meme", { path: hit.path });
+      undoToken = token;
+      showToast(
+        { message: `Deleted ${hit.name}`, danger: true, action: { label: "Undo", run: () => undoDelete(token) } },
+        DELETED_TOAST_MS,
+      );
+      setTimeout(() => {
+        if (undoToken === token) undoToken = null;
+      }, UNDO_MS);
       await refresh();
     });
+
+  const undoDelete = (token: string) =>
+    act(async () => {
+      if (undoToken === token) undoToken = null;
+      toast = null;
+      await invoke("undo_delete", { token });
+      await refresh();
+      showToast({ message: "Restored" }, 2000);
+    });
+
+  // ---------- toast ----------
+
+  type Toast = {
+    message: string;
+    action?: { label: string; run: () => void };
+    error?: boolean;
+    /** Faded red, for destructive things that happened (e.g. a delete). */
+    danger?: boolean;
+  };
+  let toast = $state<Toast | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** A short notice above the action bar ("Added cat.png", "Deleted… Undo"). */
+  function showToast(next: Toast, ms = 4000) {
+    clearTimeout(toastTimer);
+    toast = next;
+    toastTimer = setTimeout(() => (toast = null), ms);
+  }
+
+  // ---------- adding memes (drop / paste) ----------
+
+  type ImportResult = { added: string[]; duplicates: string[] };
+  let dragDepth = $state(0);
+  let importing = $state(false);
+
+  const isUrl = (text: string) => /^https?:\/\/\S+$/i.test(text.trim());
+
+  async function addMemes(files: File[], urls: string[]) {
+    if (stage !== "ready" || (files.length === 0 && urls.length === 0)) return;
+    importing = true;
+    const added: string[] = [];
+    const duplicates: string[] = [];
+    const failures: string[] = [];
+    const collect = (r: ImportResult) => {
+      added.push(...r.added);
+      duplicates.push(...r.duplicates);
+    };
+    for (const file of files) {
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        collect(await invoke<ImportResult>("import_bytes", bytes, { headers: { "x-filename": encodeURIComponent(file.name) } }));
+      } catch (e) {
+        failures.push(`${file.name || "Image"}: ${e}`);
+      }
+    }
+    for (const url of urls) {
+      try {
+        collect(await invoke<ImportResult>("import_url", { url }));
+      } catch (e) {
+        failures.push(String(e));
+      }
+    }
+    importing = false;
+
+    if (added.length) {
+      // Show the new memes: they're the newest, so an empty search puts them first.
+      query = "";
+      await refresh(true);
+    }
+    const name = (rel: string) => rel.split("/").pop();
+    const parts: string[] = [];
+    if (added.length) parts.push(added.length === 1 ? `Added ${name(added[0])}` : `Added ${added.length} memes`);
+    if (duplicates.length) parts.push(duplicates.length === 1 ? `${name(duplicates[0])} is already in your library` : `${duplicates.length} were already in your library`);
+    if (failures.length) parts.push(failures.length === 1 ? failures[0] : `${failures.length} couldn't be added`);
+    if (parts.length) showToast({ message: parts.join(" · "), error: failures.length > 0 && added.length === 0 }, 5000);
+  }
+
+  function onPaste(e: ClipboardEvent) {
+    if (stage !== "ready" || !e.clipboardData) return;
+    const files = Array.from(e.clipboardData.files);
+    const text = e.clipboardData.getData("text/plain");
+    if (files.length) {
+      e.preventDefault();
+      addMemes(files, []);
+    } else if (isUrl(text)) {
+      e.preventDefault();
+      addMemes([], [text.trim()]);
+    }
+    // Anything else (plain text) pastes into the search box as usual.
+  }
+
+  function dropUrls(dt: DataTransfer) {
+    const list = dt.getData("text/uri-list") || dt.getData("text/plain");
+    return list
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#") && isUrl(l));
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragDepth = 0;
+    invoke("set_dragging", { active: false, refocus: true });
+    if (!e.dataTransfer) return;
+    const files = Array.from(e.dataTransfer.files);
+    // Images dragged from a browser come as a URL (sometimes with a file too).
+    addMemes(files, files.length ? [] : dropUrls(e.dataTransfer));
+  }
 
   function onInput() {
     error = null;
@@ -297,6 +552,24 @@
       run: (i: number) => {
         select(i);
         toggleDetails(true);
+      },
+    },
+    {
+      label: "Rename…",
+      keys: "F2",
+      danger: false,
+      run: (i: number) => {
+        select(i).then(startRename);
+      },
+    },
+    {
+      label: "Edit Text…",
+      keys: "",
+      danger: false,
+      run: (i: number) => {
+        select(i);
+        toggleDetails(true);
+        setTimeout(startEditText, 150); // once its current text has loaded
       },
     },
     {
@@ -346,6 +619,21 @@
   function onKeydown(e: KeyboardEvent) {
     const key = e.key;
     const ctrl = e.ctrlKey || e.metaKey;
+
+    // Typing in an edit field (rename, text): leave the keys to it.
+    const target = e.target;
+    if (target instanceof HTMLTextAreaElement || (target instanceof HTMLInputElement && target !== input)) return;
+    // Ctrl+Z right after a delete brings it back (otherwise it undoes typing as usual).
+    if (ctrl && key.toLowerCase() === "z" && !e.shiftKey && undoToken && stage === "ready") {
+      e.preventDefault();
+      undoDelete(undoToken);
+      return;
+    }
+    if (key === "F2" && stage === "ready" && current) {
+      e.preventDefault();
+      startRename();
+      return;
+    }
 
     if (menu) {
       if (key === "ArrowDown" || key === "ArrowUp") {
@@ -471,6 +759,19 @@
     if (menu && !(e.target instanceof Element && e.target.closest(".menu"))) menu = null;
   }}
   onblur={() => (menu = null)}
+  ondragenter={(e) => {
+    if (stage !== "ready") return;
+    e.preventDefault();
+    if (dragDepth++ === 0) invoke("set_dragging", { active: true }); // keep the pane open
+  }}
+  ondragover={(e) => {
+    if (stage === "ready") e.preventDefault(); // allow dropping
+  }}
+  ondragleave={() => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) invoke("set_dragging", { active: false });
+  }}
+  ondrop={onDrop}
 />
 
 {#snippet folderIcon()}
@@ -486,6 +787,7 @@
         bind:this={input}
         bind:value={query}
         oninput={onInput}
+        onpaste={onPaste}
         placeholder={status?.count ? `Search ${status.count} memes by name or text…` : "Search memes…"}
         spellcheck="false"
         autocomplete="off"
@@ -582,7 +884,14 @@
           <p>Nothing matches “{query}”.</p>
         </div>
       {:else}
-        <div class="masonry" bind:this={grid} onscroll={() => (menu = null)}>
+        <div
+          class="masonry"
+          bind:this={grid}
+          onscroll={() => {
+            menu = null;
+            maybeLoadMore();
+          }}
+        >
           {#each masonry.cols as column, c (c)}
             <div class="col">
               {#each column as i (hits[i].path)}
@@ -603,8 +912,10 @@
                     else primary(i);
                   }}
                   oncontextmenu={(e) => openMenuAt(e, i)}
+                  onmouseenter={() => (hovered = i)}
+                  onmouseleave={() => (hovered = -1)}
                 >
-                  <img src={convertFileSrc(hit.path)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
+                  <img src={tileSrc(hit, i)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
                 </button>
               {/each}
             </div>
@@ -620,10 +931,49 @@
         </div>
         <aside class="info">
           <p class="label">File</p>
-          <p class="filename" title={current.rel}>{current.rel}</p>
+          {#if renaming}
+            <div class="name-edit">
+              <input
+                bind:this={nameInput}
+                bind:value={nameDraft}
+                onkeydown={(e) => onEditKey(e, saveRename, false)}
+                spellcheck="false"
+                aria-label="New name"
+              />
+              {#if extOf(current.name)}<span class="ext">.{extOf(current.name)}</span>{/if}
+            </div>
+            <div class="edit-actions">
+              <button class="btn ghost sm" onclick={stopEditing}>Cancel</button>
+              <button class="btn primary sm" onclick={saveRename} disabled={busy || !nameDraft.trim()}>Rename <kbd>↵</kbd></button>
+            </div>
+          {:else}
+            <div class="file-row">
+              <p class="filename" title={current.rel}>{current.rel}</p>
+              <button class="link-btn" onclick={startRename} title="Rename (F2)">Rename</button>
+            </div>
+          {/if}
 
-          <p class="label">Text in image</p>
-          {#if !details}
+          <div class="file-row">
+            <p class="label">Text in image</p>
+            {#if details && !editingText}
+              <button class="link-btn" onclick={startEditText}>{details.text ? "Edit" : "Add text"}</button>
+            {/if}
+          </div>
+          {#if editingText}
+            <textarea
+              class="ocr-text"
+              bind:this={textInput}
+              bind:value={textDraft}
+              onkeydown={(e) => onEditKey(e, saveText, true)}
+              spellcheck="true"
+              placeholder="Type the text in this meme…"
+              aria-label="Text in image"
+            ></textarea>
+            <div class="edit-actions">
+              <button class="btn ghost sm" onclick={stopEditing}>Cancel</button>
+              <button class="btn primary sm" onclick={saveText} disabled={busy}>Save <kbd>Ctrl</kbd><kbd>↵</kbd></button>
+            </div>
+          {:else if !details}
             <div class="ocr-text skeleton-text"></div>
           {:else if details.state === "read" && details.text}
             <div class="ocr-text">{details.text}</div>
@@ -637,8 +987,10 @@
             <p class="note">Couldn't read this image.</p>
           {/if}
 
-          {#if details?.state === "read"}
-            <p class="meta">Read {formatWhen(details.at)}{details.lang ? ` · ${details.lang}` : ""}</p>
+          {#if details?.state === "read" && !editingText}
+            <p class="meta">
+              {details.edited ? "Edited by you" : "Read"} {formatWhen(details.at)}{details.lang ? ` · ${details.lang}` : ""}
+            </p>
           {/if}
 
           <div class="info-actions">
@@ -715,6 +1067,35 @@
       {/if}
     {/if}
   </footer>
+
+  {#if dragDepth > 0}
+    <div class="dropzone" aria-hidden="true">
+      <div>
+        <strong>Drop to add to memeity</strong>
+        <span>Images, GIFs, or links to them</span>
+      </div>
+    </div>
+  {/if}
+
+  {#if importing || toast}
+    <div
+      class="toast"
+      class:err={toast?.error}
+      class:danger={toast?.danger}
+      class:has-action={!importing && !!toast?.action}
+      role="status"
+    >
+      <span>{importing ? "Adding…" : toast?.message}</span>
+      {#if !importing && toast?.action}
+        <button
+          onclick={() => {
+            toast?.action?.run();
+            toast = null;
+          }}
+        >{toast.action.label}</button>
+      {/if}
+    </div>
+  {/if}
 </main>
 
 {#if menu}
@@ -978,6 +1359,72 @@
     margin: 8px 0 0;
     font-size: 11px;
     color: var(--muted-fg);
+  }
+
+  .file-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .file-row .filename {
+    min-width: 0;
+  }
+
+  .link-btn {
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--muted-fg);
+    font-size: 11px;
+    font-weight: 500;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  .link-btn:hover {
+    color: var(--fg);
+  }
+
+  .name-edit {
+    display: flex;
+    align-items: center;
+    height: 32px;
+    margin-bottom: 8px;
+    padding: 0 8px;
+    border: 1px solid var(--ring);
+    border-radius: 6px;
+    background: var(--muted);
+  }
+
+  .name-edit input {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+  }
+
+  .name-edit .ext {
+    color: var(--muted-fg);
+    font-size: 13px;
+  }
+
+  textarea.ocr-text {
+    width: 100%;
+    resize: none;
+    color: var(--fg);
+    border-color: var(--ring);
+    outline: none;
+  }
+
+  .edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin: 8px 0 14px;
   }
 
   .info-actions {
@@ -1271,6 +1718,102 @@
     border-color: transparent;
     background: color-mix(in srgb, currentColor 15%, transparent);
     color: inherit;
+  }
+
+  /* ---------- drop overlay & toast ---------- */
+
+  main {
+    position: relative;
+  }
+
+  .dropzone {
+    position: absolute;
+    inset: 8px;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    border: 2px dashed var(--ring);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(2px);
+    pointer-events: none;
+    text-align: center;
+  }
+
+  .dropzone strong {
+    display: block;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .dropzone span {
+    color: var(--muted-fg);
+    font-size: 13px;
+  }
+
+  .toast {
+    position: absolute;
+    /* Centred with auto margins (not a translate), so text never lands on half pixels. */
+    left: 20px;
+    right: 20px;
+    bottom: 56px;
+    z-index: 15;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    width: fit-content;
+    max-width: calc(100% - 40px);
+    height: 38px;
+    margin: 0 auto;
+    padding: 0 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--popover);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    font-size: 13px;
+  }
+
+  /* With a button (Undo), tighten the right side so the button sits evenly in the corner. */
+  .toast.has-action {
+    padding-right: 6px;
+  }
+
+  .toast span {
+    line-height: 1.3; /* room for descenders (g, y, p), which overflow:hidden would clip */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .toast.err span {
+    color: var(--destructive);
+  }
+
+  .toast.danger {
+    border-color: color-mix(in srgb, var(--destructive) 35%, var(--border));
+    background: color-mix(in srgb, var(--destructive) 14%, var(--popover));
+  }
+
+  .toast.danger span {
+    color: color-mix(in srgb, var(--destructive) 80%, var(--fg));
+  }
+
+  .toast button {
+    flex-shrink: 0;
+    height: 26px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .toast button:hover {
+    background: var(--accent);
   }
 
   /* ---------- actions menu ---------- */

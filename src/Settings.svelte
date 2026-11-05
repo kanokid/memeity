@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
@@ -32,6 +32,7 @@
     { id: "general", label: "General" },
     { id: "account", label: "Account & Sync" },
     { id: "text", label: "Text Search" },
+    { id: "duplicates", label: "Duplicates" },
     { id: "about", label: "About" },
   ] as const;
   type Section = (typeof sections)[number]["id"];
@@ -168,6 +169,66 @@
     });
 
   const openLink = (target: string) => act(() => invoke("open_link", { target }));
+
+  // ---------- duplicates ----------
+
+  type DupItem = {
+    path: string;
+    name: string;
+    rel: string;
+    width: number | null;
+    height: number | null;
+    version: number;
+    bytes: number;
+  };
+  type DupGroup = { exact: boolean; items: DupItem[] };
+  type Duplicates = { groups: DupGroup[]; pending: number };
+
+  let dupes = $state<Duplicates | null>(null);
+  let dupesLoading = $state(false);
+  let deleted = $state<{ name: string; token: string } | null>(null);
+  let deletedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function loadDupes() {
+    dupesLoading = true;
+    try {
+      dupes = await invoke<Duplicates>("find_duplicates");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      dupesLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (section === "duplicates" && !dupes && !dupesLoading) loadDupes();
+  });
+
+  const deleteDupe = (item: DupItem) =>
+    act(async () => {
+      const token = await invoke<string>("delete_meme", { path: item.path });
+      clearTimeout(deletedTimer);
+      deleted = { name: item.name, token };
+      deletedTimer = setTimeout(() => (deleted = null), 10_000);
+      await loadDupes();
+    });
+
+  const undoDupe = () =>
+    act(async () => {
+      if (!deleted) return;
+      const token = deleted.token;
+      deleted = null;
+      await invoke("undo_delete", { token });
+      await loadDupes();
+    });
+
+  const thumb = (item: DupItem) => `${convertFileSrc(item.path, "thumb")}?v=${item.version}`;
+
+  function size(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
 
   // ---------- formatting ----------
 
@@ -391,6 +452,59 @@
           {/if}
         </div>
       </div>
+    {:else if section === "duplicates"}
+      <div class="title-row">
+        <h1>Duplicates</h1>
+        <button class="btn outline sm" onclick={loadDupes} disabled={dupesLoading}>
+          {dupesLoading ? "Checking…" : "Check again"}
+        </button>
+      </div>
+
+      {#if deleted}
+        <div class="undo-bar" role="status">
+          <span>Deleted {deleted.name}</span>
+          <button class="btn outline sm" onclick={undoDupe} disabled={busy}>Undo</button>
+        </div>
+      {/if}
+
+      {#if dupes && dupes.pending > 0}
+        <p class="note top">
+          Still fingerprinting {dupes.pending} meme{dupes.pending === 1 ? "" : "s"} in the background. Look-alikes among
+          them will show up once that's done.
+        </p>
+      {/if}
+
+      {#if !dupes}
+        <p class="muted">Looking for duplicates…</p>
+      {:else if dupes.groups.length === 0}
+        <div class="card">
+          <h3>No duplicates</h3>
+          <p class="muted small">Every meme in your library is one of a kind.</p>
+        </div>
+      {:else}
+        <p class="note top">
+          {dupes.groups.length} group{dupes.groups.length === 1 ? "" : "s"}. The first in each is the best copy (highest
+          resolution). Deleting removes a meme from Drive and every device; you can undo for a few seconds.
+        </p>
+        {#each dupes.groups as group (group.items.map((i) => i.rel).join("|"))}
+          <div class="card dupe-group">
+            <p class="group-kind">{group.exact ? "Identical copies" : "Look the same"}</p>
+            {#each group.items as item, n (item.rel)}
+              <div class="dupe">
+                <img src={thumb(item)} alt="" width="56" height="56" loading="lazy" />
+                <div class="dupe-info">
+                  <span class="dupe-name" title={item.rel}>{item.rel}</span>
+                  <span class="muted small">
+                    {item.width && item.height ? `${item.width}×${item.height} · ` : ""}{size(item.bytes)}
+                  </span>
+                </div>
+                {#if n === 0}<span class="badge">Best copy</span>{/if}
+                <button class="btn outline sm danger" onclick={() => deleteDupe(item)} disabled={busy}>Delete</button>
+              </div>
+            {/each}
+          </div>
+        {/each}
+      {/if}
     {:else if section === "about"}
       <div class="about">
         <img src={logo} alt="memeity" width="72" height="72" />
@@ -726,6 +840,93 @@
     height: 100%;
     background: var(--primary);
     transition: width 200ms ease;
+  }
+
+  .title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+
+  .title-row h1 {
+    margin: 0;
+  }
+
+  .note.top {
+    margin: 0 0 12px;
+  }
+
+  .small {
+    font-size: 12px;
+  }
+
+  .undo-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    padding: 8px 10px 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--muted);
+    font-size: 13px;
+  }
+
+  .dupe-group {
+    padding: 10px 12px;
+  }
+
+  .group-kind {
+    margin: 0 0 6px;
+    color: var(--muted-fg);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .dupe {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 0;
+  }
+
+  .dupe + .dupe {
+    border-top: 1px solid var(--border);
+  }
+
+  .dupe img {
+    width: 56px;
+    height: 56px;
+    flex-shrink: 0;
+    border-radius: 6px;
+    object-fit: cover;
+    background: var(--muted);
+  }
+
+  .dupe-info {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .dupe-name {
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .badge {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--muted-fg);
+    font-size: 11px;
+    font-weight: 500;
   }
 
   .about {

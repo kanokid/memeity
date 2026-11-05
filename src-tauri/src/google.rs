@@ -393,6 +393,63 @@ impl Google {
         check(req.send().await.map_err(net)?).await?.json().await.map_err(net)
     }
 
+    /// A bookmark for "now" in this account's Drive change feed.
+    pub async fn start_page_token(&self) -> Result<String, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Token {
+            start_page_token: String,
+        }
+        let resp = self
+            .http
+            .get(format!("{DRIVE}/changes/startPageToken"))
+            .bearer_auth(self.token().await?)
+            .send()
+            .await
+            .map_err(net)?;
+        let token: Token = check(resp).await?.json().await.map_err(net)?;
+        Ok(token.start_page_token)
+    }
+
+    /// Has anything memeity can see changed since `token`? Returns `None` if so (the
+    /// caller then does a full sync and takes a fresh bookmark), or `Some(new_token)`
+    /// when nothing changed. One tiny request in the common case.
+    pub async fn changes_since(&self, token: &str) -> Result<Option<String>, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            #[serde(default)]
+            changes: Vec<serde_json::Value>,
+            next_page_token: Option<String>,
+            new_start_page_token: Option<String>,
+        }
+        let mut token = token.to_string();
+        loop {
+            let resp = self
+                .http
+                .get(format!("{DRIVE}/changes"))
+                .query(&[
+                    ("pageToken", token.as_str()),
+                    ("pageSize", "100"),
+                    ("spaces", "drive"),
+                    ("fields", "nextPageToken,newStartPageToken,changes(fileId)"),
+                ])
+                .bearer_auth(self.token().await?)
+                .send()
+                .await
+                .map_err(net)?;
+            let page: Page = check(resp).await?.json().await.map_err(net)?;
+            if !page.changes.is_empty() {
+                return Ok(None);
+            }
+            match (page.next_page_token, page.new_start_page_token) {
+                (Some(next), _) => token = next,
+                (None, Some(fresh)) => return Ok(Some(fresh)),
+                (None, None) => return Ok(None), // unexpected: play safe, do a full sync
+            }
+        }
+    }
+
     /// Replaces an existing file's contents (same id, name and folder).
     pub async fn update_content(&self, id: &str, mime: &str, bytes: Vec<u8>) -> Result<DriveItem, String> {
         let resp = self
@@ -406,6 +463,19 @@ impl Google {
             .await
             .map_err(net)?;
         check(resp).await?.json().await.map_err(net)
+    }
+
+    /// Takes a file back out of Drive's trash (for Undo).
+    pub async fn untrash(&self, id: &str) -> Result<(), String> {
+        let resp = self
+            .http
+            .patch(format!("{DRIVE}/files/{id}"))
+            .bearer_auth(self.token().await?)
+            .json(&serde_json::json!({ "trashed": false }))
+            .send()
+            .await
+            .map_err(net)?;
+        check(resp).await.map(|_| ())
     }
 
     /// Moves a file to Drive's trash (recoverable for 30 days), not a permanent delete.

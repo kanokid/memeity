@@ -23,7 +23,8 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": true,
-        "center": true
+        "center": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {

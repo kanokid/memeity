@@ -30,6 +30,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 /// How often to poll Drive for remote changes.
 const POLL: Duration = Duration::from_secs(30);
+/// Every this many polls, do a full sync instead of a change-feed check.
+const FULL_EVERY: u32 = 20;
 /// Showing the pane triggers a sync if the last one is older than this.
 const STALE: Duration = Duration::from_secs(15);
 /// Don't upload files modified more recently than this (they may still be being written).
@@ -63,6 +65,10 @@ struct SyncState {
     scope: String,
     /// Local relative path (`/`-separated) -> what it was last synced as.
     files: BTreeMap<String, Synced>,
+    /// Bookmark in Drive's change feed, taken at the start of the last full sync. Polls
+    /// ask "anything new since this?" instead of listing the whole folder.
+    #[serde(default)]
+    page_token: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,6 +91,7 @@ impl SyncState {
                 folder_id: folder_id.to_string(),
                 scope: crate::google::SCOPE.to_string(),
                 files: BTreeMap::new(),
+                page_token: None,
             })
     }
 
@@ -97,28 +104,50 @@ impl SyncState {
 
 // ---------- loop & triggers ----------
 
-pub fn spawn_loop(app: AppHandle, mut rx: UnboundedReceiver<()>) {
+/// How thorough a sync pass should be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyncKind {
+    /// Ask Drive's change feed whether anything changed; only sync fully if so.
+    Check,
+    /// List everything and reconcile (startup, local changes, "Sync now").
+    Full,
+}
+
+pub fn spawn_loop(app: AppHandle, mut rx: UnboundedReceiver<SyncKind>) {
     tauri::async_runtime::spawn(async move {
+        let mut polls = 0u32;
         loop {
-            tokio::select! {
-                msg = rx.recv() => if msg.is_none() { return },
-                _ = tokio::time::sleep(POLL) => {}
+            let mut kind = tokio::select! {
+                msg = rx.recv() => match msg { Some(kind) => kind, None => return },
+                _ = tokio::time::sleep(POLL) => {
+                    // Safety net: a full pass every FULL_EVERY polls (~10 min), in case the
+                    // file watcher ever missed a local change.
+                    polls += 1;
+                    if polls.is_multiple_of(FULL_EVERY) { SyncKind::Full } else { SyncKind::Check }
+                }
+            };
+            // Coalesce bursts of triggers; any request for a full sync wins.
+            while let Ok(more) = rx.try_recv() {
+                if more == SyncKind::Full {
+                    kind = SyncKind::Full;
+                }
             }
-            while rx.try_recv().is_ok() {} // coalesce bursts of triggers
-            run_once(&app).await;
+            run_once(&app, kind).await;
         }
     });
 }
 
+/// Full sync (local files changed, "Sync now", new sidecars to upload...).
 pub fn trigger(app: &AppHandle) {
-    let _ = app.state::<AppState>().sync_tx.send(());
+    let _ = app.state::<AppState>().sync_tx.send(SyncKind::Full);
 }
 
+/// Opening the pane: a cheap check for remote changes, if the last sync is a while ago.
 pub fn trigger_if_stale(app: &AppHandle) {
     let last = app.state::<AppState>().sync_status.lock().unwrap().last_synced;
     let stale = last.is_none_or(|ms| now_ms().saturating_sub(ms) > STALE.as_millis() as u64);
     if stale {
-        trigger(app);
+        let _ = app.state::<AppState>().sync_tx.send(SyncKind::Check);
     }
 }
 
@@ -131,7 +160,7 @@ fn set_status(app: &AppHandle, f: impl FnOnce(&mut SyncStatus)) {
     let _ = app.emit("sync-status", ());
 }
 
-async fn run_once(app: &AppHandle) {
+async fn run_once(app: &AppHandle, kind: SyncKind) {
     let state = app.state::<AppState>();
     let Some((folder, root)) = sync_target(app) else {
         set_status(app, |s| *s = SyncStatus { state: "off", ..Default::default() });
@@ -144,6 +173,30 @@ async fn run_once(app: &AppHandle) {
     let Ok(data_dir) = app.path().app_data_dir() else { return };
 
     let _guard = state.sync_lock.lock().await;
+
+    // A check is one tiny request when nothing changed on Drive. Local changes always
+    // come in as Full syncs (from the file watcher), so they never wait on this.
+    if kind == SyncKind::Check {
+        let saved = SyncState::load(&data_dir, &folder.id);
+        if let Some(token) = saved.page_token.clone()
+            && let Ok(Some(fresh)) = state.google.changes_since(&token).await
+        {
+            let mut saved = saved;
+            saved.page_token = Some(fresh);
+            let _ = saved.save(&data_dir);
+            set_status(app, |s| {
+                if s.state != "error" {
+                    s.state = "idle";
+                    s.message = None;
+                }
+                s.last_synced = Some(now_ms());
+                s.last = Counts::default();
+            });
+            return;
+        }
+        // Something changed (or there's no bookmark yet / the check failed): full sync.
+    }
+
     set_status(app, |s| {
         s.state = "syncing";
         s.message = None;
@@ -169,6 +222,13 @@ async fn run_once(app: &AppHandle) {
             }
         }
     });
+    if !report.downloaded.is_empty() {
+        let now = std::time::Instant::now();
+        let mut arrived = state.arrived.lock().unwrap();
+        for rel in &report.downloaded {
+            arrived.insert(rel.clone(), now);
+        }
+    }
     if changed {
         refresh_library(app);
     }
@@ -187,15 +247,20 @@ struct Report {
     counts: Counts,
     errors: Vec<String>,
     retry_soon: bool,
+    /// Memes (not sidecars) downloaded this pass.
+    downloaded: Vec<String>,
 }
 
 async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Report {
-    let mut report = Report { counts: Counts::default(), errors: Vec::new(), retry_soon: false };
+    let mut report = Report { counts: Counts::default(), errors: Vec::new(), retry_soon: false, downloaded: Vec::new() };
 
     if let Err(e) = std::fs::create_dir_all(root.join(TMP_DIR)) {
         report.errors.push(format!("Couldn't create {}: {e}", root.display()));
         return report;
     }
+    // Bookmark the change feed *before* reading Drive, so changes made while this sync
+    // runs show up in the next check rather than being missed.
+    let fresh_token = g.start_page_token().await.ok();
     let mut remote = match remote_tree(g, folder_id).await {
         Ok(r) => r,
         Err(e) => {
@@ -253,6 +318,9 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
                 Ok(()) => {
                     st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
                     report.counts.downloaded += 1;
+                    if !sidecar::is_sidecar_rel(rel) {
+                        report.downloaded.push(rel.clone());
+                    }
                 }
                 Err(e) => report.errors.push(format!("Download {rel}: {e}")),
             }
@@ -314,6 +382,7 @@ async fn cycle(g: &Google, folder_id: &str, root: &Path, data_dir: &Path) -> Rep
         }
     }
 
+    st.page_token = fresh_token;
     if let Err(e) = st.save(data_dir) {
         report.errors.push(e);
     }
@@ -401,8 +470,22 @@ async fn push_local_renames(g: &Google, root: &Path, remote: &mut RemoteTree, st
     }
 }
 
-/// Removes a meme everywhere: trashes it on Drive, then sends the local copy to the Recycle Bin.
-pub async fn delete(app: &AppHandle, path: &Path) -> Result<(), String> {
+/// How long a delete can be undone. Afterwards the local copy goes to the Recycle Bin
+/// (the Drive copy stays in Drive's trash for 30 days either way).
+const UNDO_WINDOW: Duration = Duration::from_secs(10);
+/// Deleted files wait here (hidden, never indexed or synced) until the undo window ends.
+const HOLD_DIR: &str = ".memeity-tmp/deleted";
+
+/// A delete that can still be undone.
+pub struct HeldDelete {
+    path: PathBuf,
+    held: PathBuf,
+    drive_id: Option<String>,
+}
+
+/// Removes a meme everywhere: trashes it on Drive and sets the local copy aside for
+/// UNDO_WINDOW (then it goes to the Recycle Bin). Returns a token for `undo_delete`.
+pub async fn delete(app: &AppHandle, path: &Path) -> Result<String, String> {
     let state = app.state::<AppState>();
     let (folder, root) = sync_target(app).ok_or("No Drive folder selected.")?;
     let rel = path
@@ -414,14 +497,86 @@ pub async fn delete(app: &AppHandle, path: &Path) -> Result<(), String> {
 
     let _guard = state.sync_lock.lock().await;
     let mut st = SyncState::load(&data_dir, &folder.id);
-    if let Some(synced) = st.files.get(&rel) {
-        state.google.trash(&synced.id).await?;
+    let drive_id = st.files.get(&rel).map(|s| s.id.clone());
+    if let Some(id) = &drive_id {
+        state.google.trash(id).await?;
     }
+
+    let token = format!("{:x}", Md5::digest(format!("{rel}{}", now_ms())));
+    let hold = root.join(HOLD_DIR).join(&token);
+    std::fs::create_dir_all(&hold).map_err(|e| e.to_string())?;
+    let held = hold.join(path.file_name().unwrap_or_default());
     if path.exists() {
-        trash::delete(path).map_err(|e| format!("Trashed on Drive, but couldn't remove the local copy: {e}"))?;
+        std::fs::rename(path, &held).map_err(|e| format!("Trashed on Drive, but couldn't remove the local copy: {e}"))?;
     }
     st.files.remove(&rel);
-    st.save(&data_dir)
+    st.save(&data_dir)?;
+
+    state
+        .pending_deletes
+        .lock()
+        .unwrap()
+        .insert(token.clone(), HeldDelete { path: path.to_path_buf(), held, drive_id });
+    let app = app.clone();
+    let expire = token.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(UNDO_WINDOW).await;
+        let entry = app.state::<AppState>().pending_deletes.lock().unwrap().remove(&expire);
+        if let Some(entry) = entry {
+            finalize(&entry.held);
+        }
+    });
+    Ok(token)
+}
+
+/// Sends a held file to the Recycle Bin and removes its holding folder.
+fn finalize(held: &Path) {
+    if held.exists()
+        && let Err(e) = trash::delete(held)
+    {
+        eprintln!("[memeity] couldn't move {} to the Recycle Bin: {e}", held.display());
+        return;
+    }
+    if let Some(dir) = held.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Puts a just-deleted meme back, on Drive and on this device.
+pub async fn undo_delete(app: &AppHandle, token: &str) -> Result<PathBuf, String> {
+    let state = app.state::<AppState>();
+    let entry = state.pending_deletes.lock().unwrap().remove(token).ok_or("It's too late to undo that.")?;
+    let _guard = state.sync_lock.lock().await;
+    // Drive first: if the local file came back first, sync could see it as a brand-new
+    // file and upload a second copy.
+    if let Some(id) = &entry.drive_id {
+        state.google.untrash(id).await?;
+    }
+    let dest = if entry.path.exists() {
+        let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        conflict_path(&entry.path.with_file_name(name))
+    } else {
+        entry.path.clone()
+    };
+    std::fs::rename(&entry.held, &dest).map_err(|e| format!("Couldn't restore the file: {e}"))?;
+    if let Some(dir) = entry.held.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(dest)
+}
+
+/// Startup: anything still held from last time (quit or crash within an undo window)
+/// goes to the Recycle Bin now.
+pub fn sweep_held_deletes(root: &Path) {
+    let Ok(dirs) = std::fs::read_dir(root.join(HOLD_DIR)) else { return };
+    for dir in dirs.flatten() {
+        if let Ok(files) = std::fs::read_dir(dir.path()) {
+            for file in files.flatten() {
+                finalize(&file.path());
+            }
+        }
+        let _ = std::fs::remove_dir(dir.path());
+    }
 }
 
 // ---------- remote tree ----------
@@ -644,7 +799,7 @@ mod tests {
             files: HashMap::from([("reactions/new.png".to_string(), item("A", "m"))]),
             folders: HashMap::new(),
         };
-        let mut report = Report { counts: Counts::default(), errors: vec![], retry_soon: false };
+        let mut report = Report { counts: Counts::default(), errors: vec![], retry_soon: false, downloaded: vec![] };
 
         follow_remote_renames(&root, &remote, &mut st, &mut report);
 
