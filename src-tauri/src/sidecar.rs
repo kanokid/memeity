@@ -9,7 +9,8 @@
 //! {
 //!   "version": 1,
 //!   "tags": ["reaction", "cat"],          // reserved for milestone 2, omitted while empty
-//!   "ocr": { "text": "…", "engine": "windows.media.ocr", "lang": "en-US", "at": "2026-…Z" }
+//!   "ocr": { "text": "…", "engine": "windows.media.ocr", "lang": "en-US", "at": "2026-…Z" },
+//!   "pinned": true                         // omitted unless pinned
 //! }
 //! ```
 //! Unknown fields are preserved on rewrite, so an older memeity never drops data a
@@ -33,6 +34,9 @@ pub struct Sidecar {
     /// Text found in the image, so other devices never re-run OCR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ocr: Option<Ocr>,
+    /// Pinned to the top of the pane (on every device).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     /// Anything a newer version wrote that we don't know about. Kept as-is.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -59,7 +63,7 @@ fn current_version() -> u32 {
 
 impl Default for Sidecar {
     fn default() -> Self {
-        Sidecar { version: VERSION, tags: Vec::new(), ocr: None, extra: serde_json::Map::new() }
+        Sidecar { version: VERSION, tags: Vec::new(), ocr: None, pinned: false, extra: serde_json::Map::new() }
     }
 }
 

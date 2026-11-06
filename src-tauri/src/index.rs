@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS usage (
     score     REAL NOT NULL,
     last_used INTEGER NOT NULL
 );
+-- Pinned memes (by content hash), mirrored from their sidecars.
+CREATE TABLE IF NOT EXISTS pins (
+    md5 TEXT PRIMARY KEY
+);
+-- Other devices' usage, read from their synced usage files (see usage.rs). Replaced
+-- wholesale per device whenever its file changes.
+CREATE TABLE IF NOT EXISTS remote_usage (
+    device    TEXT NOT NULL,
+    md5       TEXT NOT NULL,
+    score     REAL NOT NULL,
+    last_used INTEGER NOT NULL,
+    PRIMARY KEY (device, md5)
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS meme_fts USING fts5(
     text,
     tags,
@@ -165,23 +178,89 @@ impl Index {
         Ok(())
     }
 
-    /// Current (decayed) usage score per meme, for memes that have been used.
+    /// Current (decayed) usage score per meme, for memes that have been used: this
+    /// device's uses plus every other device's.
     pub fn usage_scores(&self, now_ms: i64) -> rusqlite::Result<HashMap<String, f64>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT m.rel, u.score, u.last_used FROM usage u JOIN memes m ON m.md5 = u.md5")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.rel, u.score, u.last_used
+             FROM (SELECT md5, score, last_used FROM usage
+                   UNION ALL SELECT md5, score, last_used FROM remote_usage) u
+             JOIN memes m ON m.md5 = u.md5",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, i64>(2)?))
         })?;
-        let mut out = HashMap::new();
+        let mut out: HashMap<String, f64> = HashMap::new();
         for row in rows {
             let (rel, score, last) = row?;
-            let current = decayed(score, last, now_ms);
-            if current >= MIN_USAGE {
-                out.insert(rel, current);
+            *out.entry(rel).or_default() += decayed(score, last, now_ms);
+        }
+        out.retain(|_, score| *score >= MIN_USAGE);
+        Ok(out)
+    }
+
+    pub fn set_pinned(&self, md5: &str, pinned: bool) -> rusqlite::Result<()> {
+        if pinned {
+            self.conn.execute("INSERT OR IGNORE INTO pins (md5) VALUES (?1)", [md5])?;
+        } else {
+            self.conn.execute("DELETE FROM pins WHERE md5 = ?1", [md5])?;
+        }
+        Ok(())
+    }
+
+    /// Library-relative paths of pinned memes.
+    pub fn pinned_rels(&self) -> rusqlite::Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT m.rel FROM pins p JOIN memes m ON m.md5 = p.md5")?;
+        stmt.query_map([], |r| r.get(0))?.collect()
+    }
+
+    /// This device's own uses that still count (for its synced usage file), by content hash.
+    pub fn own_usage(&self, now_ms: i64) -> rusqlite::Result<std::collections::BTreeMap<String, crate::usage::Use>> {
+        let mut stmt = self.conn.prepare_cached("SELECT md5, score, last_used FROM usage")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, crate::usage::Use { score: r.get(1)?, last_used: r.get(2)? }))
+        })?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (md5, u) = row?;
+            if decayed(u.score, u.last_used, now_ms) >= MIN_USAGE {
+                out.insert(md5, u);
             }
         }
         Ok(out)
+    }
+
+    /// Replaces what we know of another device's usage.
+    pub fn set_remote_usage(
+        &self,
+        device: &str,
+        uses: &std::collections::BTreeMap<String, crate::usage::Use>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM remote_usage WHERE device = ?1", [device])?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO remote_usage (device, md5, score, last_used) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (md5, u) in uses {
+                if u.score.is_finite() && u.score > 0.0 {
+                    insert.execute(params![device, md5, u.score, u.last_used])?;
+                }
+            }
+        }
+        tx.commit()
+    }
+
+    /// Forgets devices whose usage file is gone.
+    pub fn retain_remote_devices(&self, devices: &HashSet<String>) -> rusqlite::Result<()> {
+        let known: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT DISTINCT device FROM remote_usage")?;
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for device in known.iter().filter(|d| !devices.contains(*d)) {
+            self.conn.execute("DELETE FROM remote_usage WHERE device = ?1", [device])?;
+        }
+        Ok(())
     }
 
     /// Memes that don't have a perceptual hash yet (newest first isn't needed: all get one).
@@ -341,6 +420,38 @@ mod tests {
         init(&conn).unwrap();
         assert!(conn.prepare("SELECT engine FROM memes").is_ok());
         init(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn other_devices_usage_adds_up() {
+        use crate::usage::Use;
+        use std::collections::BTreeMap;
+        let idx = Index::in_memory();
+        idx.upsert_file("a.png", 1, 1, "aaa").unwrap();
+        idx.upsert_file("b.png", 1, 1, "bbb").unwrap();
+        idx.record_use("a.png", 0).unwrap();
+        let laptop = BTreeMap::from([
+            ("aaa".to_string(), Use { score: 2.0, last_used: 0 }),
+            ("bbb".to_string(), Use { score: 1.0, last_used: 0 }),
+            ("gone".to_string(), Use { score: 9.0, last_used: 0 }), // not in this library
+        ]);
+        idx.set_remote_usage("laptop", &laptop).unwrap();
+        let scores = idx.usage_scores(0).unwrap();
+        assert!((scores["a.png"] - 3.0).abs() < 1e-9, "1 here + 2 on the laptop");
+        assert!((scores["b.png"] - 1.0).abs() < 1e-9, "used only on the laptop");
+        assert_eq!(scores.len(), 2);
+
+        // Only this device's own uses get published.
+        let own = idx.own_usage(0).unwrap();
+        assert_eq!(own.keys().collect::<Vec<_>>(), vec!["aaa"]);
+
+        // A newer file from the laptop replaces its old numbers; a vanished device is forgotten.
+        idx.set_remote_usage("laptop", &BTreeMap::from([("bbb".to_string(), Use { score: 4.0, last_used: 0 })])).unwrap();
+        let scores = idx.usage_scores(0).unwrap();
+        assert!((scores["a.png"] - 1.0).abs() < 1e-9);
+        assert!((scores["b.png"] - 4.0).abs() < 1e-9);
+        idx.retain_remote_devices(&HashSet::new()).unwrap();
+        assert!(!idx.usage_scores(0).unwrap().contains_key("b.png"));
     }
 
     #[test]

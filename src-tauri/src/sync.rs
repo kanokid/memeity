@@ -369,6 +369,7 @@ async fn run_once(app: &AppHandle, kind: SyncKind) {
         }
     }
     if changed {
+        crate::usage::load_remote(app); // other devices' uses may have come down
         refresh_library(app);
     }
     if report.retry_soon {
@@ -401,6 +402,21 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
     // Bookmark the change feed *before* reading Drive, so changes made while this sync
     // runs show up in the next check rather than being missed.
     let fresh_token = g.start_page_token().await.ok();
+    // If the folder itself was deleted or trashed on Drive, its listing comes back empty,
+    // and step 1 would remove every meme on this device. Stop instead.
+    match g.find(folder_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            report.errors.push(
+                "Your memeity folder on Google Drive was deleted or moved to the trash. Nothing was removed \
+                 from this device. Restore it from Drive's trash, or pick another folder in Settings."
+                    .into(),
+            );
+            return report;
+        }
+        // Couldn't check (a blip, or offline): the listing below fails too if it's real.
+        Err(e) => log::info!("sync: couldn't check the Drive folder: {e}"),
+    }
     let mut remote = match remote_tree(g, folder_id).await {
         Ok(r) => r,
         Err(e) => {
@@ -641,24 +657,37 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
     report
 }
 
-/// A sidecar changed on Drive *and* here. Drive's copy wins, except for text the user
-/// typed on this device, which is kept (unless it was also retyped elsewhere). Returns
-/// true if the merged sidecar was written locally (and still needs uploading), false
-/// if Drive's copy should simply be downloaded.
+/// A sidecar changed on Drive *and* here. Drive's copy wins, except for what the user
+/// did on this device: text they typed is kept (unless it was also retyped elsewhere),
+/// and a pin is kept. Returns true if the merged sidecar was written locally (and still
+/// needs uploading), false if Drive's copy should simply be downloaded.
 async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result<bool, String> {
     let local: Option<sidecar::Sidecar> =
         tokio::fs::read(path).await.ok().and_then(|b| serde_json::from_slice(&b).ok());
-    let Some(local_ocr) = local.and_then(|sc| sc.ocr).filter(|o| o.edited) else {
-        return Ok(false);
-    };
+    let Some(local) = local else { return Ok(false) };
+    let typed = local.ocr.filter(|o| o.edited);
+    if typed.is_none() && !local.pinned {
+        return Ok(false); // nothing of ours to keep
+    }
     let bytes = g.download(&item.id).await?;
     let Ok(mut merged) = serde_json::from_slice::<sidecar::Sidecar>(&bytes) else {
         return Ok(false); // Drive's copy is unreadable; downloading it as-is changes nothing
     };
-    if merged.ocr.as_ref().is_some_and(|o| o.edited) {
-        return Ok(false); // retyped on another device too: the newest edit (Drive's) wins
+    let mut kept = false;
+    // Retyped on another device too: the newest edit (Drive's) wins.
+    if let Some(typed) = typed
+        && !merged.ocr.as_ref().is_some_and(|o| o.edited)
+    {
+        merged.ocr = Some(typed);
+        kept = true;
     }
-    merged.ocr = Some(local_ocr);
+    if local.pinned && !merged.pinned {
+        merged.pinned = true;
+        kept = true;
+    }
+    if !kept {
+        return Ok(false);
+    }
     let json = serde_json::to_vec_pretty(&merged).map_err(|e| e.to_string())?;
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -1309,6 +1338,12 @@ mod tests {
         unlisted: Mutex<HashSet<String>>,
         /// Upload attempts, successful or not.
         uploads: Mutex<u32>,
+        /// No connection at all: every call fails.
+        offline: Mutex<bool>,
+        /// The synced folder ("root") was deleted / trashed.
+        root_gone: Mutex<bool>,
+        /// Uploads are refused (storage quota exceeded).
+        quota_full: Mutex<bool>,
     }
 
     impl FakeDrive {
@@ -1354,6 +1389,9 @@ mod tests {
 
     impl Drive for FakeDrive {
         async fn list_children(&self, parent: &str) -> Result<Vec<DriveItem>, String> {
+            if *self.offline.lock().unwrap() {
+                return Err("offline".into());
+            }
             let files = self.files.lock().unwrap();
             let unlisted = self.unlisted.lock().unwrap();
             Ok(files
@@ -1363,13 +1401,19 @@ mod tests {
                 .collect())
         }
         async fn download(&self, id: &str) -> Result<Vec<u8>, String> {
-            if self.fail_downloads {
+            if self.fail_downloads || *self.offline.lock().unwrap() {
                 return Err("offline".into());
             }
             Ok(self.get(id).bytes)
         }
         async fn upload(&self, parent: &str, name: &str, mime: &str, bytes: Vec<u8>, id: &str) -> Result<DriveItem, String> {
             *self.uploads.lock().unwrap() += 1;
+            if *self.offline.lock().unwrap() {
+                return Err("offline".into());
+            }
+            if *self.quota_full.lock().unwrap() {
+                return Err("403: The user's Drive storage quota has been exceeded.".into());
+            }
             if let Some(hook) = self.on_upload.lock().unwrap().take() {
                 hook();
             }
@@ -1389,8 +1433,12 @@ mod tests {
             Ok((0..count).map(|_| self.new_id()).collect())
         }
         async fn find(&self, id: &str) -> Result<Option<DriveItem>, String> {
-            if *self.find_offline.lock().unwrap() {
+            if *self.find_offline.lock().unwrap() || *self.offline.lock().unwrap() {
                 return Err("offline".into());
+            }
+            if id == "root" {
+                let folder = FakeFile { parent: String::new(), name: "memeity".into(), mime: FOLDER_MIME.into(), bytes: vec![] };
+                return Ok((!*self.root_gone.lock().unwrap()).then(|| Self::item(id, &folder)));
             }
             Ok(self.files.lock().unwrap().get(id).map(|f| Self::item(id, f)))
         }
@@ -1705,4 +1753,140 @@ mod tests {
         cleanup(&root);
     }
 
+    // ---------- edge cases: offline, quota, a vanished folder, conflicts ----------
+
+    #[tokio::test]
+    async fn offline_pass_changes_nothing_and_the_next_one_catches_up() {
+        let (root, data) = dirs("offline");
+        let g = FakeDrive::default();
+        g.add("root", "remote.png", b"from drive");
+        write_settled(&root.join("local.png"), b"from here");
+
+        *g.offline.lock().unwrap() = true;
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(!r.errors.is_empty(), "being offline is reported");
+        assert_eq!(r.counts.removed, 0);
+        assert!(root.join("local.png").is_file(), "local meme untouched");
+        assert!(!root.join("remote.png").exists());
+        assert_eq!(g.names(), ["remote.png"], "nothing reached Drive");
+
+        *g.offline.lock().unwrap() = false;
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(std::fs::read(root.join("remote.png")).unwrap(), b"from drive");
+        assert_eq!(g.names(), ["local.png", "remote.png"]);
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn trashed_drive_folder_never_empties_this_device() {
+        let (root, data) = dirs("trashed");
+        let g = FakeDrive::default();
+        g.add("root", "a.png", b"a");
+        g.add("root", "b.png", b"b");
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+
+        // The folder goes to Drive's trash: its listing would now come back empty.
+        *g.root_gone.lock().unwrap() = true;
+        g.files.lock().unwrap().clear();
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].contains("trash"), "{:?}", r.errors);
+        assert_eq!(r.counts.removed, 0);
+        assert!(root.join("a.png").is_file() && root.join("b.png").is_file(), "every meme is still here");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn meme_deleted_on_another_device_goes_here_too() {
+        let (root, data) = dirs("remote-delete");
+        let g = FakeDrive::default();
+        let id = g.add("root", "old.png", b"old");
+        g.add("root", "keep.png", b"keep");
+        cycle(&g, "root", &root, &data).await;
+
+        g.files.lock().unwrap().remove(&id);
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.counts.removed, 1);
+        assert!(!root.join("old.png").exists() && root.join("keep.png").is_file());
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn full_drive_keeps_the_meme_and_uploads_it_later() {
+        let (root, data) = dirs("quota");
+        let g = FakeDrive::default();
+        write_settled(&root.join("new.png"), b"new");
+
+        *g.quota_full.lock().unwrap() = true;
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.iter().any(|e| e.contains("quota")), "{:?}", r.errors);
+        assert!(root.join("new.png").is_file());
+        assert!(g.names().is_empty());
+
+        // Space freed up: the next pass uploads it, once.
+        *g.quota_full.lock().unwrap() = false;
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(g.names(), ["new.png"]);
+        let r = cycle(&g, "root", &root, &data).await;
+        assert_eq!(r.counts.uploaded, 0, "not uploaded twice");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn usage_files_from_each_device_sync_without_conflicts() {
+        let (root, data) = dirs("usage");
+        let g = FakeDrive::default();
+        let meta = g.create_folder("root", META_DIR).await.unwrap();
+        g.add(&meta, "usage-bbbbbbbbbbbb.json", br#"{"version":1,"device":"bbbbbbbbbbbb","uses":{}}"#);
+        std::fs::create_dir_all(root.join(META_DIR)).unwrap();
+        let ours = root.join(META_DIR).join("usage-aaaaaaaaaaaa.json");
+        write_settled(&ours, br#"{"version":1,"device":"aaaaaaaaaaaa","uses":{}}"#);
+
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(root.join(META_DIR).join("usage-bbbbbbbbbbbb.json").is_file(), "the other device's came down");
+        assert!(g.names().contains(&"usage-aaaaaaaaaaaa.json".to_string()), "ours went up");
+
+        // Both devices update their own files: each side just takes the other's.
+        let theirs = g.files.lock().unwrap().iter().find(|(_, f)| f.name == "usage-bbbbbbbbbbbb.json").map(|(id, _)| id.clone()).unwrap();
+        g.set_bytes(&theirs, br#"{"version":1,"device":"bbbbbbbbbbbb","uses":{"x":{"score":1.0,"last_used":1}}}"#);
+        write_settled(&ours, br#"{"version":1,"device":"aaaaaaaaaaaa","uses":{"y":{"score":2.0,"last_used":2}}}"#);
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let names = g.names();
+        assert!(!names.iter().any(|n| n.contains("this device")), "no conflict copies: {names:?}");
+        assert!(std::fs::read_to_string(root.join(META_DIR).join("usage-bbbbbbbbbbbb.json")).unwrap().contains("\"x\""));
+        let ours_on_drive = g.files.lock().unwrap().values().find(|f| f.name == "usage-aaaaaaaaaaaa.json").unwrap().bytes.clone();
+        assert!(String::from_utf8(ours_on_drive).unwrap().contains("\"y\""));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn pin_survives_a_sidecar_changed_on_both_devices() {
+        let (root, data) = dirs("pin-merge");
+        let g = FakeDrive::default();
+        let meta = g.create_folder("root", META_DIR).await.unwrap();
+        let id = g.add(&meta, "abc.json", &sidecar_json("ocr v1", false));
+        cycle(&g, "root", &root, &data).await;
+
+        // Pinned here, while another device re-read the text.
+        let path = root.join(META_DIR).join("abc.json");
+        let mut sc: sidecar::Sidecar = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        sc.pinned = true;
+        write_settled(&path, &serde_json::to_vec_pretty(&sc).unwrap());
+        g.set_bytes(&id, &sidecar_json("ocr v2", false));
+
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let local: sidecar::Sidecar = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(local.pinned, "the pin is kept");
+        assert_eq!(local.ocr.unwrap().text, "ocr v2", "and the other device's text is taken");
+        cleanup(&root);
+    }
 }

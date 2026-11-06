@@ -149,6 +149,20 @@ fn webp_to_gif(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// Removes converted copies nobody has made in a day.
+/// Saves an image that isn't in the library (the editor's result, copied or pasted
+/// without saving) as a file other apps can be handed. Cleared out after a day.
+pub fn temp_file(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let root = SHARE_DIR.get().ok_or("No cache folder.")?;
+    prune_shared(root);
+    let nanos = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = root.join(format!("edited-{nanos}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = crate::sync::sanitize(name);
+    let path = dir.join(if name.trim().is_empty() { "meme.png".to_string() } else { name });
+    std::fs::write(&path, bytes).map_err(|e| format!("Couldn't prepare the image: {e}"))?;
+    Ok(path)
+}
+
 fn prune_shared(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else { return };
     for entry in entries.flatten() {

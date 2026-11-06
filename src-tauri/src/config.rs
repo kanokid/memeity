@@ -26,6 +26,12 @@ pub struct Config {
     /// Shift+Enter / Shift+click does the other one.
     #[serde(default)]
     pub primary_action: Option<String>,
+    /// The search pane's size, as a percentage of the default 750×475. None = 100.
+    #[serde(default)]
+    pub pane_scale: Option<u32>,
+    /// Random id for this device; names its usage file in the synced folder (usage.rs).
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 impl Config {

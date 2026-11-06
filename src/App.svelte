@@ -15,6 +15,8 @@
     animated: boolean;
     /** Changes when the file does, so its cached thumbnail refreshes. */
     version: number;
+    /** Pinned to the top of the pane (synced to every device). */
+    pinned: boolean;
   };
   type SearchResult = { hits: Hit[]; total: number; micros: number };
   type DriveFolder = { id: string; name: string };
@@ -52,7 +54,7 @@
   /** Start loading the next page this many pixels before the bottom. */
   const LOAD_AHEAD_PX = 700;
   /** Tile aspect (height / width) is clamped so panoramas and tall screenshots stay usable. */
-  const MIN_RATIO = 0.5;
+  const MIN_RATIO = 0.35;
   const MAX_RATIO = 1.6;
   /** Gap between tiles, as a fraction of column width (14px gap / ~220px column). */
   const GAP_UNITS = 0.064;
@@ -67,6 +69,8 @@
   let hits = $state<Hit[]>([]);
   let selected = $state(0);
   let hovered = $state(-1);
+  /** The OS asks for less motion: GIFs only play when selected, not on hover. */
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const stage = $derived(status?.stage);
   const current = $derived(hits[selected]);
 
@@ -80,6 +84,38 @@
     return `${convertFileSrc(hit.path, "thumb")}?v=${hit.version}`;
   }
   let confirmDelete = $state<Hit | null>(null);
+
+  // ---------- quick editor ----------
+
+  /** The meme open in the editor (the pane grows to fit it), if any. */
+  let editing = $state<Hit | null>(null);
+  /** Loaded the first time it's used, so the search pane never waits for it. */
+  let Editor = $state<typeof import("./editor/Editor.svelte").default | null>(null);
+
+  async function openEditor(i = selected) {
+    const hit = hits[i];
+    if (!hit || editing) return;
+    menu = null;
+    confirmDelete = null;
+    try {
+      Editor ??= (await import("./editor/Editor.svelte")).default;
+      await invoke("set_editing", { active: true });
+      editing = hit;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function closeEditor(saved?: { rel: string; duplicate: boolean }) {
+    editing = null;
+    await invoke("set_editing", { active: false });
+    input?.focus();
+    if (saved) {
+      await showMeme(saved.rel);
+      const name = saved.rel.split("/").pop();
+      showToast({ message: saved.duplicate ? `${name} is already in your library` : `Saved as ${name}` }, 4000);
+    }
+  }
   let searchSeq = 0;
 
   /**
@@ -472,7 +508,7 @@
   let view = $state<View>(readView());
   let list: HTMLDivElement | undefined = $state();
   /** Row height and top/bottom padding of the list, in px (must match `.row` / `.list-rows`). */
-  const ROW_H = 48;
+  const ROW_H = 60;
   const LIST_PAD = 8;
   /** PageUp / PageDown moves this many rows in the list. */
   const LIST_PAGE = 8;
@@ -732,6 +768,17 @@
     });
 
   /** Show in folder (Ctrl+Shift+F): Explorer/Finder with the meme selected. */
+  /** Pins the meme to the top of an empty search (on every device), or unpins it. */
+  const togglePin = (i = selected) =>
+    act(async () => {
+      const hit = hits[i];
+      if (!hit) return;
+      await invoke("set_pinned", { path: hit.path, pinned: !hit.pinned });
+      wantSelected(hit.path); // keep it selected wherever it moves to
+      await runSearch(false);
+      showToast({ message: `${hit.pinned ? "Unpinned" : "Pinned"} ${stemOf(hit.name)}` }, 2500);
+    });
+
   const reveal = (i = selected) =>
     act(async () => {
       const hit = hits[i];
@@ -883,7 +930,7 @@
 
   function onDrop(e: DragEvent) {
     e.preventDefault(); // never let the webview open the dropped file itself
-    if (ownDrag() || stage !== "ready") {
+    if (ownDrag() || stage !== "ready" || editing) {
       dragDepth = 0;
       return; // a meme dragged out of the pane and dropped back on it: nothing to do
     }
@@ -933,6 +980,13 @@
   const actions = $derived([
     { ...(pasteFirst ? pasteAction : copyAction), keys: "↵" },
     { ...(pasteFirst ? copyAction : pasteAction), keys: "Shift ↵" },
+    {
+      label: hits[menu?.index ?? selected]?.pinned ? "Unpin" : "Pin to Top",
+      keys: `${MOD} P`,
+      danger: false,
+      run: (i: number) => togglePin(i),
+    },
+    { label: "Edit…", keys: `${MOD} E`, danger: false, run: (i: number) => openEditor(i) },
     { label: "Show in Folder", keys: `${MOD} Shift F`, danger: false, run: (i: number) => reveal(i) },
     {
       label: "Show Text",
@@ -1001,6 +1055,7 @@
   // ---------- keyboard ----------
 
   function onKeydown(e: KeyboardEvent) {
+    if (editing) return; // the editor has its own keys (and Esc never closes it)
     const key = e.key;
     const ctrl = e.ctrlKey || e.metaKey;
     if (isModKey(key) && !e.repeat && stage === "ready") {
@@ -1091,6 +1146,8 @@
       if (ctrl && key.toLowerCase() === "l") { e.preventDefault(); toggleView(); return; }
       if (ctrl && key.toLowerCase() === "k") { e.preventDefault(); openActions(); return; }
       if (ctrl && key.toLowerCase() === "i") { e.preventDefault(); toggleDetails(); return; }
+      if (ctrl && key.toLowerCase() === "e") { e.preventDefault(); openEditor(); return; }
+      if (ctrl && !e.shiftKey && key.toLowerCase() === "p") { e.preventDefault(); togglePin(); return; }
       if (ctrl && e.shiftKey && key.toLowerCase() === "f") { e.preventDefault(); reveal(); return; }
       switch (key) {
         case "ArrowRight": e.preventDefault(); move("right"); break;
@@ -1123,6 +1180,7 @@
       listen("pane-shown", () => {
         hideNumbers();
         draggingOut = false;
+        if (editing) return; // reopened mid-edit: leave the editor as it was
         checkDuplicates();
         error = null;
         confirmDelete = null;
@@ -1190,7 +1248,7 @@
     // Always claim drags: a drop the page doesn't handle makes the webview open the file
     // as a page (replacing memeity with just the image).
     e.preventDefault();
-    if (stage !== "ready" || ownDrag()) return; // our own drag passing over the pane
+    if (stage !== "ready" || ownDrag() || editing) return; // our own drag passing over the pane; the editor takes its own drops
     if (dragDepth++ === 0) invoke("set_dragging", { active: true }); // keep the pane open
   }}
   ondragover={(e) => {
@@ -1205,6 +1263,13 @@
   ondrop={onDrop}
 />
 
+{#snippet pinIcon()}
+  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M12 17v5" />
+    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+  </svg>
+{/snippet}
+
 {#snippet folderIcon()}
   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
     <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
@@ -1212,6 +1277,10 @@
 {/snippet}
 
 <main class:pane={stage === "ready"}>
+  <!-- Screen readers hear how many memes match as you type. -->
+  {#if stage === "ready"}
+    <p class="sr-only" aria-live="polite">{query.trim() ? `${total} ${total === 1 ? "meme" : "memes"}` : ""}</p>
+  {/if}
   {#if stage === "ready"}
     <header>
       <input
@@ -1219,6 +1288,12 @@
         bind:value={query}
         oninput={onInput}
         onpaste={onPaste}
+        aria-label="Search memes"
+        role="combobox"
+        aria-expanded="true"
+        aria-autocomplete="list"
+        aria-controls="results"
+        aria-activedescendant={current ? `meme-${selected}` : undefined}
         placeholder={status?.count ? `Search ${status.count} memes by name or text…` : "Search memes…"}
         spellcheck="false"
         autocomplete="off"
@@ -1292,6 +1367,11 @@
     <!-- Full error text (not truncated) and selectable, so it can be copied into a bug report. -->
     <div class="banner error-banner" role="alert">
       <span class="error-text">{error}</span>
+      <button
+        class="btn ghost sm"
+        title="Open a GitHub issue about this (copies diagnostics to paste in)"
+        onclick={() => invoke("report_problem", { context: error }).catch((e) => (error = String(e)))}
+      >Report…</button>
       <button class="dismiss" aria-label="Dismiss error" onclick={() => (error = null)}>
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
       </button>
@@ -1354,6 +1434,7 @@
         <div class="list-view">
           <div
             class="list"
+            id="results"
             bind:this={list}
             role="listbox"
             aria-label="Memes"
@@ -1371,7 +1452,9 @@
                   class:selected={i === selected}
                   class:doomed={confirmDelete?.path === hit.path}
                   role="option"
+                  id={`meme-${i}`}
                   aria-selected={i === selected}
+                  aria-label={`${stemOf(hit.name)}${hit.pinned ? ", pinned" : ""}`}
                   tabindex="-1"
                   style:top="{LIST_PAD + i * ROW_H}px"
                   title={hit.rel}
@@ -1385,7 +1468,10 @@
                   {#if showNumbers && i < 9}<kbd class="num">{i + 1}</kbd>{/if}
                   <img src={tileSrc(hit, false)} alt="" loading="lazy" decoding="async" draggable="false" />
                   <span class="row-text">
-                    <span class="row-name">{stemOf(hit.name)}</span>
+                    <span class="row-name">
+                      {#if hit.pinned}<span class="pin-inline" title="Pinned">{@render pinIcon()}</span>{/if}
+                      {stemOf(hit.name)}
+                    </span>
                     <span class="row-meta">{[fileType(hit), sizeLabel(hit), folderOf(hit)].filter(Boolean).join(" · ")}</span>
                   </span>
                 </button>
@@ -1437,6 +1523,9 @@
       {:else}
         <div
           class="masonry"
+          id="results"
+          role="listbox"
+          aria-label="Memes"
           bind:this={grid}
           onscroll={() => {
             menu = null;
@@ -1448,12 +1537,16 @@
             <div class="col" style:padding-top="{w.padTop}px" style:padding-bottom="{w.padBottom}px">
               {#each w.items as i (hits[i].path)}
                 {@const hit = hits[i]}
-                {@const active = i === selected || i === hovered}
+                {@const active = i === selected || (i === hovered && !reduceMotion)}
                 <button
                   class="tile"
                   class:selected={i === selected}
                   class:doomed={confirmDelete?.path === hit.path}
                   data-i={i}
+                  role="option"
+                  id={`meme-${i}`}
+                  aria-selected={i === selected}
+                  aria-label={`${stemOf(hit.name)}${hit.pinned ? ", pinned" : ""}`}
                   tabindex="-1"
                   style:aspect-ratio="1 / {ratioOf(hit)}"
                   title={hit.name}
@@ -1471,6 +1564,7 @@
                 >
                   <img src={tileSrc(hit, active)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
                   {#if showNumbers && i < 9}<kbd class="num">{i + 1}</kbd>{/if}
+                  {#if hit.pinned}<span class="pin-badge" title="Pinned">{@render pinIcon()}</span>{/if}
                 </button>
               {/each}
             </div>
@@ -1632,6 +1726,10 @@
     </div>
   {/if}
 
+  {#if editing && Editor}
+    <Editor hit={editing} {pasteFirst} onclose={closeEditor} />
+  {/if}
+
   {#if importing || toast}
     <div
       class="toast"
@@ -1680,6 +1778,7 @@
 
 <style>
   main {
+    position: relative;
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -2013,6 +2112,38 @@
   /* ---------- masonry ---------- */
 
   /* Ctrl/Cmd held: which number key acts on which result. */
+  .pin-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    background: rgb(0 0 0 / 0.6);
+    color: #fff;
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+  }
+
+  .pin-badge .icon {
+    width: 13px;
+    height: 13px;
+  }
+
+  .pin-inline {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 4px;
+    color: var(--muted-fg);
+  }
+
+  .pin-inline .icon {
+    width: 14px;
+    height: 14px;
+  }
+
   .num {
     position: absolute;
     top: 6px;
@@ -2060,10 +2191,10 @@
     position: absolute;
     left: 8px;
     right: 8px;
-    height: 44px; /* ROW_H minus the 4px between rows */
+    height: 56px; /* ROW_H minus the 4px between rows */
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
     padding: 0 8px;
     border: none;
     border-radius: 8px;
@@ -2082,15 +2213,26 @@
     box-shadow: inset 0 0 0 1px var(--ring);
   }
 
+  @media (forced-colors: active) {
+    .row.selected {
+      outline: 2px solid Highlight;
+      outline-offset: -2px;
+    }
+
+    .tile.selected {
+      outline-color: Highlight;
+    }
+  }
+
   .row.doomed {
     box-shadow: inset 0 0 0 1px var(--destructive);
   }
 
   .row img {
-    width: 32px;
-    height: 32px;
+    width: 42px;
+    height: 42px;
     flex-shrink: 0;
-    border-radius: 5px;
+    border-radius: 6px;
     object-fit: cover;
     background: var(--muted);
   }
@@ -2098,6 +2240,7 @@
   .row-text {
     display: flex;
     flex-direction: column;
+    gap: 1px;
     min-width: 0;
   }
 
@@ -2109,11 +2252,13 @@
   }
 
   .row-name {
-    font-size: 13px;
+    font-size: 15.5px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
   }
 
   .row-meta {
-    font-size: 11px;
+    font-size: 12.5px;
     color: var(--muted-fg);
   }
 

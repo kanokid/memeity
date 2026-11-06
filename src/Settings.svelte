@@ -27,6 +27,7 @@
     /** A newer published version, if one is waiting. */
     update: string | null;
     primary_action: "paste" | "copy";
+    pane_scale: number;
     version: string;
   };
 
@@ -66,6 +67,8 @@
       diagnosticsCopied = true;
       setTimeout(() => (diagnosticsCopied = false), 2000);
     });
+
+  const reportProblem = () => act(() => invoke("report_problem"));
 
   async function act(fn: () => Promise<unknown>) {
     if (busy) return;
@@ -198,6 +201,12 @@
   const setPrimaryAction = (action: "paste" | "copy") =>
     act(async () => {
       status = await invoke<Status>("set_primary_action", { action });
+    });
+
+  const PANE_SCALES = [75, 90, 100, 125, 150];
+  const setPaneScale = (percent: number) =>
+    act(async () => {
+      status = await invoke<Status>("set_pane_scale", { percent });
     });
 
   const toggleAutostart = () =>
@@ -378,7 +387,11 @@
   <nav class="side" aria-label="Settings sections">
     <div class="brand"><img src={logo} alt="" width="22" height="22" />Settings</div>
     {#each sections as s (s.id)}
-      <button class:active={section === s.id} onclick={() => (section = s.id)}>{s.label}</button>
+      <button
+        class:active={section === s.id}
+        aria-current={section === s.id ? "page" : undefined}
+        onclick={() => (section = s.id)}
+      >{s.label}</button>
     {/each}
   </nav>
 
@@ -454,6 +467,26 @@
               onclick={() => setPrimaryAction("copy")}
               disabled={busy}
             >Copy to Clipboard</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <h3>Pane size</h3>
+            <p>How big the search pane is, compared to the default.</p>
+          </div>
+          <div class="segmented" role="radiogroup" aria-label="Pane size">
+            {#each PANE_SCALES as p (p)}
+              <button
+                role="radio"
+                aria-checked={status.pane_scale === p}
+                class:on={status.pane_scale === p}
+                onclick={() => setPaneScale(p)}
+                disabled={busy}
+              >{p}%</button>
+            {/each}
           </div>
         </div>
       </div>
@@ -673,13 +706,17 @@
           <button class="btn outline sm" onclick={() => openLink("privacy")}>Privacy policy</button>
           <button class="btn outline sm" onclick={() => openLink("source")}>Source code</button>
         </div>
+        <div class="buttons center">
+          <button class="btn outline sm" onclick={reportProblem} disabled={busy}>Report a Problem…</button>
+        </div>
         <div class="diagnostics">
           <button class="btn ghost sm" onclick={copyDiagnostics} disabled={busy}>
             {diagnosticsCopied ? "Copied" : "Copy diagnostics"}
           </button>
           <p class="muted small">
-            Version, sync status and recent log lines, for a bug report. Paste it somewhere to check it first: it
-            includes file names from your meme folder.
+            Report a Problem opens a new GitHub issue (public) and copies these diagnostics for you to paste in:
+            version, sync status and recent log lines. Check them first: they include file names from your meme
+            folder, but not your Google account.
           </p>
         </div>
       </div>

@@ -310,6 +310,31 @@ pub fn set_primary_action(app: AppHandle, action: String) -> Result<Status, Stri
     Ok(status(&app))
 }
 
+/// Sizes offered in Settings > General, as a percentage of the default pane size.
+pub const PANE_SCALES: [u32; 5] = [75, 90, 100, 125, 150];
+
+/// The search pane's size, as a percentage of the default.
+pub fn pane_scale(app: &AppHandle) -> u32 {
+    config(app).pane_scale.filter(|s| PANE_SCALES.contains(s)).unwrap_or(100)
+}
+
+#[tauri::command]
+pub fn set_pane_scale(app: AppHandle, percent: u32) -> Result<Status, String> {
+    if !PANE_SCALES.contains(&percent) {
+        return Err("Unknown size.".into());
+    }
+    update_config(&app, |c| c.pane_scale = Some(percent));
+    // Resize it now (re-centered), so the change shows next time it opens, or right away
+    // if it's open behind Settings.
+    if crate::is_ready(&app)
+        && let Some(win) = crate::pane(&app)
+    {
+        crate::lock_size(&app, &win);
+        crate::position_pane(&app, &win);
+    }
+    Ok(status(&app))
+}
+
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<Status, String> {
     let launcher = app.autolaunch();

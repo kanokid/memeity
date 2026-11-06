@@ -166,7 +166,11 @@ fn run(
         if indexed && sidecar_mtime == seen_sidecar && current_engine {
             continue; // up to date
         }
-        match sidecar::read(&root, &md5) {
+        let sc = sidecar::read(&root, &md5);
+        if let Some(sc) = &sc {
+            with_index(app, |idx| idx.set_pinned(&md5, sc.pinned))?; // pinned/unpinned on any device
+        }
+        match sc {
             Some(sc) if sc.ocr.is_some() => {
                 let ocr_text = sc.ocr.as_ref().expect("checked above");
                 // Index what we have right away so search works meanwhile...

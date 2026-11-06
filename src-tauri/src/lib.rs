@@ -17,6 +17,7 @@ mod sync;
 mod textindex;
 mod thumbs;
 mod updates;
+mod usage;
 mod watcher;
 #[cfg(windows)]
 mod winhook;
@@ -45,6 +46,9 @@ const CLIENT_FILE: &str = "google-client.json";
 /// Fixed content size of the window (Raycast's default), matching tauri.conf.json.
 const PANE_WIDTH: f64 = 750.0;
 const PANE_HEIGHT: f64 = 475.0;
+/// The pane grows to this while the quick editor is open (shrunk to fit small screens).
+const EDITOR_WIDTH: f64 = 1100.0;
+const EDITOR_HEIGHT: f64 = 720.0;
 
 pub struct AppState {
     pub library: RwLock<Library>,
@@ -78,6 +82,9 @@ pub struct AppState {
     dialog_open: AtomicBool,
     /// A drag (files/images/links) is over the pane: don't hide it.
     dragging: AtomicBool,
+    /// The quick editor is open: the pane is bigger and doesn't hide on blur (an edit
+    /// would be lost); it closes with the editor's Save or Cancel.
+    editing: AtomicBool,
     /// Whether the pane has actually received focus since it was last shown. Windows
     /// may refuse to focus a window (e.g. right after launch); we only hide on blur
     /// once it really had focus, so it can't vanish before you ever see it.
@@ -148,6 +155,8 @@ struct Status {
     update: Option<String>,
     /// "paste" or "copy": what Enter / click does in the pane.
     primary_action: &'static str,
+    /// The pane's size, as a percentage of the default (Settings > General).
+    pane_scale: u32,
     version: String,
 }
 
@@ -177,7 +186,7 @@ fn apply_window_mode(app: &AppHandle) {
     let _ = win.set_title(if ready { "memeity" } else { "memeity setup" });
     // macOS: menu-bar only once set up; a regular Dock app during setup.
     settings::update_activation_policy(app);
-    lock_size(&win);
+    lock_size(app, &win);
     set_rounded(&win, ready);
     if ready {
         position_pane(app, &win);
@@ -272,6 +281,7 @@ fn status(app: &AppHandle) -> Status {
         autostart: settings::autostart_enabled(app),
         update: state.update.lock().unwrap().clone(),
         primary_action: settings::primary_action(app),
+        pane_scale: settings::pane_scale(app),
         version: app.package_info().version.to_string(),
     }
 }
@@ -293,16 +303,68 @@ fn position_pane(app: &AppHandle, win: &WebviewWindow) {
     let _ = win.set_position(PhysicalPosition::new(x, y));
 }
 
-/// Pin the window to its fixed size. Re-applied on every show because window
-/// managers (e.g. tiling ones like komorebi) or a maximize can resize it behind our back.
-fn lock_size(win: &WebviewWindow) {
-    let size = LogicalSize::new(PANE_WIDTH, PANE_HEIGHT);
+/// The pane's size: the default scaled by the user's size setting, or bigger while the
+/// editor is open. Never bigger than the screen it's on, minus a margin.
+fn pane_size(app: &AppHandle, win: &WebviewWindow) -> LogicalSize<f64> {
+    let scale = settings::pane_scale(app) as f64 / 100.0;
+    let (pane_w, pane_h) = (PANE_WIDTH * scale, PANE_HEIGHT * scale);
+    let (mut w, mut h) = if app.state::<AppState>().editing.load(Ordering::SeqCst) {
+        (EDITOR_WIDTH.max(pane_w), EDITOR_HEIGHT.max(pane_h))
+    } else {
+        (pane_w, pane_h)
+    };
+    if let Ok(Some(monitor)) = win.current_monitor() {
+        let area = monitor.work_area().size.to_logical::<f64>(monitor.scale_factor());
+        // Keep the shape when shrinking to fit the screen.
+        let fit = ((area.width - 48.0) / w).min((area.height - 48.0) / h).min(1.0);
+        w *= fit;
+        h *= fit;
+    }
+    // The smallest size the pane's layout is made for.
+    LogicalSize::new(w.max(PANE_WIDTH * 0.75).round(), h.max(PANE_HEIGHT * 0.75).round())
+}
+
+/// Pin the window to its size. Re-applied on every show because window managers
+/// (e.g. tiling ones like komorebi) or a maximize can resize it behind our back.
+fn lock_size(app: &AppHandle, win: &WebviewWindow) {
+    let size = pane_size(app, win);
     if win.is_maximized().unwrap_or(false) {
         let _ = win.unmaximize();
     }
+    // Lift the old limits first: growing for the editor would otherwise be clamped.
+    let _ = win.set_min_size(None::<LogicalSize<f64>>);
+    let _ = win.set_max_size(None::<LogicalSize<f64>>);
+    let _ = win.set_size(size);
     let _ = win.set_min_size(Some(size));
     let _ = win.set_max_size(Some(size));
-    let _ = win.set_size(size);
+}
+
+/// The quick editor opened or closed: resize the pane (and re-center it on its screen),
+/// and keep it open on blur while editing.
+#[tauri::command]
+fn set_editing(app: AppHandle, active: bool) {
+    app.state::<AppState>().editing.store(active, Ordering::SeqCst);
+    let Some(win) = pane(&app) else { return };
+    lock_size(&app, &win);
+    if let (Ok(Some(monitor)), Ok(size)) = (win.current_monitor(), win.outer_size()) {
+        let area = monitor.work_area();
+        let x = area.position.x + (area.size.width as i32 - size.width as i32) / 2;
+        let y = area.position.y + (area.size.height as i32 - size.height as i32) / if active { 2 } else { 3 };
+        let _ = win.set_position(PhysicalPosition::new(x, y));
+    }
+}
+
+/// The full-size original of a meme, as raw bytes (for the editor, which draws it on a
+/// canvas: loading it straight from `thumb://` would be cross-origin and taint the
+/// canvas so it can't be exported).
+#[tauri::command(async)]
+fn read_meme(app: AppHandle, path: String) -> Result<tauri::ipc::Response, String> {
+    let path = PathBuf::from(path);
+    if !app.state::<AppState>().library.read().unwrap().contains(&path) {
+        return Err("That meme isn't in your library anymore.".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Couldn't open the meme: {e}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 fn show_pane(app: &AppHandle) {
@@ -314,8 +376,11 @@ fn show_pane(app: &AppHandle) {
     let _ = app.show();
     apply_window_mode(app);
     if is_ready(app) {
-        lock_size(&win);
-        position_pane(app, &win);
+        lock_size(app, &win);
+        // Mid-edit, it reopens wherever the user dragged it.
+        if !app.state::<AppState>().editing.load(Ordering::SeqCst) {
+            position_pane(app, &win);
+        }
     }
     app.state::<AppState>().had_focus.store(false, Ordering::SeqCst);
     set_window_animation(&win, true); // opening keeps the usual Windows animation
@@ -450,6 +515,8 @@ fn load_library(app: &AppHandle) {
     *state.library.write().unwrap() = lib;
     // Replacing the watcher drops (and stops) the old one.
     *state.watcher.lock().unwrap() = watcher::watch(app.clone(), dir);
+    usage::load_remote(app);
+    usage::schedule_flush(app); // publish uses from before syncing usage existed
     let _ = app.emit("library-changed", ());
     textindex::trigger(app);
 }
@@ -557,9 +624,16 @@ fn search(app: AppHandle, query: String, offset: Option<usize>, limit: usize) ->
         .as_ref()
         .and_then(|idx| idx.usage_scores(now_ms()).ok())
         .unwrap_or_default();
+    let pinned = state
+        .index
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|idx| idx.pinned_rels().ok())
+        .unwrap_or_default();
     let lib = state.library.read().unwrap();
     let mut matcher = state.matcher.lock().unwrap();
-    lib.search(&query, offset.unwrap_or(0), limit, &mut matcher, &text_bonus, &usage)
+    lib.search(&query, offset.unwrap_or(0), limit, &mut matcher, &text_bonus, &usage, &pinned)
 }
 
 fn now_ms() -> i64 {
@@ -579,6 +653,7 @@ fn record_use(app: &AppHandle, path: &std::path::Path) {
     {
         log::warn!("couldn't record use: {e}");
     }
+    usage::schedule_flush(app); // so other devices rank it up too
 }
 
 #[tauri::command]
@@ -810,6 +885,31 @@ fn set_meme_text(app: AppHandle, path: String, text: String) -> Result<(), Strin
     Ok(())
 }
 
+/// Pins a meme to the top of the pane, or unpins it. Saved in its sidecar, so it
+/// syncs to every device.
+#[tauri::command(async)]
+fn set_pinned(app: AppHandle, path: String, pinned: bool) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let (root, rel) = library_rel(&app, &path)?;
+    let state = app.state::<AppState>();
+    let md5 = state
+        .index
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|idx| idx.lookup(&rel).ok().flatten())
+        .map(|e| e.md5)
+        .ok_or("memeity is still indexing this meme. Try again in a moment.")?;
+    let mut sc = sidecar::read(&root, &md5).unwrap_or_default();
+    sc.pinned = pinned;
+    sidecar::write(&root, &md5, &sc).map_err(|e| format!("Couldn't save: {e}"))?;
+    if let Some(idx) = state.index.lock().unwrap().as_ref() {
+        idx.set_pinned(&md5, pinned).map_err(|e| e.to_string())?;
+    }
+    sync::trigger(&app); // upload the sidecar
+    Ok(())
+}
+
 /// Instant insert (Shift+Enter): paste the meme into the app the user was in, then
 /// restore their clipboard.
 #[tauri::command]
@@ -826,6 +926,33 @@ async fn insert_meme(app: AppHandle, path: String) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())??;
     record_use(&app, &used);
+    Ok(())
+}
+
+/// The editor's result, copied or pasted straight into the app you were in without
+/// saving it to the library. Raw image bytes in the body; `x-action` is "copy" or
+/// "paste", `x-filename` (percent-encoded) names the file apps may receive.
+#[tauri::command]
+async fn share_edited(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Expected raw image bytes.".into());
+    };
+    let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(thumbs::percent_decode_str);
+    let name = header("x-filename").unwrap_or_else(|| "meme.png".into());
+    let paste = header("x-action").as_deref() == Some("paste");
+    let path = clipboard::temp_file(&name, bytes)?;
+    if paste {
+        let target = app.state::<AppState>().prev_window.load(Ordering::SeqCst);
+        let handle = app.clone();
+        tauri::async_runtime::spawn_blocking(move || insert::insert(&handle, &path, target))
+            .await
+            .map_err(|e| e.to_string())??;
+    } else {
+        tauri::async_runtime::spawn_blocking(move || clipboard::copy(&path))
+            .await
+            .map_err(|e| e.to_string())??;
+        hide_pane_after_copy(&app);
+    }
     Ok(())
 }
 
@@ -993,9 +1120,42 @@ fn is_app_url(url: &tauri::Url) -> bool {
 /// status, and the end of the log. (Not the account email.)
 #[tauri::command(async)]
 fn copy_diagnostics(app: AppHandle) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(diagnostics(&app)))
+        .map_err(|e| format!("Couldn't copy to the clipboard: {e}"))
+}
+
+/// "Report a Problem…": copies the diagnostics, then opens a new GitHub issue with a
+/// short template (version and OS filled in) to paste them into. memeity itself sends
+/// nothing anywhere; the user sees the report and decides whether to post it.
+#[tauri::command(async)]
+fn report_problem(app: AppHandle, context: Option<String>) -> Result<(), String> {
+    copy_diagnostics(app.clone())?;
+    let mut body = String::new();
+    if let Some(context) = context.filter(|c| !c.trim().is_empty()) {
+        body.push_str(&format!("**Error shown**\n```\n{}\n```\n\n", context.trim()));
+    }
+    body.push_str(&format!(
+        "**What happened?**\n\n\n**What did you expect to happen?**\n\n\n**Steps to reproduce**\n1. \n\n---\n\
+         memeity {} on {} {}\n\n\
+         <!-- memeity copied diagnostics (version, sync status, recent log lines) to your clipboard. \
+         Paste them between the ``` lines below if you're happy to share them: they include file names \
+         from your meme folder, but not your Google account. GitHub issues are public. -->\n\
+         <details><summary>Diagnostics</summary>\n\n```\n\n```\n</details>\n",
+        app.package_info().version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ));
+    let mut url = reqwest::Url::parse("https://github.com/purestellenium/memeity/issues/new").expect("valid url");
+    url.query_pairs_mut().append_pair("body", &body);
+    app.opener().open_url(url.as_str(), None::<&str>).map_err(|e| e.to_string())
+}
+
+/// Version, OS, sync and text-search status, and the end of the log.
+fn diagnostics(app: &AppHandle) -> String {
     /// How much of the log to include.
     const LOG_LINES: usize = 300;
-    let s = status(&app);
+    let s = status(app);
     let mut out = format!(
         "memeity {} on {} {}\nstage: {}\nmemes: {} ({} with text read)\nsync: {} {}\n\
          last sync: {} down, {} up, {} removed\ntext: {} {}/{} {}\nshortcut: {}{}\n",
@@ -1026,9 +1186,7 @@ fn copy_diagnostics(app: AppHandle) -> Result<(), String> {
     let lines: Vec<&str> = log.lines().collect();
     out.push_str(&format!("\n--- last {} log lines ---\n", lines.len().min(LOG_LINES)));
     out.push_str(&lines[lines.len().saturating_sub(LOG_LINES)..].join("\n"));
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(out))
-        .map_err(|e| format!("Couldn't copy to the clipboard: {e}"))
+    out
 }
 
 #[tauri::command]
@@ -1207,6 +1365,8 @@ pub fn run() {
             duplicate_count,
             remove_exact_duplicates,
             set_meme_text,
+            set_pinned,
+            share_edited,
             insert_meme,
             reveal_meme,
             drag_meme,
@@ -1218,6 +1378,7 @@ pub fn run() {
             setup_drive_folder,
             sync_now,
             copy_diagnostics,
+            report_problem,
             open_folder,
             open_setup_link,
             hide,
@@ -1229,11 +1390,14 @@ pub fn run() {
             settings::stop_shortcut_capture,
             settings::set_autostart,
             settings::set_primary_action,
+            settings::set_pane_scale,
             settings::reread_all_text,
             settings::open_link,
             import::import_bytes,
             import::import_url,
             set_dragging,
+            set_editing,
+            read_meme,
             updates::check_for_update,
             updates::install_update
         ])
@@ -1277,6 +1441,7 @@ pub fn run() {
                 shortcut_error: Mutex::new(None),
                 dialog_open: AtomicBool::new(false),
                 dragging: AtomicBool::new(false),
+                editing: AtomicBool::new(false),
                 had_focus: AtomicBool::new(false),
                 window_mode: Mutex::new(None),
                 shortcut: Mutex::new(settings::DEFAULT_SHORTCUT.parse().expect("default shortcut is valid")),
@@ -1316,6 +1481,7 @@ pub fn run() {
                     if is_ready(&h)
                         && state.had_focus.load(Ordering::SeqCst)
                         && !state.dialog_open.load(Ordering::SeqCst)
+                        && !state.editing.load(Ordering::SeqCst)
                     {
                         hide_on_blur(&h);
                     }

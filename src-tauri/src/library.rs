@@ -7,7 +7,7 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
@@ -51,6 +51,9 @@ pub fn fuzzy_text_bonus(typos: usize) -> u32 {
 /// never enough to beat a clearly better match (good matches score in the hundreds).
 const USAGE_BOOST_MAX: u32 = 60;
 
+/// Search boost for a pinned meme: like heavy use.
+const PIN_BOOST: u32 = 60;
+
 fn usage_boost(score: f64) -> u32 {
     ((score * 15.0) as u32).min(USAGE_BOOST_MAX)
 }
@@ -93,6 +96,8 @@ pub struct Hit {
     pub animated: bool,
     /// Changes whenever the file does (its modified time), so cached thumbnails refresh.
     pub version: u64,
+    /// Pinned to the top (set by `search`; false elsewhere).
+    pub pinned: bool,
 }
 
 #[derive(Serialize)]
@@ -118,6 +123,7 @@ impl From<&Meme> for Hit {
             height: m.dims.map(|d| d.1),
             animated: m.animated,
             version: m.modified.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+            pinned: false,
         }
     }
 }
@@ -198,7 +204,9 @@ impl Library {
     /// more pages as you scroll).
     ///
     /// `usage` holds recently/frequently used memes (decayed scores): with no query they
-    /// come first; with one they get a modest boost.
+    /// come first; with one they get a modest boost. `pinned` memes come before them
+    /// all with no query, and get a boost with one.
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
         query: &str,
@@ -207,26 +215,36 @@ impl Library {
         matcher: &mut Matcher,
         text_bonus: &HashMap<String, u32>,
         usage: &HashMap<String, f64>,
+        pinned: &HashSet<String>,
     ) -> SearchResult {
+        let hit = |i: usize| {
+            let m = &self.memes[i];
+            Hit { pinned: pinned.contains(&m.rel), ..Hit::from(m) }
+        };
         let start = Instant::now();
         let query = query.trim();
 
         if query.is_empty() {
-            // Used memes first (most used first), then everything else newest-first.
-            let mut used: Vec<(usize, f64)> = self
+            // Pinned memes first, then used ones (most used first), then everything else
+            // newest-first. Within each group, more used comes first.
+            let mut first: Vec<(usize, bool, f64)> = self
                 .memes
                 .iter()
                 .enumerate()
-                .filter_map(|(i, m)| usage.get(&m.rel).map(|&u| (i, u)))
+                .filter_map(|(i, m)| {
+                    let pin = pinned.contains(&m.rel);
+                    let used = usage.get(&m.rel).copied();
+                    (pin || used.is_some()).then(|| (i, pin, used.unwrap_or(0.0)))
+                })
                 .collect();
-            used.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let used_set: std::collections::HashSet<usize> = used.iter().map(|&(i, _)| i).collect();
-            let order = used
+            first.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)));
+            let first_set: HashSet<usize> = first.iter().map(|&(i, ..)| i).collect();
+            let order = first
                 .iter()
-                .map(|&(i, _)| i)
-                .chain((0..self.memes.len()).filter(|i| !used_set.contains(i)));
+                .map(|&(i, ..)| i)
+                .chain((0..self.memes.len()).filter(|i| !first_set.contains(i)));
             return SearchResult {
-                hits: order.skip(offset).take(limit).map(|i| Hit::from(&self.memes[i])).collect(),
+                hits: order.skip(offset).take(limit).map(hit).collect(),
                 total: self.memes.len(),
                 micros: start.elapsed().as_micros(),
             };
@@ -244,7 +262,8 @@ impl Library {
                 if fuzzy.is_none() && text.is_none() {
                     return None;
                 }
-                let boost = usage.get(&m.rel).map_or(0, |&u| usage_boost(u));
+                let boost = usage.get(&m.rel).map_or(0, |&u| usage_boost(u))
+                    + if pinned.contains(&m.rel) { PIN_BOOST } else { 0 };
                 Some((fuzzy.unwrap_or(0) + text.unwrap_or(0) + boost, i))
             })
             .collect();
@@ -257,7 +276,7 @@ impl Library {
                 .into_iter()
                 .skip(offset)
                 .take(limit)
-                .map(|(_, i)| Hit::from(&self.memes[i]))
+                .map(|(_, i)| hit(i))
                 .collect(),
             micros: start.elapsed().as_micros(),
         }
@@ -290,17 +309,17 @@ mod tests {
         assert_eq!(lib.memes.len(), 2, "skips non-images and dot-folders");
 
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
-        let res = lib.search("spika", 0, 10, &mut m, &HashMap::new(), &HashMap::new());
+        let res = lib.search("spika", 0, 10, &mut m, &HashMap::new(), &HashMap::new(), &HashSet::new());
         assert_eq!(res.hits.len(), 1);
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
-        assert_eq!(lib.search("", 0, 10, &mut m, &HashMap::new(), &HashMap::new()).hits.len(), 2);
-        assert_eq!(lib.search("zzzz", 0, 10, &mut m, &HashMap::new(), &HashMap::new()).hits.len(), 0);
+        assert_eq!(lib.search("", 0, 10, &mut m, &HashMap::new(), &HashMap::new(), &HashSet::new()).hits.len(), 2);
+        assert_eq!(lib.search("zzzz", 0, 10, &mut m, &HashMap::new(), &HashMap::new(), &HashSet::new()).hits.len(), 0);
 
         // A text-only match (filename doesn't match) still shows up...
-        let res = lib.search("zzzz", 0, 10, &mut m, &text_bonuses(&["this is fine.png".to_string()], &[]), &HashMap::new());
+        let res = lib.search("zzzz", 0, 10, &mut m, &text_bonuses(&["this is fine.png".to_string()], &[]), &HashMap::new(), &HashSet::new());
         assert_eq!(res.hits.len(), 1);
         // ...and a text hit lifts a meme above a filename-only match.
-        let res = lib.search("i", 0, 10, &mut m, &text_bonuses(&["reactions/surprised pikachu.jpg".to_string()], &[]), &HashMap::new());
+        let res = lib.search("i", 0, 10, &mut m, &text_bonuses(&["reactions/surprised pikachu.jpg".to_string()], &[]), &HashMap::new(), &HashSet::new());
         assert_eq!(res.hits[0].rel, "reactions/surprised pikachu.jpg");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -326,13 +345,13 @@ mod tests {
         let lib = Library::scan(&root);
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
         let none = HashMap::new();
-        let first = lib.search("cat", 0, 2, &mut m, &none, &HashMap::new());
-        let rest = lib.search("cat", 2, 10, &mut m, &none, &HashMap::new());
+        let first = lib.search("cat", 0, 2, &mut m, &none, &HashMap::new(), &HashSet::new());
+        let rest = lib.search("cat", 2, 10, &mut m, &none, &HashMap::new(), &HashSet::new());
         assert_eq!((first.hits.len(), rest.hits.len(), first.total), (2, 3, 5));
         let all: Vec<_> = first.hits.iter().chain(&rest.hits).map(|h| h.rel.clone()).collect();
         let unique: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(unique.len(), 5, "pages don't overlap");
-        assert_eq!(lib.search("", 4, 10, &mut m, &none, &HashMap::new()).hits.len(), 1, "empty query pages too");
+        assert_eq!(lib.search("", 4, 10, &mut m, &none, &HashMap::new(), &HashSet::new()).hits.len(), 1, "empty query pages too");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -348,13 +367,22 @@ mod tests {
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
         let usage = HashMap::from([("dog.png".to_string(), 3.0), ("cat two.png".to_string(), 1.0)]);
 
-        let empty = lib.search("", 0, 10, &mut m, &HashMap::new(), &usage);
+        let empty = lib.search("", 0, 10, &mut m, &HashMap::new(), &usage, &HashSet::new());
         let order: Vec<_> = empty.hits.iter().map(|h| h.rel.as_str()).collect();
         assert_eq!(&order[..2], ["dog.png", "cat two.png"], "most used first");
         assert_eq!(order.len(), 3, "then the rest");
 
-        let cats = lib.search("cat", 0, 10, &mut m, &HashMap::new(), &usage);
+        let cats = lib.search("cat", 0, 10, &mut m, &HashMap::new(), &usage, &HashSet::new());
         assert_eq!(cats.hits[0].rel, "cat two.png", "used meme wins an otherwise equal match");
+
+        // A pinned meme beats even the most used one, and says it's pinned.
+        let pinned = HashSet::from(["cat one.png".to_string()]);
+        let empty = lib.search("", 0, 10, &mut m, &HashMap::new(), &usage, &pinned);
+        let order: Vec<_> = empty.hits.iter().map(|h| h.rel.as_str()).collect();
+        assert_eq!(order, ["cat one.png", "dog.png", "cat two.png"]);
+        assert!(empty.hits[0].pinned && !empty.hits[1].pinned);
+        let cats = lib.search("cat", 0, 10, &mut m, &HashMap::new(), &usage, &pinned);
+        assert_eq!(cats.hits[0].rel, "cat one.png", "pin boost beats light use");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
