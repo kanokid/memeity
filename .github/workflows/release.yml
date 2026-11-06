@@ -5,6 +5,9 @@
 # Required repository secrets (Settings > Secrets and variables > Actions):
 #   MEMEITY_GOOGLE_CLIENT_ID / MEMEITY_GOOGLE_CLIENT_SECRET   built-in Google sign-in
 #   TAURI_SIGNING_PRIVATE_KEY                                  signs updates (~/.tauri/memeity-updater.key)
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD             Developer ID Application cert (.p12, base64)
+#   APPLE_SIGNING_IDENTITY                                     e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID                  notarization (APPLE_PASSWORD = app-specific password)
 # See RELEASING.md.
 name: Release
 
@@ -48,7 +51,7 @@ jobs:
                 "- **Mac (Apple Silicon):** `memeity_*_aarch64.dmg`",
                 "- **Mac (Intel):** `memeity_*_x64.dmg` (no text recognition: search by name, plus text read on your other devices)",
                 "",
-                "These builds aren't code-signed yet. Windows may show \"Windows protected your PC\" (click **More info → Run anyway**); on a Mac, open it once from System Settings → Privacy & Security → **Open Anyway**.",
+                "The Mac builds are signed and notarized by Apple. The Windows builds aren't code-signed, so Windows may show \"Windows protected your PC\": click **More info → Run anyway**.",
               ].join("\n"),
             });
             return data.id;
@@ -81,9 +84,20 @@ jobs:
           CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          names="CLIENT_ID CLIENT_SECRET SIGNING_KEY"
+          # Mac builds are signed and notarized: never ship an unsigned one by accident.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            names="$names APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID"
+          fi
           missing=0
-          for name in CLIENT_ID CLIENT_SECRET SIGNING_KEY; do
+          for name in $names; do
             if [ -z "${!name}" ]; then echo "::error::Missing secret for $name (see RELEASING.md)"; missing=1; fi
           done
           exit $missing
@@ -121,6 +135,14 @@ jobs:
           MEMEITY_GOOGLE_CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS: Tauri imports the certificate into a temporary keychain, signs with the
+          # hardened runtime, then notarizes and staples. Unset on Windows (ignored there).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           # Upload into the draft made by `create-release` (also merges each platform
           # into one latest.json for the updater).
