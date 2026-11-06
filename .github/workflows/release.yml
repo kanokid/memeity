@@ -113,7 +113,8 @@ jobs:
 
       - run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0
+      # v1+: v0 silently ignores uploadUpdaterSignatures (below).
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MEMEITY_GOOGLE_CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
