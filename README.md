@@ -23,6 +23,7 @@ memeity aims to fix this issue by hosting all of your memes on Google Drive - sy
 - **Filename and OCR search**:  find your memes however you remember them - or however you don't.
 - **Easy setup with Google Drive**: just log into memeity with Google Drive for a near-instant setup. For your privacy, memeity only sees the files it creates itself and uses only a single folder.
 - **Quickly add memes**: drag and drop, or paste your memes into the pane to instantly process new images!
+- **Quick & powerful built-in editor**: edit and markup your memes & templates in an instant, right inside the memeity pane.
 - **Automatic updates**: memeity handles all of its own updates, so you'll never have to worry about keeping up to date again.
 - **Cross-platform**: memeity is supported on Windows, MacOS, with plans to expand to Linux + a web-based client!
 - **No telemetry**: memeity never phones home - I don't need your data, silly!
@@ -32,6 +33,7 @@ Grab the [latest release](https://github.com/purestellenium/memeity/releases/lat
 
 ## AI Declaration
 I used AI heavily (Claude Opus 5.5) in the development of memeity- I just wanted something that worked, and so using AI was the quickest way to make this happen.
+The development process of this app was heavily supervised by me to ensure high code quality, but Rust is not a language I consider myself proficient in.
 
 ## Contributing
 As always, PRs welcome!
