@@ -82,15 +82,17 @@ pub fn tray_clicked(app: &AppHandle) {
             install(&app).await
         } else {
             match check(&app).await {
-                // Found one: the item now reads "Install Update (x)…"; open Settings to show it.
+                // Found one: show it in Settings > About, with its Update button (the tray
+                // item now reads "Install Update (x)…" too).
                 Ok(Some(_)) => {
-                    crate::settings::open(&app);
+                    crate::settings::open_at(&app, Some("about"));
                     Ok(())
                 }
+                // Nothing new: say so in the pane (the tray item stays "Check for Updates…").
                 Ok(None) => {
-                    if let Some(item) = app.state::<AppState>().update_item.lock().unwrap().as_ref() {
-                        let _ = item.set_text(format!("Up to Date ({})", app.package_info().version));
-                    }
+                    crate::show_pane(&app);
+                    let message = format!("memeity is up to date! ({})", app.package_info().version);
+                    let _ = app.emit_to(crate::PANE, "notice", message);
                     Ok(())
                 }
                 Err(e) => Err(e),

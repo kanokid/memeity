@@ -1114,6 +1114,8 @@
   onMount(() => {
     checkDuplicates();
     const unlisten = [
+      // A short message from the backend (e.g. "memeity is up to date!" from the tray).
+      listen<string>("notice", (e) => showToast({ message: e.payload }, 3000)),
       listen("drag-out-ended", () => {
         draggingOut = false;
         dragOutEndedAt = Date.now();
