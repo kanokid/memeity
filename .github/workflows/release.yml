@@ -166,3 +166,24 @@ jobs:
           # Windows ships only the setup.exe (no MSI): point updates at it.
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
+
+      # Tauri notarizes the .app inside the DMG but not the DMG itself, which Gatekeeper
+      # then rejects as "Unnotarized Developer ID". Notarize + staple it and re-upload.
+      - name: Notarize the DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for dmg in src-tauri/target/*/release/bundle/dmg/*.dmg; do
+            xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait --timeout 30m \
+              | tee notary.log
+            grep -q "status: Accepted" notary.log
+            xcrun stapler staple "$dmg"
+            spctl -a -t open --context context:primary-signature -v "$dmg"
+            gh release upload "$GITHUB_REF_NAME" "$dmg" --clobber
+          done
