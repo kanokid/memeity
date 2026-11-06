@@ -51,7 +51,8 @@ impl Config {
 /// mid-write never leaves a half-written (unreadable) file behind.
 pub fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dest.with_file_name(format!(".{name}.tmp"));
+    // Unique per process: two memeity processes never share a temp file.
+    let tmp = dest.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;

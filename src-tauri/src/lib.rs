@@ -18,6 +18,8 @@ mod textindex;
 mod thumbs;
 mod updates;
 mod watcher;
+#[cfg(windows)]
+mod winhook;
 
 use config::{Config, DriveFolder};
 use google::Google;
@@ -1121,7 +1123,21 @@ pub fn run() {
     let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
     let (text_tx, text_rx) = std::sync::mpsc::channel();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Only one memeity at a time (must be the first plugin). Two copies would both sync
+    // the same folder (and fight over the shortcut). Opening memeity again just brings up
+    // the pane of the one already running. Release builds only: `tauri dev` shares the
+    // installed app's id, and should run next to it (sync.rs's file lock keeps the two
+    // from syncing at the same time).
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        log::info!("memeity was opened again; showing the running copy instead");
+        if !argv.iter().any(|a| a == settings::AUTOSTART_ARG) {
+            show_pane(app);
+        }
+    }));
+
+    builder
         // Grid thumbnails: `thumb://<path>`, made on demand and cached (see thumbs.rs).
         // `?full=1` serves the original instead (details preview, animated GIFs).
         .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
@@ -1209,6 +1225,8 @@ pub fn run() {
             settings::set_shortcut,
             settings::reset_shortcut,
             settings::retry_shortcut,
+            settings::start_shortcut_capture,
+            settings::stop_shortcut_capture,
             settings::set_autostart,
             settings::set_primary_action,
             settings::reread_all_text,
@@ -1281,6 +1299,8 @@ pub fn run() {
             }
 
             setup_tray(&handle)?;
+            #[cfg(windows)]
+            winhook::init(&handle);
             settings::register_initial(&handle);
 
             // Launcher behaviour: hide on blur, and closing just hides.

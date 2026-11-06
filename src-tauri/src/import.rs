@@ -90,7 +90,7 @@ pub fn add_bytes(app: &AppHandle, name_hint: Option<&str>, bytes: &[u8]) -> Resu
     // Write to a hidden temp file, then rename: the watcher/sync never see a partial file.
     let tmp_dir = root.join(TMP_DIR);
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-    let tmp = tmp_dir.join(format!("import-{md5}.part"));
+    let tmp = tmp_dir.join(format!("import-{md5}.{}.part", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| format!("Couldn't save the meme: {e}"))?;
     std::fs::rename(&tmp, &dest).map_err(|e| format!("Couldn't save the meme: {e}"))?;
 

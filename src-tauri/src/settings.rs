@@ -166,11 +166,39 @@ pub fn register_initial(app: &AppHandle) {
     let saved = config(app).shortcut.and_then(|s| parse(&s).ok());
     let shortcut = saved.unwrap_or_else(|| parse(DEFAULT_SHORTCUT).expect("default shortcut is valid"));
     *app.state::<AppState>().shortcut.lock().unwrap() = shortcut;
-    if let Err(e) = app.global_shortcut().register(shortcut) {
-        log::warn!("couldn't register {}: {e}", label(&shortcut));
+    if register(app, shortcut).is_err() {
         *app.state::<AppState>().shortcut_error.lock().unwrap() = Some(taken_message(&shortcut));
     }
     refresh_shortcut_labels(app);
+}
+
+/// Makes `shortcut` open the pane: the normal global-hotkey way, or on Windows, for
+/// combinations Windows won't hand out (Win+Space, Alt+Space...), memeity's own keyboard
+/// hook (see winhook.rs), like Raycast.
+fn register(app: &AppHandle, shortcut: Shortcut) -> Result<(), String> {
+    match app.global_shortcut().register(shortcut) {
+        Ok(()) => {
+            #[cfg(windows)]
+            crate::winhook::set_target(None);
+            Ok(())
+        }
+        Err(e) => {
+            #[cfg(windows)]
+            if crate::winhook::set_target(Some(shortcut)) {
+                log::info!("{} is reserved by Windows; memeity takes it over with its keyboard hook", label(&shortcut));
+                return Ok(());
+            }
+            log::warn!("couldn't register {}: {e}", label(&shortcut));
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Stops `shortcut` opening the pane, however it was registered.
+fn unregister(app: &AppHandle, shortcut: Shortcut) {
+    let _ = app.global_shortcut().unregister(shortcut);
+    #[cfg(windows)]
+    crate::winhook::set_target(None);
 }
 
 /// Shown when a shortcut can't be registered (almost always: another app owns it).
@@ -192,15 +220,13 @@ fn apply(app: &AppHandle, next: Shortcut) -> Result<(), String> {
     if next == old && old_registered {
         return Ok(());
     }
-    let gs = app.global_shortcut();
     if old_registered {
-        let _ = gs.unregister(old);
+        unregister(app, old);
     }
-    if let Err(e) = gs.register(next) {
+    if register(app, next).is_err() {
         if old_registered {
-            let _ = gs.register(old);
+            let _ = register(app, old);
         }
-        log::warn!("couldn't register {}: {e}", label(&next));
         return Err(format!("{} Try another combination.", taken_message(&next)));
     }
     *app.state::<AppState>().shortcut.lock().unwrap() = next;
@@ -234,6 +260,24 @@ pub async fn open_settings(app: AppHandle, section: Option<String>) {
 pub fn set_shortcut(app: AppHandle, accelerator: String) -> Result<Status, String> {
     apply(&app, parse(&accelerator)?)?;
     Ok(status(&app))
+}
+
+/// Settings started recording a shortcut. On Windows, memeity then captures the next
+/// combination system-wide, so ones Windows would act on itself (Alt+Space, Win+...) can
+/// be recorded too; it arrives as a `shortcut-captured` event. Returns whether it does
+/// (otherwise Settings reads the keys itself).
+#[tauri::command]
+pub fn start_shortcut_capture() -> bool {
+    #[cfg(windows)]
+    return crate::winhook::start_capture();
+    #[cfg(not(windows))]
+    false
+}
+
+#[tauri::command]
+pub fn stop_shortcut_capture() {
+    #[cfg(windows)]
+    crate::winhook::stop_capture();
 }
 
 /// Tries the current shortcut again (e.g. after quitting the app that had it).

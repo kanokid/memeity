@@ -100,7 +100,7 @@ pub fn thumbnail(dir: &Path, path: &Path) -> Result<(Vec<u8>, &'static str), Str
     let (bytes, ext, mime) = make(path)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // Write-then-rename so a half-written file is never served.
-    let part = dir.join(format!("{key}.{ext}.part"));
+    let part = dir.join(format!("{key}.{ext}.{}.part", std::process::id()));
     if std::fs::write(&part, &bytes).is_ok() {
         let _ = std::fs::rename(&part, dir.join(format!("{key}.{ext}")));
     }

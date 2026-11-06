@@ -100,10 +100,31 @@
     return arrows[code] ?? code;
   }
 
-  function startRecording() {
+  /** Windows: memeity is capturing the next combination system-wide (see winhook.rs). */
+  let nativeCapture = false;
+
+  function stopRecording() {
+    recording = false;
+    preview = [];
+    if (nativeCapture) invoke("stop_shortcut_capture");
+    nativeCapture = false;
+  }
+
+  /** The shortcut to save, or a message if it isn't usable. */
+  function saveShortcut(accelerator: string) {
+    recording = false;
+    nativeCapture = false;
+    act(async () => {
+      status = await invoke<Status>("set_shortcut", { accelerator });
+    });
+  }
+
+  async function startRecording() {
     error = null;
     preview = [];
     recording = true;
+    // Windows: also catch combinations Windows would act on itself (Alt+Space, Win+...).
+    nativeCapture = await invoke<boolean>("start_shortcut_capture").catch(() => false);
     // Keys are read from the whole window, so the recorder button doesn't need focus.
     // Keeping it would let the Space of a shortcut like Ctrl+Space "click" it again on
     // key-up and restart recording, as if the new shortcut never took.
@@ -122,8 +143,7 @@
     e.stopPropagation();
 
     if (e.key === "Escape" && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      recording = false;
-      preview = [];
+      stopRecording();
       return;
     }
     const mods = modifierLabels(e);
@@ -131,6 +151,8 @@
       preview = mods; // still holding modifiers
       return;
     }
+    // Capturing system-wide: the finished combination arrives as `shortcut-captured`.
+    if (nativeCapture) return;
     preview = [...mods, keyLabel(e.code)];
     if (!e.ctrlKey && !e.altKey && !e.metaKey) {
       error = `Include ${isMac ? "Ctrl, Option or Cmd" : "Ctrl, Alt or Win"} so the shortcut doesn't clash with typing.`;
@@ -145,10 +167,30 @@
     ]
       .filter(Boolean)
       .join("+");
-    recording = false;
-    act(async () => {
-      status = await invoke<Status>("set_shortcut", { accelerator });
-    });
+    saveShortcut(accelerator);
+  }
+
+  /** A combination captured system-wide (Windows), or null if Esc cancelled it. */
+  function onCaptured(accelerator: string | null) {
+    if (!recording) return;
+    nativeCapture = false;
+    if (!accelerator) {
+      stopRecording();
+      return;
+    }
+    const parts = accelerator.split("+");
+    const key = parts[parts.length - 1];
+    const has = (m: string) => parts.includes(m);
+    preview = [
+      ...modifierLabels({ ctrlKey: has("control"), altKey: has("alt"), shiftKey: has("shift"), metaKey: has("super") } as KeyboardEvent),
+      keyLabel(key),
+    ];
+    if (!has("control") && !has("alt") && !has("super")) {
+      error = `Include ${isMac ? "Ctrl, Option or Cmd" : "Ctrl, Alt or Win"} so the shortcut doesn't clash with typing.`;
+      recording = false;
+      return;
+    }
+    saveShortcut(accelerator);
   }
 
   // ---------- actions ----------
@@ -308,6 +350,7 @@
     const unlisten = ["sync-status", "ocr-status", "library-changed", "update-status"].map((e) =>
       listen(e, () => refresh()),
     );
+    unlisten.push(listen<string | null>("shortcut-captured", (e) => onCaptured(e.payload)));
     unlisten.push(
       listen<string>("show-section", (e) => {
         const next = sectionFrom(e.payload);
@@ -316,13 +359,20 @@
     );
     const timer = setInterval(() => (now = Date.now()), 5000);
     return () => {
+      if (recording) stopRecording(); // never leave system-wide capture on
       clearInterval(timer);
       unlisten.forEach((p) => p.then((f) => f()));
     };
   });
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<svelte:window
+  onkeydown={onKeydown}
+  onblur={() => {
+    // Clicked away: stop recording, so a system-wide capture never eats keys meant for another app.
+    if (recording) stopRecording();
+  }}
+/>
 
 <div class="settings">
   <nav class="side" aria-label="Settings sections">

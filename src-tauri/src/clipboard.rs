@@ -127,7 +127,7 @@ pub fn shareable(path: &Path) -> Result<PathBuf, String> {
     }
     prune_shared(root);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let part = dir.join(format!(".{stem}.{ext}.part"));
+    let part = dir.join(format!(".{stem}.{ext}.{}.part", std::process::id()));
     match kind {
         Kind::AnimatedWebp => webp_to_gif(path, &part)?,
         _ => decode(path)?.save_with_format(&part, image::ImageFormat::Png).map_err(|e| e.to_string())?,

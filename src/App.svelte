@@ -82,8 +82,11 @@
   let confirmDelete = $state<Hit | null>(null);
   let searchSeq = 0;
 
-  /** Actions menu (right-click on a tile, or Ctrl+K), positioned in window coordinates. */
-  let menu = $state<{ x: number; y: number; index: number } | null>(null);
+  /**
+   * Actions menu (right-click on a tile, or Ctrl+K), positioned in window coordinates.
+   * `bottom`, if set, anchors its bottom edge there instead (resolved once measured).
+   */
+  let menu = $state<{ x: number; y: number; bottom?: number; index: number } | null>(null);
   let menuSel = $state(0);
 
   /** Details view (Ctrl+I): big preview + the text OCR read from the selected meme. */
@@ -167,7 +170,7 @@
       const renamed = await invoke<string>("rename_meme", { path, name: nameDraft });
       stopEditing();
       // Keep the renamed meme selected (its rank, and so its index, may have changed).
-      pendingSelectPath = renamed;
+      wantSelected(renamed);
       await refresh();
       if (renamed !== path) {
         const undo = () => undoRename(renamed, oldStem);
@@ -182,7 +185,7 @@
       lastUndo = null;
       toast = null;
       const restored = await invoke<string>("rename_meme", { path, name: oldStem });
-      pendingSelectPath = restored;
+      wantSelected(restored);
       await refresh();
       showToast({ message: `Renamed back to ${baseName(restored)}` }, 2000);
     });
@@ -622,12 +625,40 @@
   let total = $state(0);
   /** The search (searchSeq) whose next page is loading, so an old query's slow page can't block a new one. */
   let loadingMoreSeq = -1;
-  /** After a rename: select this meme (by its new path) once the results include it. */
-  let pendingSelectPath: string | null = null;
+  /**
+   * A meme to select (by path or library-relative path) as soon as the results include
+   * it: after a rename, or a meme just added. Whichever search or page load lands next
+   * picks it up, so it can't be lost to another refresh running at the same moment
+   * (adding a file also refreshes the library). Expires, so it can't grab the selection
+   * much later.
+   */
+  let pendingSelect: { key: string; until: number } | null = null;
+  const PENDING_SELECT_MS = 5000;
+
+  function wantSelected(key: string) {
+    pendingSelect = { key, until: Date.now() + PENDING_SELECT_MS };
+  }
+
+  /** Selects the pending meme if it's in `hits` (returns its index), else loads the next page. */
+  function followPending(): number {
+    const want = pendingSelect;
+    if (!want) return -1;
+    if (Date.now() > want.until) {
+      pendingSelect = null;
+      return -1;
+    }
+    const i = hits.findIndex((h) => h.path === want.key || h.rel === want.key);
+    if (i >= 0) {
+      pendingSelect = null;
+      selected = i;
+    } else if (hits.length < total) {
+      loadMore(); // not on the pages loaded so far
+    }
+    return i;
+  }
 
   async function runSearch(resetSelection: boolean) {
     const seq = ++searchSeq;
-    if (resetSelection) pendingSelectPath = null;
     // A refresh (library changed) keeps however many pages were already loaded.
     const limit = resetSelection ? PAGE : Math.max(PAGE, hits.length);
     let res: SearchResult;
@@ -641,11 +672,8 @@
     hits = res.hits;
     total = res.total;
     selected = resetSelection ? 0 : Math.min(selected, Math.max(hits.length - 1, 0));
-    const follow = pendingSelectPath;
-    pendingSelectPath = null;
-    const found = follow ? hits.findIndex((h) => h.path === follow) : -1;
-    if (found >= 0) selected = found;
     if (resetSelection) (view === "list" ? list : grid)?.scrollTo({ top: 0 });
+    const found = followPending();
     await tick();
     if (found >= 0) scrollToTile(found);
     maybeLoadMore(); // the first page might not fill the pane
@@ -667,7 +695,9 @@
     } finally {
       if (loadingMoreSeq === seq) loadingMoreSeq = -1;
     }
+    const found = followPending();
     await tick();
+    if (found >= 0) scrollToTile(found);
     maybeLoadMore(); // still short of the pane's end (or the selection's)?
   }
 
@@ -778,38 +808,55 @@
     const added: string[] = [];
     const duplicates: string[] = [];
     const failures: string[] = [];
-    const collect = (r: ImportResult) => {
+    /** The meme to show: the first one added (or found already in the library). */
+    let shown: string | null = null;
+    const collect = async (r: ImportResult) => {
       added.push(...r.added);
       duplicates.push(...r.duplicates);
+      const first = r.added[0] ?? r.duplicates[0];
+      if (first && !shown) {
+        shown = first;
+        await showMeme(first); // right away, while any other files are still being added
+      }
     };
     for (const file of files) {
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        collect(await invoke<ImportResult>("import_bytes", bytes, { headers: { "x-filename": encodeURIComponent(file.name) } }));
+        await collect(await invoke<ImportResult>("import_bytes", bytes, { headers: { "x-filename": encodeURIComponent(file.name) } }));
       } catch (e) {
         failures.push(`${file.name || "Image"}: ${e}`);
       }
     }
     for (const url of urls) {
       try {
-        collect(await invoke<ImportResult>("import_url", { url }));
+        await collect(await invoke<ImportResult>("import_url", { url }));
       } catch (e) {
         failures.push(String(e));
       }
     }
     importing = false;
 
-    if (added.length) {
-      // Show the new memes: they're the newest, so an empty search puts them first.
-      query = "";
-      await refresh(true);
-    }
+    // More memes arrived after the first was shown, shifting it: select it again.
+    if (shown && added.length + duplicates.length > 1) await showMeme(shown);
     const name = (rel: string) => rel.split("/").pop();
     const parts: string[] = [];
     if (added.length) parts.push(added.length === 1 ? `Added ${name(added[0])}` : `Added ${added.length} memes`);
     if (duplicates.length) parts.push(duplicates.length === 1 ? `${name(duplicates[0])} is already in your library` : `${duplicates.length} were already in your library`);
     if (failures.length) parts.push(failures.length === 1 ? failures[0] : `${failures.length} couldn't be added`);
     if (parts.length) showToast({ message: parts.join(" · "), error: failures.length > 0 && added.length === 0 }, 5000);
+  }
+
+  /**
+   * Clears the search and selects the meme at `rel` (library-relative) in the current
+   * view. An empty search lists recently used memes before the newest, so it may be past
+   * the first page: load pages until it turns up.
+   */
+  async function showMeme(rel: string) {
+    query = "";
+    confirmDelete = null;
+    menu = null;
+    wantSelected(rel);
+    await runSearch(true);
   }
 
   function onPaste(e: ClipboardEvent) {
@@ -849,6 +896,7 @@
   }
 
   function onInput() {
+    pendingSelect = null; // typing a new search: don't jump away from it
     error = null;
     confirmDelete = null;
     menu = null;
@@ -858,7 +906,22 @@
   // ---------- actions menu ----------
 
   const MENU_W = 230;
-  const MENU_H = 188;
+  /** Gap kept between the menu and the pane's edges. */
+  const MENU_MARGIN = 8;
+  let menuEl: HTMLDivElement | undefined = $state();
+
+  // Once the menu is on screen, measure it and nudge it back inside the pane: its real
+  // height depends on how many actions it has (and fonts), so it's never guessed.
+  $effect(() => {
+    const m = menu;
+    const el = menuEl;
+    if (!m || !el) return;
+    const { width, height } = el.getBoundingClientRect();
+    const top = m.bottom !== undefined ? m.bottom - height : m.y;
+    const x = Math.max(MENU_MARGIN, Math.min(m.x, window.innerWidth - width - MENU_MARGIN));
+    const y = Math.max(MENU_MARGIN, Math.min(top, window.innerHeight - height - MENU_MARGIN));
+    if (x !== m.x || y !== m.y || m.bottom !== undefined) menu = { x, y, index: m.index };
+  });
 
   // Enter / click = the primary action, Shift = the other one (swappable in Settings).
   const pasteFirst = $derived(status?.primary_action !== "copy");
@@ -910,19 +973,16 @@
     e.preventDefault();
     select(i);
     menuSel = 0;
-    menu = {
-      // Keep the menu inside the window.
-      x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
-      y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
-      index: i,
-    };
+    // At the cursor; moved back inside the pane once its size is known (see the $effect).
+    menu = { x: e.clientX, y: e.clientY, index: i };
   }
 
   /** Ctrl+K: Raycast-style actions panel, anchored above the action bar. */
   function openActions() {
     if (!current) return;
     menuSel = 0;
-    menu = { x: window.innerWidth - MENU_W - 10, y: window.innerHeight - MENU_H - 52, index: selected };
+    // Right-aligned, sitting just above the action bar.
+    menu = { x: window.innerWidth - MENU_W - 10, y: 0, bottom: window.innerHeight - 52, index: selected };
   }
 
   function runAction(a: number) {
@@ -1592,7 +1652,15 @@
 </main>
 
 {#if menu}
-  <div class="menu" role="menu" style:left="{menu.x}px" style:top="{menu.y}px" style:width="{MENU_W}px">
+  <div
+    class="menu"
+    role="menu"
+    bind:this={menuEl}
+    style:left="{menu.x}px"
+    style:top="{menu.y}px"
+    style:width="{MENU_W}px"
+    style:visibility={menu.bottom !== undefined ? "hidden" : null}
+  >
     {#each actions as a, n (a.label)}
       {#if n > 0 && a.danger}<div class="menu-sep"></div>{/if}
       <button

@@ -85,7 +85,8 @@ pub fn write(root: &Path, md5: &str, sidecar: &Sidecar) -> std::io::Result<()> {
     std::fs::create_dir_all(dest.parent().expect("sidecar path has a parent"))?;
     let tmp_dir = root.join(TMP_DIR);
     std::fs::create_dir_all(&tmp_dir)?;
-    let tmp = tmp_dir.join(format!("{md5}.json.part"));
+    // Unique per process: two memeity processes never share a temp file.
+    let tmp = tmp_dir.join(format!("{md5}.json.{}.part", std::process::id()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(sidecar).expect("sidecar serializes"))?;
     std::fs::rename(&tmp, &dest)
 }

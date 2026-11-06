@@ -1,6 +1,6 @@
 [package]
 name = "memeity"
-version = "0.2.0"
+version = "0.2.1"
 description = "One meme folder, everywhere, with a Raycast-style search pane"
 edition = "2024"
 
@@ -53,6 +53,7 @@ tauri-plugin-log = "2"
 # Dragging memes out of the pane into other apps (CrabNebula's drag, without its Tauri
 # plugin: that would let the webview drag any file; our command checks the library).
 drag = "2.1.1"
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
 # Instant insert: save/restore the clipboard and refocus the previous app.
@@ -62,6 +63,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Memory",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Input_KeyboardAndMouse",
+  # Shortcuts Windows reserves (Alt+Space, Win+...): a low-level keyboard hook (winhook.rs).
+  "Win32_System_LibraryLoader",
 ] }
 # Turning the pane's hide animation on/off (DWM). Same `windows` version Tauri uses.
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }

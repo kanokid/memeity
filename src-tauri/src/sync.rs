@@ -199,6 +199,25 @@ impl SyncState {
     }
 }
 
+/// Holds `sync.lock` in the app-data dir until dropped, waiting for it if another memeity
+/// process (a second copy, or a dev build next to the installed app) is syncing. Both
+/// share `sync-state.json`, so taking turns means a file one uploaded is already
+/// tracked when the other looks, instead of being uploaded twice.
+async fn lock_across_processes(data_dir: &Path) -> Result<std::fs::File, String> {
+    let path = data_dir.join("sync.lock");
+    tokio::task::spawn_blocking(move || {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+        file.lock()?; // released when the file is closed (dropped)
+        Ok::<_, std::io::Error>(file)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("Couldn't lock memeity's sync state: {e}"))
+}
+
 // ---------- loop & triggers ----------
 
 /// How thorough a sync pass should be.
@@ -270,6 +289,16 @@ async fn run_once(app: &AppHandle, kind: SyncKind) {
     let Ok(data_dir) = app.path().app_data_dir() else { return };
 
     let _guard = state.sync_lock.lock().await;
+    let _across = match lock_across_processes(&data_dir).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            set_status(app, |s| {
+                s.state = "error";
+                s.message = Some(e);
+            });
+            return;
+        }
+    };
 
     // A check is one tiny request when nothing changed on Drive. Local changes always
     // come in as Full syncs (from the file watcher), so they never wait on this.
@@ -823,6 +852,7 @@ pub async fn rename(app: &AppHandle, from: &Path, to: &Path) -> Result<(), Strin
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
 
     let _guard = state.sync_lock.lock().await;
+    let _across = lock_across_processes(&data_dir).await?;
     if to.exists() && !same_file_other_case(from, to) {
         return Err(format!("There's already a meme called {new_name}."));
     }
@@ -871,6 +901,7 @@ pub async fn delete(app: &AppHandle, path: &Path) -> Result<String, String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
 
     let _guard = state.sync_lock.lock().await;
+    let _across = lock_across_processes(&data_dir).await?;
     let mut st = SyncState::load(&data_dir, &folder.id);
     let drive_id = st.files.get(&rel).map(|s| s.id.clone());
     if let Some(id) = &drive_id {
@@ -1018,7 +1049,8 @@ async fn ensure_folder<D: Drive>(g: &D, folders: &mut HashMap<String, String>, d
 
 async fn download<D: Drive>(g: &D, item: &DriveItem, root: &Path, dest: &Path) -> Result<(), String> {
     let bytes = g.download(&item.id).await?;
-    let tmp = root.join(TMP_DIR).join(&item.id);
+    // Unique per process: two memeity processes never download into the same file.
+    let tmp = root.join(TMP_DIR).join(format!("{}.{}", item.id, std::process::id()));
     let dest = dest.to_path_buf();
     let modified = item.modified_time.as_deref().and_then(|t| humantime::parse_rfc3339_weak(t).ok());
     tokio::task::spawn_blocking(move || {
@@ -1644,6 +1676,19 @@ mod tests {
         assert!(third.errors.is_empty(), "{:?}", third.errors);
         assert_eq!(g.names(), ["cat.png"], "retried with the same id: one file on Drive");
         assert_eq!(Library::scan(&root).memes.len(), 1, "no duplicate downloaded either");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn sync_lock_waits_for_the_other_holder() {
+        let (root, data) = dirs("lock");
+        let first = lock_across_processes(&data).await.unwrap();
+        let data2 = data.clone();
+        let waiter = tokio::spawn(async move { lock_across_processes(&data2).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!waiter.is_finished(), "a second holder waits while the lock is held");
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap();
         cleanup(&root);
     }
 
