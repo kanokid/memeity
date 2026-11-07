@@ -4,7 +4,8 @@
 //! It's a cache: everything in it can be rebuilt from the library and its sidecars.
 //! - `memes` remembers each file's content hash (keyed by path + size + mtime, so we
 //!   don't re-hash unchanged files) and whether its text is indexed.
-//! - `meme_fts` holds searchable text per meme: OCR text now, tags in milestone 2.
+//! - `meme_fts` holds searchable text per meme (OCR'd or typed). Its `tags` column is
+//!   unused: tags are matched by name in `search` (lib.rs), via `meme_tags`.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +34,13 @@ CREATE TABLE IF NOT EXISTS usage (
 -- Pinned memes (by content hash), mirrored from their sidecars.
 CREATE TABLE IF NOT EXISTS pins (
     md5 TEXT PRIMARY KEY
+);
+-- Which tags (by id, see tags.rs) each image (by content hash) has, mirrored from
+-- the sidecars.
+CREATE TABLE IF NOT EXISTS meme_tags (
+    md5 TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (md5, tag)
 );
 -- Other devices' usage, read from their synced usage files (see usage.rs). Replaced
 -- wholesale per device whenever its file changes.
@@ -119,7 +127,6 @@ impl Index {
         &self,
         rel: &str,
         text: &str,
-        tags: &[String],
         sidecar_mtime: Option<i64>,
         engine: Option<&str>,
     ) -> rusqlite::Result<()> {
@@ -132,8 +139,8 @@ impl Index {
         };
         self.conn.execute("DELETE FROM meme_fts WHERE rowid = ?1", [id])?;
         self.conn.execute(
-            "INSERT INTO meme_fts (rowid, text, tags) VALUES (?1, ?2, ?3)",
-            params![id, text, tags.join(" ")],
+            "INSERT INTO meme_fts (rowid, text, tags) VALUES (?1, ?2, '')",
+            params![id, text],
         )?;
         self.conn.execute(
             "UPDATE memes SET indexed = 1, sidecar_mtime = ?2, engine = ?3 WHERE id = ?1",
@@ -206,6 +213,45 @@ impl Index {
             self.conn.execute("DELETE FROM pins WHERE md5 = ?1", [md5])?;
         }
         Ok(())
+    }
+
+    /// Replaces a meme's tags (by content hash) with `tags` (ids).
+    pub fn set_meme_tags(&self, md5: &str, tags: &[String]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM meme_tags WHERE md5 = ?1", [md5])?;
+        {
+            let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO meme_tags (md5, tag) VALUES (?1, ?2)")?;
+            for tag in tags {
+                insert.execute(params![md5, tag])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Tag ids per library-relative path, for memes that have any.
+    pub fn tags_by_rel(&self) -> rusqlite::Result<HashMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare_cached("SELECT m.rel, t.tag FROM meme_tags t JOIN memes m ON m.md5 = t.md5")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (rel, tag) = row?;
+            out.entry(rel).or_default().push(tag);
+        }
+        Ok(out)
+    }
+
+    /// How many memes in the library have each tag.
+    pub fn tag_counts(&self) -> rusqlite::Result<HashMap<String, usize>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT t.tag, COUNT(*) FROM meme_tags t JOIN memes m ON m.md5 = t.md5 GROUP BY t.tag",
+        )?;
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))?.collect()
+    }
+
+    /// Content hashes of the images that have a tag.
+    pub fn memes_with_tag(&self, tag: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT md5 FROM meme_tags WHERE tag = ?1")?;
+        stmt.query_map([tag], |r| r.get(0))?.collect()
     }
 
     /// Library-relative paths of pinned memes.
@@ -296,15 +342,10 @@ impl Index {
             .optional()
     }
 
-    /// Every indexed meme's text and tags (for the in-memory loose-match cache).
-    pub fn all_texts(&self) -> rusqlite::Result<Vec<(String, String, Vec<String>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT m.rel, f.text, f.tags FROM meme_fts f JOIN memes m ON m.id = f.rowid")?;
-        let rows = stmt.query_map([], |r| {
-            let tags: String = r.get(2)?;
-            Ok((r.get(0)?, r.get(1)?, tags.split_whitespace().map(str::to_owned).collect()))
-        })?;
+    /// Every indexed meme's text (for the in-memory loose-match cache).
+    pub fn all_texts(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT m.rel, f.text FROM meme_fts f JOIN memes m ON m.id = f.rowid")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
 
@@ -315,7 +356,7 @@ impl Index {
             .map(|n| n as usize)
     }
 
-    /// Memes whose text or tags match every word of `query` (as prefixes), best first.
+    /// Memes whose text matches every word of `query` (as prefixes), best first.
     pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<String>> {
         let Some(fts) = fts_query(query) else { return Ok(Vec::new()) };
         let mut stmt = self.conn.prepare_cached(
@@ -387,12 +428,11 @@ mod tests {
         let idx = Index::in_memory();
         idx.upsert_file("a.png", 1, 1, "aaa").unwrap();
         idx.upsert_file("b.png", 1, 1, "bbb").unwrap();
-        idx.set_text("a.png", "When the code compiles first try", &[], None, Some("eng")).unwrap();
-        idx.set_text("b.png", "nobody: absolutely nobody", &["cat".into()], Some(5), Some("eng")).unwrap();
+        idx.set_text("a.png", "When the code compiles first try", None, Some("eng")).unwrap();
+        idx.set_text("b.png", "nobody: absolutely nobody", Some(5), Some("eng")).unwrap();
 
         assert_eq!(idx.search("compil", 10).unwrap(), vec!["a.png"], "prefix match");
         assert_eq!(idx.search("CODE when", 10).unwrap(), vec!["a.png"], "any order, case-insensitive");
-        assert_eq!(idx.search("cat", 10).unwrap(), vec!["b.png"], "tags are searchable");
         assert!(idx.search("compiles nobody", 10).unwrap().is_empty(), "all words must match");
 
         let e = idx.lookup("b.png").unwrap().unwrap();
@@ -420,6 +460,22 @@ mod tests {
         init(&conn).unwrap();
         assert!(conn.prepare("SELECT engine FROM memes").is_ok());
         init(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn tags_follow_content() {
+        let idx = Index::in_memory();
+        idx.upsert_file("a.png", 1, 1, "aaa").unwrap();
+        idx.upsert_file("copy of a.png", 1, 1, "aaa").unwrap();
+        idx.upsert_file("b.png", 1, 1, "bbb").unwrap();
+        idx.set_meme_tags("aaa", &["t1".into(), "t2".into()]).unwrap();
+        idx.set_meme_tags("bbb", &["t1".into()]).unwrap();
+        let by_rel = idx.tags_by_rel().unwrap();
+        assert_eq!(by_rel["copy of a.png"].len(), 2, "same image, same tags");
+        assert_eq!(idx.tag_counts().unwrap()["t1"], 3);
+        idx.set_meme_tags("aaa", &[]).unwrap();
+        assert!(!idx.tags_by_rel().unwrap().contains_key("a.png"));
+        assert_eq!(idx.memes_with_tag("t1").unwrap(), vec!["bbb"]);
     }
 
     #[test]

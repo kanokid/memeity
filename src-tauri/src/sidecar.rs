@@ -8,7 +8,7 @@
 //! ```json
 //! {
 //!   "version": 1,
-//!   "tags": ["reaction", "cat"],          // reserved for milestone 2, omitted while empty
+//!   "tags": ["a1b2c3d4", "0f9e8d7c"],     // tag ids (see tags.rs), omitted while empty
 //!   "ocr": { "text": "…", "engine": "windows.media.ocr", "lang": "en-US", "at": "2026-…Z" },
 //!   "pinned": true                         // omitted unless pinned
 //! }
@@ -28,7 +28,7 @@ const TMP_DIR: &str = ".memeity-tmp";
 pub struct Sidecar {
     #[serde(default = "current_version")]
     pub version: u32,
-    /// User-applied tags (milestone 2). Indexed for search already, just never set yet.
+    /// Ids of the user's tags on this meme (names and colours live in tags.rs files).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// Text found in the image, so other devices never re-run OCR.

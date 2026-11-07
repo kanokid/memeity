@@ -2,8 +2,20 @@
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import logo from "./assets/logo.png";
+  import {
+    accentOf,
+    accentsOf,
+    applyTheme,
+    DEFAULT_CHOICE,
+    swatchesOf,
+    THEMES,
+    themeById,
+    variantOf,
+    type Theme,
+    type ThemeChoice,
+  } from "./themes";
 
   type SyncStatus = {
     state: "off" | "syncing" | "idle" | "error";
@@ -29,11 +41,14 @@
     primary_action: "paste" | "copy";
     pane_scale: number;
     scroll_reset_secs: number;
+    theme: ThemeChoice | null;
     version: string;
   };
 
   const sections = [
     { id: "general", label: "General" },
+    { id: "appearance", label: "Appearance" },
+    { id: "tags", label: "Tags" },
     { id: "account", label: "Account & Sync" },
     { id: "text", label: "Text Search" },
     { id: "duplicates", label: "Duplicates" },
@@ -42,6 +57,106 @@
   type Section = (typeof sections)[number]["id"];
 
   const isMac = navigator.userAgent.includes("Mac");
+
+  // ---------- search ----------
+
+  /** A setting you can search for. `find` is the start of its heading or button text
+   * (or `sel` a selector), to scroll to and highlight; neither shows the section. */
+  type Entry = { section: Section; title: string; words: string; find?: string; sel?: string };
+  const ENTRIES: Entry[] = [
+    { section: "general", title: "Shortcut to open memeity", words: "hotkey keyboard key binding pane global", find: "Open memeity" },
+    { section: "general", title: "Enter key", words: "return copy paste insert send", find: "Enter key" },
+    { section: "general", title: "Pane size", words: "window width height bigger smaller large", find: "Pane size" },
+    { section: "general", title: "Scroll back to top", words: "reset position remember", find: "Scroll back to top" },
+    { section: "general", title: "Launch at login", words: "startup start boot autostart open automatically", find: "Launch at login" },
+    {
+      section: "appearance",
+      title: "Theme",
+      words:
+        "color colour scheme dark light mode brightness flavor flavour style catppuccin latte frappe macchiato mocha dracula everforest gruvbox kanagawa nord one onedark rose pine rosepine solarized tokyo night",
+      sel: ".theme-grid",
+    },
+    { section: "appearance", title: "Accent color", words: "colour highlight tint", find: "Accent" },
+    { section: "tags", title: "Create a tag", words: "new add label", sel: "form.row" },
+    { section: "tags", title: "Rename, recolor or delete tags", words: "edit color colour remove labels" },
+    { section: "account", title: "Google account", words: "sign in out login logout email drive" },
+    { section: "account", title: "Sync", words: "google drive upload download status cloud", find: "Sync" },
+    { section: "account", title: "Memes folder", words: "location path directory drive local", find: "Memes folder" },
+    { section: "text", title: "Text in images", words: "ocr read recognition language words", find: "Text in images" },
+    { section: "text", title: "Re-read all memes", words: "ocr reread rescan reindex refresh", find: "Re-read all" },
+    { section: "duplicates", title: "Duplicates", words: "dupes identical copies similar clean up delete" },
+    { section: "about", title: "Check for updates", words: "update upgrade version new release", find: "Check for Updates" },
+    { section: "about", title: "Report a problem", words: "bug issue feedback help broken github", find: "Report a Problem" },
+    { section: "about", title: "Copy diagnostics", words: "logs debug bug", find: "Copy diagnostics" },
+    { section: "about", title: "Website", words: "homepage link", find: "Website" },
+    { section: "about", title: "Privacy policy", words: "data telemetry", find: "Privacy policy" },
+    { section: "about", title: "Source code", words: "github open source repository", find: "Source code" },
+  ];
+
+  let search = $state("");
+  let searchInput = $state<HTMLInputElement | undefined>();
+  /** The result Enter opens (moved with the arrow keys). */
+  let active = $state(0);
+
+  /** Every word typed starts a word of the entry (its title, keywords or section). */
+  const results = $derived.by(() => {
+    const typed = search.toLowerCase().split(/[\s&,/-]+/).filter(Boolean);
+    if (!typed.length) return [];
+    const label = (e: Entry) => sections.find((s) => s.id === e.section)?.label ?? "";
+    return ENTRIES.map((e) => {
+      const title = e.title.toLowerCase().split(/[\s&,/-]+/);
+      const all = [...title, ...`${e.words} ${label(e)}`.toLowerCase().split(/[\s&,/-]+/)];
+      if (!typed.every((t) => all.some((w) => w.startsWith(t)))) return null;
+      // Title matches first.
+      return { e, rank: typed.filter((t) => title.some((w) => w.startsWith(t))).length };
+    })
+      .filter((r) => r !== null)
+      .sort((a, b) => b.rank - a.rank)
+      .map((r) => r.e);
+  });
+
+  $effect(() => {
+    void results;
+    active = 0;
+  });
+
+  /** Shows an entry's section, then scrolls to its setting and highlights it. */
+  async function openEntry(e: Entry) {
+    section = e.section;
+    await tick();
+    const content = document.querySelector(".content");
+    let el: Element | null = null;
+    if (e.sel) el = content?.querySelector(e.sel) ?? null;
+    else if (e.find) {
+      const hit = [...(content?.querySelectorAll("h3, button") ?? [])].find((n) => n.textContent?.trim().startsWith(e.find!));
+      el = hit?.tagName === "H3" ? (hit.closest(".row, .card") ?? hit) : (hit ?? null);
+    }
+    if (!el) {
+      content?.scrollTo({ top: 0 });
+      return;
+    }
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.classList.remove("flash");
+    void (el as HTMLElement).offsetWidth; // restart the animation
+    el.classList.add("flash");
+    setTimeout(() => el.classList.remove("flash"), 1600);
+  }
+
+  function onSearchKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      if (search) {
+        e.preventDefault();
+        search = "";
+      } else searchInput?.blur();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (!results.length) return;
+      e.preventDefault();
+      active = (active + (e.key === "ArrowDown" ? 1 : results.length - 1)) % results.length;
+    } else if (e.key === "Enter" && results[active]) {
+      e.preventDefault();
+      openEntry(results[active]);
+    }
+  }
 
   let status = $state<Status | null>(null);
   // Opened at a section (e.g. from the pane's duplicates prompt): `index.html#duplicates`.
@@ -136,6 +251,13 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    // Cmd+F / Ctrl+F searches settings.
+    if (!recording && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      searchInput?.focus();
+      searchInput?.select();
+      return;
+    }
     // Ctrl+W / Cmd+W closes Settings, like any normal window.
     if (!recording && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "w") {
       e.preventDefault();
@@ -348,6 +470,109 @@
     return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   }
 
+  // ---------- appearance ----------
+
+  $effect(() => {
+    if (status) applyTheme(status.theme);
+  });
+
+  const choice = $derived(status?.theme ?? DEFAULT_CHOICE);
+  const theme = $derived(themeById(choice.theme));
+  const variant = $derived(variantOf(theme, choice.variant));
+  const accent = $derived(accentOf(theme, choice.accent));
+
+  const saveTheme = (next: ThemeChoice) =>
+    act(async () => {
+      status = await invoke<Status>("set_theme", next);
+    });
+
+  /** Switching themes keeps a light/dark choice the new theme also has. */
+  function pickTheme(t: Theme) {
+    if (t.id === theme.id) return;
+    const keep = t.variants.some((v) => v.id === variant.id) ? variant.id : t.defaultVariant;
+    saveTheme({ theme: t.id, variant: keep, accent: null });
+  }
+
+  const pickVariant = (id: string) => saveTheme({ theme: theme.id, variant: id, accent: choice.accent });
+  const pickAccent = (name: string) => saveTheme({ theme: theme.id, variant: variant.id, accent: name });
+
+  /** "rosewater" -> "Rosewater"; "" (no accent) -> "Mono". */
+  const label = (name: string) => (name ? name[0].toUpperCase() + name.slice(1) : "Mono");
+
+  // ---------- tags ----------
+
+  type Tag = { id: string; name: string; color: string; count: number };
+  /** Same order as tags.rs COLORS. */
+  const TAG_COLORS = ["blue", "green", "yellow", "orange", "red", "pink", "purple", "teal", "gray"];
+
+  let tags = $state<Tag[] | null>(null);
+  let newTag = $state("");
+  /** The tag being renamed, its draft name, and the one whose colours are showing. */
+  let renamingTag = $state<string | null>(null);
+  let tagDraft = $state("");
+  let coloring = $state<string | null>(null);
+  /** Deleting asks for a second click. */
+  let confirmDeleteTag = $state<string | null>(null);
+
+  async function loadTags() {
+    try {
+      tags = await invoke<Tag[]>("list_tags");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  $effect(() => {
+    if (section === "tags" && !tags) loadTags();
+  });
+
+  const createTag = () =>
+    act(async () => {
+      if (!newTag.trim()) return;
+      await invoke("create_tag", { name: newTag });
+      newTag = "";
+      await loadTags();
+    });
+
+  function startRenameTag(t: Tag) {
+    renamingTag = t.id;
+    tagDraft = t.name;
+    coloring = null;
+    confirmDeleteTag = null;
+  }
+
+  const saveTagName = (t: Tag) =>
+    act(async () => {
+      if (tagDraft.trim() && tagDraft.trim() !== t.name) {
+        tags = await invoke<Tag[]>("update_tag", { id: t.id, name: tagDraft });
+      }
+      renamingTag = null;
+    });
+
+  const setTagColor = (t: Tag, color: string) =>
+    act(async () => {
+      tags = await invoke<Tag[]>("update_tag", { id: t.id, color });
+      coloring = null;
+    });
+
+  const deleteTag = (t: Tag) =>
+    act(async () => {
+      if (confirmDeleteTag !== t.id) {
+        confirmDeleteTag = t.id;
+        renamingTag = null;
+        coloring = null;
+        return;
+      }
+      confirmDeleteTag = null;
+      tags = await invoke<Tag[]>("delete_tag", { id: t.id });
+    });
+
+  /** Focuses (and selects) an input as soon as it appears. */
+  function autofocus(el: HTMLInputElement) {
+    el.focus();
+    el.select();
+  }
+
   // ---------- formatting ----------
 
   function ago(ms: number) {
@@ -373,6 +598,9 @@
       listen(e, () => refresh()),
     );
     unlisten.push(listen<string | null>("shortcut-captured", (e) => onCaptured(e.payload)));
+    // Tags changed in the pane or on another device; counts change with the library.
+    unlisten.push(listen("tags-changed", () => tags && loadTags()));
+    unlisten.push(listen("library-changed", () => tags && loadTags()));
     unlisten.push(
       listen<string>("show-section", (e) => {
         const next = sectionFrom(e.payload);
@@ -399,13 +627,48 @@
 <div class="settings">
   <nav class="side" aria-label="Settings sections">
     <div class="brand"><img src={logo} alt="" width="22" height="22" />Settings</div>
-    {#each sections as s (s.id)}
-      <button
-        class:active={section === s.id}
-        aria-current={section === s.id ? "page" : undefined}
-        onclick={() => (section = s.id)}
-      >{s.label}</button>
-    {/each}
+    <div class="side-search">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+      <input
+        bind:this={searchInput}
+        bind:value={search}
+        onkeydown={onSearchKey}
+        type="search"
+        placeholder="Search"
+        aria-label="Search settings"
+        aria-controls="setting-results"
+        spellcheck="false"
+        autocomplete="off"
+      />
+      {#if !search}<kbd>{isMac ? "⌘F" : "Ctrl+F"}</kbd>{/if}
+    </div>
+    {#if search.trim()}
+      <div id="setting-results" class="results" role="listbox" aria-label="Matching settings">
+        {#each results as r, i (r.section + r.title)}
+          <button
+            class="result"
+            class:active={i === active}
+            role="option"
+            aria-selected={i === active}
+            onmouseenter={() => (active = i)}
+            onclick={() => openEntry(r)}
+          >
+            <span>{r.title}</span>
+            <span class="where">{sections.find((s) => s.id === r.section)?.label}</span>
+          </button>
+        {:else}
+          <p class="no-results">No matching settings</p>
+        {/each}
+      </div>
+    {:else}
+      {#each sections as s (s.id)}
+        <button
+          class:active={section === s.id}
+          aria-current={section === s.id ? "page" : undefined}
+          onclick={() => (section = s.id)}
+        >{s.label}</button>
+      {/each}
+    {/if}
   </nav>
 
   <main class="content">
@@ -592,6 +855,169 @@
             through Drive's website don't sync, because memeity can only see files it created.
           </p>
         </div>
+      {/if}
+    {:else if section === "appearance"}
+      <h1>Appearance</h1>
+
+      <div class="theme-grid" role="radiogroup" aria-label="Theme">
+        {#each THEMES as t (t.id)}
+          {@const v = t.id === theme.id ? variant : variantOf(t, t.defaultVariant)}
+          {@const sw = swatchesOf(t, v, t.id === theme.id ? choice.accent : null)}
+          <button
+            class="theme-card"
+            class:on={t.id === theme.id}
+            role="radio"
+            aria-checked={t.id === theme.id}
+            onclick={() => pickTheme(t)}
+            disabled={busy}
+          >
+            <span class="theme-preview" style:background={sw[0]} style:color={sw[1]}>
+              <span class="preview-text">Aa</span>
+              <span class="preview-accent" style:background={sw[2]}></span>
+              <span class="preview-dots">
+                {#each sw.slice(3) as c, n (n)}<i style:background={c}></i>{/each}
+              </span>
+            </span>
+            <span class="theme-name">{t.name}</span>
+          </button>
+        {/each}
+      </div>
+
+      {#if theme.variants.length > 1}
+        <div class="card">
+          <div class="row">
+            <div>
+              <h3>{theme.variantLabel ?? "Variant"}</h3>
+              <p>{theme.id === "default" ? "System follows your computer's light or dark mode." : `${theme.name} comes in ${theme.variants.length} styles.`}</p>
+            </div>
+            <div class="segmented" role="radiogroup" aria-label={theme.variantLabel ?? "Variant"}>
+              {#each theme.variants as v (v.id)}
+                <button
+                  role="radio"
+                  aria-checked={variant.id === v.id}
+                  class:on={variant.id === v.id}
+                  onclick={() => pickVariant(v.id)}
+                  disabled={busy}
+                >{v.name}</button>
+              {/each}
+            </div>
+          </div>
+        </div>
+      {/if}
+
+      <div class="card">
+        <h3>Accent</h3>
+        <p class="muted small">Colours buttons, the selected meme and focus rings.</p>
+        <div class="accents" role="radiogroup" aria-label="Accent">
+          {#each accentsOf(theme) as name (name)}
+            <button
+              class="accent-swatch"
+              class:on={(accent ?? "") === name}
+              role="radio"
+              aria-checked={(accent ?? "") === name}
+              aria-label={label(name)}
+              title={label(name)}
+              onclick={() => pickAccent(name)}
+              disabled={busy}
+            >
+              <i style:background={name ? variant.palette.colors[name] : variant.palette.fg}></i>
+            </button>
+          {/each}
+        </div>
+        <p class="muted small accent-name">{label(accent ?? "")}</p>
+      </div>
+    {:else if section === "tags"}
+      <h1>Tags</h1>
+
+      <div class="card">
+        <form class="row" onsubmit={(e) => { e.preventDefault(); createTag(); }}>
+          <input
+            class="text-input"
+            bind:value={newTag}
+            placeholder="New tag name"
+            aria-label="New tag name"
+            spellcheck="false"
+            autocomplete="off"
+            maxlength="64"
+          />
+          <button class="btn primary sm" type="submit" disabled={busy || !newTag.trim()}>Create tag</button>
+        </form>
+        <p class="note">
+          In the search pane, {isMac ? "⌘" : "Ctrl"}-click memes to select several (Shift-click selects a range), then press
+          <kbd>{isMac ? "⌘" : "Ctrl"}</kbd><kbd>T</kbd> to tag them. Search with <span class="mono-inline">#tag</span>.
+        </p>
+      </div>
+
+      {#if !tags}
+        <p class="muted">Loading…</p>
+      {:else if tags.length === 0}
+        <div class="card">
+          <h3>No tags yet</h3>
+          <p class="muted small">Tags you make here or in the search pane show up on every device.</p>
+        </div>
+      {:else}
+        <div class="card tag-list">
+          {#each tags as t (t.id)}
+            <div class="tag-row">
+              <button
+                class="swatch"
+                data-color={t.color}
+                class:open={coloring === t.id}
+                title="Change colour"
+                aria-label={`Colour of ${t.name}: ${t.color}`}
+                onclick={() => {
+                  coloring = coloring === t.id ? null : t.id;
+                  renamingTag = null;
+                  confirmDeleteTag = null;
+                }}
+              ><span class="tag-dot" data-color={t.color}></span></button>
+              {#if renamingTag === t.id}
+                <form class="tag-rename" onsubmit={(e) => { e.preventDefault(); saveTagName(t); }}>
+                  <input
+                    class="text-input"
+                    bind:value={tagDraft}
+                    use:autofocus
+                    onkeydown={(e) => e.key === "Escape" && (renamingTag = null)}
+                    aria-label={`Rename ${t.name}`}
+                    spellcheck="false"
+                    autocomplete="off"
+                    maxlength="64"
+                  />
+                  <button class="btn ghost sm" type="button" onclick={() => (renamingTag = null)}>Cancel</button>
+                  <button class="btn primary sm" type="submit" disabled={busy || !tagDraft.trim()}>Save</button>
+                </form>
+              {:else}
+                <button class="tag-name" title="Rename" onclick={() => startRenameTag(t)}>
+                  <span class="tag-chip" data-color={t.color}>{t.name}</span>
+                </button>
+                <span class="muted small count">{t.count} meme{t.count === 1 ? "" : "s"}</span>
+                <span class="buttons">
+                  <button class="btn ghost sm" onclick={() => startRenameTag(t)}>Rename</button>
+                  <button class="btn ghost sm danger" onclick={() => deleteTag(t)} disabled={busy}>
+                    {confirmDeleteTag === t.id ? "Delete? Click again" : "Delete"}
+                  </button>
+                </span>
+              {/if}
+            </div>
+            {#if coloring === t.id}
+              <div class="swatches" role="radiogroup" aria-label={`Colour of ${t.name}`}>
+                {#each TAG_COLORS as c (c)}
+                  <button
+                    class="swatch"
+                    class:on={t.color === c}
+                    role="radio"
+                    aria-checked={t.color === c}
+                    aria-label={c}
+                    title={c}
+                    onclick={() => setTagColor(t, c)}
+                    disabled={busy}
+                  ><span class="tag-dot" data-color={c}></span></button>
+                {/each}
+              </div>
+            {/if}
+          {/each}
+        </div>
+        <p class="note top">Deleting a tag takes it off every meme, on every device. The memes stay.</p>
       {/if}
     {:else if section === "text"}
       <h1>Text Search</h1>
@@ -804,6 +1230,103 @@
 
   .side button:hover {
     color: var(--fg);
+  }
+
+  .side-search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    margin: 0 0 10px;
+  }
+
+  .side-search .icon {
+    position: absolute;
+    left: 8px;
+    width: 13px;
+    height: 13px;
+    color: var(--muted-fg);
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    pointer-events: none;
+  }
+
+  .side-search input {
+    width: 100%;
+    height: 28px;
+    padding: 0 8px 0 27px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: 12.5px;
+    outline: none;
+  }
+
+  .side-search input::-webkit-search-cancel-button {
+    display: none;
+  }
+
+  .side-search input:focus {
+    border-color: var(--border-strong);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 15%, transparent);
+  }
+
+  .side-search kbd {
+    position: absolute;
+    right: 6px;
+    color: var(--muted-fg);
+    font: 10.5px "Geist Mono Variable", ui-monospace, monospace;
+    pointer-events: none;
+  }
+
+  .results {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .side .result {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    color: var(--fg);
+  }
+
+  .result .where {
+    color: var(--muted-fg);
+    font-size: 11px;
+  }
+
+  .side .result.active {
+    background: var(--accent);
+  }
+
+  .no-results {
+    margin: 4px 10px;
+    color: var(--muted-fg);
+    font-size: 12px;
+  }
+
+  /* A setting found by search: briefly outlined. */
+  :global(.flash) {
+    animation: flash 1.6s ease-out;
+  }
+
+  @keyframes flash {
+    0%,
+    40% {
+      box-shadow: 0 0 0 2px var(--ring);
+      border-radius: 10px;
+    }
+    100% {
+      box-shadow: 0 0 0 2px transparent;
+      border-radius: 10px;
+    }
   }
 
   .side button.active {
@@ -1240,5 +1763,222 @@
     max-width: 380px;
     margin: 6px auto 0;
     font-size: 11px;
+  }
+
+  /* ---------- tags ---------- */
+
+  .text-input {
+    flex: 1;
+    min-width: 0;
+    height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+
+  .text-input:focus {
+    border-color: var(--border-strong);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 15%, transparent);
+  }
+
+  .mono-inline {
+    font: 12px "Geist Mono Variable", ui-monospace, monospace;
+  }
+
+  .note kbd {
+    vertical-align: 1px;
+  }
+
+  .tag-list {
+    padding: 6px 8px;
+  }
+
+  .tag-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 40px;
+  }
+
+  .tag-row + .tag-row,
+  .swatches + .tag-row {
+    border-top: 1px solid var(--border);
+  }
+
+  .swatch {
+    display: grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    flex-shrink: 0;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    cursor: pointer;
+  }
+
+  .swatch .tag-dot {
+    width: 12px;
+    height: 12px;
+  }
+
+  .swatch:hover:not(:disabled),
+  .swatch.open {
+    background: var(--accent);
+  }
+
+  .swatch.on {
+    border-color: var(--ring);
+  }
+
+  .swatches {
+    display: flex;
+    gap: 4px;
+    padding: 0 0 8px 30px;
+  }
+
+  .tag-name {
+    min-width: 0;
+    padding: 0;
+    border: none;
+    background: none;
+    cursor: pointer;
+  }
+
+  .tag-name .tag-chip {
+    height: 22px;
+    font-size: 12.5px;
+  }
+
+  .count {
+    flex: 1;
+    white-space: nowrap;
+  }
+
+  .tag-rename {
+    display: flex;
+    flex: 1;
+    gap: 6px;
+  }
+
+  /* ---------- appearance ---------- */
+
+  .theme-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .theme-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .theme-card:hover:not(:disabled) {
+    border-color: var(--border-strong);
+  }
+
+  .theme-card.on {
+    border-color: var(--ring);
+    box-shadow: 0 0 0 1px var(--ring);
+  }
+
+  .theme-preview {
+    position: relative;
+    display: block;
+    height: 58px;
+    border-radius: 6px;
+    box-shadow: inset 0 0 0 1px rgb(127 127 127 / 0.25);
+    overflow: hidden;
+  }
+
+  .preview-text {
+    position: absolute;
+    top: 8px;
+    left: 10px;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .preview-accent {
+    position: absolute;
+    top: 12px;
+    right: 10px;
+    width: 26px;
+    height: 12px;
+    border-radius: 999px;
+  }
+
+  .preview-dots {
+    position: absolute;
+    bottom: 9px;
+    left: 10px;
+    display: flex;
+    gap: 4px;
+  }
+
+  .preview-dots i {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+  }
+
+  .theme-name {
+    padding: 0 2px 2px;
+    font-size: 12.5px;
+    font-weight: 500;
+  }
+
+  .accents {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .accent-swatch {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 50%;
+    background: none;
+    cursor: pointer;
+  }
+
+  .accent-swatch i {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    box-shadow: inset 0 0 0 1px rgb(127 127 127 / 0.3);
+  }
+
+  .accent-swatch:hover:not(:disabled) {
+    border-color: var(--border-strong);
+  }
+
+  .accent-swatch.on {
+    border: 2px solid var(--ring);
+  }
+
+  .accent-name {
+    margin: 6px 0 0;
   }
 </style>

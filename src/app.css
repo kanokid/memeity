@@ -15,6 +15,16 @@
   --warning: #f59e0b;
   --popover: #09090b;
   --bar: #0c0c0e;
+  /* Tag colours (tags.rs COLORS). */
+  --tag-blue: #60a5fa;
+  --tag-green: #4ade80;
+  --tag-yellow: #facc15;
+  --tag-orange: #fb923c;
+  --tag-red: #f87171;
+  --tag-pink: #f472b6;
+  --tag-purple: #c084fc;
+  --tag-teal: #2dd4bf;
+  --tag-gray: #a1a1aa;
   color-scheme: dark;
 }
 
@@ -35,6 +45,15 @@
     --warning: #d97706;
     --popover: #ffffff;
     --bar: #fafafa;
+    --tag-blue: #2563eb;
+    --tag-green: #16a34a;
+    --tag-yellow: #a16207;
+    --tag-orange: #ea580c;
+    --tag-red: #dc2626;
+    --tag-pink: #db2777;
+    --tag-purple: #9333ea;
+    --tag-teal: #0d9488;
+    --tag-gray: #71717a;
     color-scheme: light;
   }
 }
@@ -128,3 +147,44 @@ kbd + kbd {
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* A tag, tinted with its colour: <span class="tag-chip" data-color="blue">reaction</span> */
+.tag-chip {
+  --c: var(--tag-gray);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--c) 30%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--c) 14%, transparent);
+  color: var(--c);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Just the colour, e.g. in a list row or a picker. */
+.tag-dot {
+  --c: var(--tag-gray);
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--c);
+}
+
+:is(.tag-chip, .tag-dot)[data-color="blue"] { --c: var(--tag-blue); }
+:is(.tag-chip, .tag-dot)[data-color="green"] { --c: var(--tag-green); }
+:is(.tag-chip, .tag-dot)[data-color="yellow"] { --c: var(--tag-yellow); }
+:is(.tag-chip, .tag-dot)[data-color="orange"] { --c: var(--tag-orange); }
+:is(.tag-chip, .tag-dot)[data-color="red"] { --c: var(--tag-red); }
+:is(.tag-chip, .tag-dot)[data-color="pink"] { --c: var(--tag-pink); }
+:is(.tag-chip, .tag-dot)[data-color="purple"] { --c: var(--tag-purple); }
+:is(.tag-chip, .tag-dot)[data-color="teal"] { --c: var(--tag-teal); }

@@ -353,6 +353,18 @@ pub fn set_scroll_reset(app: AppHandle, secs: u32) -> Result<Status, String> {
     Ok(status(&app))
 }
 
+/// Picks a colour theme. Both windows restyle at once (they refresh on status-changed).
+#[tauri::command]
+pub fn set_theme(app: AppHandle, theme: String, variant: Option<String>, accent: Option<String>) -> Result<Status, String> {
+    let ok = |s: &str| s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if theme.is_empty() || !ok(&theme) || !variant.as_deref().is_none_or(ok) || !accent.as_deref().is_none_or(ok) {
+        return Err("Unknown theme.".into());
+    }
+    update_config(&app, |c| c.theme = Some(crate::config::Theme { theme, variant, accent }));
+    let _ = app.emit("status-changed", ());
+    Ok(status(&app))
+}
+
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<Status, String> {
     let launcher = app.autolaunch();

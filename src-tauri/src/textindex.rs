@@ -6,8 +6,8 @@
 //!      device, so each image is OCR'd once, ever, across all devices),
 //!   2. otherwise runs OCR, writes the sidecar (which then syncs to Drive), and indexes it.
 //!
-//! It also re-reads a sidecar whenever its file changes, which is how tags edited on
-//! another device (milestone 2) will reach this device's search, and it re-reads (with
+//! It also re-reads a sidecar whenever its file changes, which is how tags and pins
+//! set on another device reach this device's search, and it re-reads (with
 //! OCR) any meme whose text came from an older engine, so upgrades apply everywhere.
 
 use crate::index::Index;
@@ -168,16 +168,17 @@ fn run(
         }
         let sc = sidecar::read(&root, &md5);
         if let Some(sc) = &sc {
-            with_index(app, |idx| idx.set_pinned(&md5, sc.pinned))?; // pinned/unpinned on any device
+            // Pinned/unpinned or tagged on any device.
+            with_index(app, |idx| idx.set_pinned(&md5, sc.pinned).and_then(|_| idx.set_meme_tags(&md5, &sc.tags)))?;
         }
         match sc {
             Some(sc) if sc.ocr.is_some() => {
                 let ocr_text = sc.ocr.as_ref().expect("checked above");
                 // Index what we have right away so search works meanwhile...
                 with_index(app, |idx| {
-                    idx.set_text(&rel, &ocr_text.text, &sc.tags, sidecar_mtime, Some(&ocr_text.engine))
+                    idx.set_text(&rel, &ocr_text.text, sidecar_mtime, Some(&ocr_text.engine))
                 })?;
-                app.state::<AppState>().text_cache.lock().unwrap().set(&rel, &ocr_text.text, &sc.tags);
+                app.state::<AppState>().text_cache.lock().unwrap().set(&rel, &ocr_text.text);
                 changed = true;
                 // ...and re-read it if an older engine produced that text.
                 if ocr_text.engine != ocr::ENGINE_NAME && !ocr_text.edited {
@@ -264,8 +265,8 @@ fn run(
                         None
                     }
                 };
-                with_index(app, |idx| idx.set_text(&item.rel, &text, &sc.tags, sidecar_mtime, Some(ocr::ENGINE_NAME)))?;
-                app.state::<AppState>().text_cache.lock().unwrap().set(&item.rel, &text, &sc.tags);
+                with_index(app, |idx| idx.set_text(&item.rel, &text, sidecar_mtime, Some(ocr::ENGINE_NAME)))?;
+                app.state::<AppState>().text_cache.lock().unwrap().set(&item.rel, &text);
             }
             Err(e) => {
                 let attempts = failures.entry(item.rel.clone()).or_insert(0);
@@ -274,7 +275,7 @@ fn run(
                 if *attempts >= OCR_ATTEMPTS {
                     // Really unreadable: index it as text-less so we stop retrying.
                     failures.remove(&item.rel);
-                    with_index(app, |idx| idx.set_text(&item.rel, "", &[], None, Some(ocr::ENGINE_NAME)))?;
+                    with_index(app, |idx| idx.set_text(&item.rel, "", None, Some(ocr::ENGINE_NAME)))?;
                 } else {
                     retry_later = true; // still pending; a later pass tries again
                 }

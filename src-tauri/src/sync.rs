@@ -370,6 +370,7 @@ async fn run_once(app: &AppHandle, kind: SyncKind) {
     }
     if changed {
         crate::usage::load_remote(app); // other devices' uses may have come down
+        crate::tags::load(app); // and tags made, renamed or deleted elsewhere
         refresh_library(app);
     }
     if report.retry_soon {
@@ -508,8 +509,21 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
                 st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
                 false
             } else if is_sidecar {
-                // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy.
-                true
+                // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy,
+                // but keep what the user did here (e.g. tagged it before Drive's arrived).
+                match merge_sidecar(g, item, &path).await {
+                    Ok(true) => {
+                        st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
+                        report.retry_soon = true;
+                        report.counts.downloaded += 1;
+                        false
+                    }
+                    Ok(false) => true,
+                    Err(e) => {
+                        report.errors.push(format!("Download {rel}: {e}"));
+                        continue;
+                    }
+                }
             } else if backed_up(&local) {
                 // Different from Drive's file of this name, but identical to another file
                 // on Drive: nothing would be lost, so don't make (and upload) another copy.
@@ -659,14 +673,14 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
 
 /// A sidecar changed on Drive *and* here. Drive's copy wins, except for what the user
 /// did on this device: text they typed is kept (unless it was also retyped elsewhere),
-/// and a pin is kept. Returns true if the merged sidecar was written locally (and still
+/// a pin is kept, and tags added here are added to Drive's. Returns true if the merged sidecar was written locally (and still
 /// needs uploading), false if Drive's copy should simply be downloaded.
 async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result<bool, String> {
     let local: Option<sidecar::Sidecar> =
         tokio::fs::read(path).await.ok().and_then(|b| serde_json::from_slice(&b).ok());
     let Some(local) = local else { return Ok(false) };
     let typed = local.ocr.filter(|o| o.edited);
-    if typed.is_none() && !local.pinned {
+    if typed.is_none() && !local.pinned && local.tags.is_empty() {
         return Ok(false); // nothing of ours to keep
     }
     let bytes = g.download(&item.id).await?;
@@ -684,6 +698,12 @@ async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result
     if local.pinned && !merged.pinned {
         merged.pinned = true;
         kept = true;
+    }
+    for tag in local.tags {
+        if !merged.tags.contains(&tag) {
+            merged.tags.push(tag);
+            kept = true;
+        }
     }
     if !kept {
         return Ok(false);

@@ -21,6 +21,7 @@ memeity aims to fix this issue by hosting all of your memes on Google Drive - sy
 
 ## Features
 - **Filename and OCR search**:  find your memes however you remember them - or however you don't.
+- **Tags**: color-coded tags that sync everywhere. Select a bunch of memes and tag them at once, then search with `#tag`.
 - **Easy setup with Google Drive**: just log into memeity with Google Drive for a near-instant setup. For your privacy, memeity only sees the files it creates itself and uses only a single folder.
 - **Quickly add memes**: drag and drop, or paste your memes into the pane to instantly process new images!
 - **Quick & powerful built-in editor**: edit and markup your memes & templates in an instant, right inside the memeity pane.

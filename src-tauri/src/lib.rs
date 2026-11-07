@@ -14,6 +14,7 @@ mod ocr;
 mod settings;
 mod sidecar;
 mod sync;
+mod tags;
 mod textindex;
 mod thumbs;
 mod updates;
@@ -28,6 +29,7 @@ use library::{Library, SearchResult};
 use notify::RecommendedWatcher;
 use nucleo_matcher::Matcher;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -62,6 +64,8 @@ pub struct AppState {
     pub index: Mutex<Option<index::Index>>,
     /// Squashed image text per meme, for typo-tolerant text search (kept in sync with `index`).
     pub text_cache: Mutex<fuzzytext::TextCache>,
+    /// Live (not deleted) tags by id, read from their synced files (see tags.rs).
+    pub tags: Mutex<std::collections::BTreeMap<String, tags::TagFile>>,
     /// Wakes the background OCR/indexing worker.
     pub text_tx: std::sync::mpsc::Sender<()>,
     pub ocr_status: Mutex<textindex::OcrStatus>,
@@ -162,6 +166,8 @@ struct Status {
     pane_scale: u32,
     /// Seconds closed before the pane reopens scrolled to the top (0 = every time).
     scroll_reset_secs: u32,
+    /// Colour theme (Settings > Appearance); None = the default.
+    theme: Option<config::Theme>,
     version: String,
 }
 
@@ -288,6 +294,7 @@ fn status(app: &AppHandle) -> Status {
         primary_action: settings::primary_action(app),
         pane_scale: settings::pane_scale(app),
         scroll_reset_secs: settings::scroll_reset_secs(app),
+        theme: config(app).theme,
         version: app.package_info().version.to_string(),
     }
 }
@@ -545,6 +552,7 @@ fn load_library(app: &AppHandle) {
     // Replacing the watcher drops (and stops) the old one.
     *state.watcher.lock().unwrap() = watcher::watch(app.clone(), dir);
     usage::load_remote(app);
+    tags::load(app);
     usage::schedule_flush(app); // publish uses from before syncing usage existed
     let _ = app.emit("library-changed", ());
     textindex::trigger(app);
@@ -632,7 +640,32 @@ fn search(app: AppHandle, query: String, offset: Option<usize>, limit: usize) ->
     let state = app.state::<AppState>();
     /// How many image-text matches to consider for ranking.
     const TEXT_HITS: usize = 500;
-    let text_bonus = if query.trim().is_empty() {
+    // `#name` words filter by tag (by prefix, so results narrow as you type the name);
+    // the rest is searched as usual, and also matches tag names.
+    let (query, tag_words) = tags::split_query(&query);
+    let tag_names = tags::names(&app);
+    let tags_by_rel: HashMap<String, Vec<String>> = state
+        .index
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|idx| idx.tags_by_rel().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(rel, ids)| (rel, ids.into_iter().filter(|id| tag_names.contains_key(id)).collect::<Vec<_>>()))
+        .filter(|(_, ids)| !ids.is_empty())
+        .collect();
+    let has_tag_starting = |rel: &str, prefix: &str| {
+        tags_by_rel.get(rel).is_some_and(|ids| ids.iter().any(|id| tag_names[id].starts_with(prefix)))
+    };
+    let filter: Option<HashSet<String>> = (!tag_words.is_empty()).then(|| {
+        tags_by_rel
+            .keys()
+            .filter(|rel| tag_words.iter().all(|w| has_tag_starting(rel, w)))
+            .cloned()
+            .collect()
+    });
+    let mut text_bonus = if query.trim().is_empty() {
         Default::default()
     } else {
         // Word matches (FTS), plus loose matches that ignore spaces and allow typos.
@@ -646,6 +679,14 @@ fn search(app: AppHandle, query: String, offset: Option<usize>, limit: usize) ->
         let loose = state.text_cache.lock().unwrap().matches(&query);
         library::text_bonuses(&words, &loose)
     };
+    // A word naming a tag (or the start of one) finds the memes tagged with it, like a
+    // strong text match.
+    for word in query.split_whitespace().map(str::to_lowercase) {
+        for rel in tags_by_rel.keys().filter(|rel| has_tag_starting(rel, &word)) {
+            let bonus = library::fuzzy_text_bonus(0);
+            text_bonus.entry(rel.clone()).and_modify(|b| *b = (*b).max(bonus)).or_insert(bonus);
+        }
+    }
     let usage = state
         .index
         .lock()
@@ -662,7 +703,7 @@ fn search(app: AppHandle, query: String, offset: Option<usize>, limit: usize) ->
         .unwrap_or_default();
     let lib = state.library.read().unwrap();
     let mut matcher = state.matcher.lock().unwrap();
-    lib.search(&query, offset.unwrap_or(0), limit, &mut matcher, &text_bonus, &usage, &pinned)
+    lib.search(&query, offset.unwrap_or(0), limit, &mut matcher, &text_bonus, &usage, &pinned, filter.as_ref(), &tags_by_rel)
 }
 
 fn now_ms() -> i64 {
@@ -907,9 +948,9 @@ fn set_meme_text(app: AppHandle, path: String, text: String) -> Result<(), Strin
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64);
     if let Some(idx) = state.index.lock().unwrap().as_ref() {
-        idx.set_text(&rel, &text, &sc.tags, sidecar_mtime, Some(&engine)).map_err(|e| e.to_string())?;
+        idx.set_text(&rel, &text, sidecar_mtime, Some(&engine)).map_err(|e| e.to_string())?;
     }
-    state.text_cache.lock().unwrap().set(&rel, &text, &sc.tags);
+    state.text_cache.lock().unwrap().set(&rel, &text);
     sync::trigger(&app); // upload the edited sidecar
     Ok(())
 }
@@ -1421,6 +1462,12 @@ pub fn run() {
             settings::set_primary_action,
             settings::set_pane_scale,
             settings::set_scroll_reset,
+            settings::set_theme,
+            tags::list_tags,
+            tags::create_tag,
+            tags::update_tag,
+            tags::delete_tag,
+            tags::set_tags,
             settings::reread_all_text,
             settings::open_link,
             import::import_bytes,
@@ -1459,6 +1506,7 @@ pub fn run() {
                 sync_status: Mutex::new(SyncStatus { state: "off", ..Default::default() }),
                 index: Mutex::new(open_index(app.handle())),
                 text_cache: Mutex::new(fuzzytext::TextCache::default()),
+                tags: Mutex::new(Default::default()),
                 text_tx,
                 ocr_status: Mutex::new(textindex::OcrStatus { state: "idle", ..Default::default() }),
                 arrived: Mutex::new(Default::default()),
@@ -1489,8 +1537,8 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 let texts = state.index.lock().unwrap().as_ref().and_then(|idx| idx.all_texts().ok());
                 let mut cache = state.text_cache.lock().unwrap();
-                for (rel, text, tags) in texts.unwrap_or_default() {
-                    cache.set(&rel, &text, &tags);
+                for (rel, text) in texts.unwrap_or_default() {
+                    cache.set(&rel, &text);
                 }
             }
 

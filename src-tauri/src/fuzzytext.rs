@@ -84,18 +84,15 @@ fn all_words(words: &[Vec<char>], text: &[char]) -> Option<usize> {
     words.iter().try_fold(0, |total, w| Some(total + substring_distance(w, text, allowed_errors(w.len()))?))
 }
 
-/// Squashed image text (and tags) per meme, keyed by library-relative path.
+/// Squashed image text per meme, keyed by library-relative path.
 #[derive(Default)]
 pub struct TextCache {
     texts: HashMap<String, Vec<char>>,
 }
 
 impl TextCache {
-    pub fn set(&mut self, rel: &str, text: &str, tags: &[String]) {
-        let mut squashed = squash(text);
-        for tag in tags {
-            squashed.extend(squash(tag));
-        }
+    pub fn set(&mut self, rel: &str, text: &str) {
+        let squashed = squash(text);
         if squashed.is_empty() {
             self.texts.remove(rel);
         } else {
@@ -167,8 +164,8 @@ mod tests {
     #[test]
     fn every_word_somewhere_matches_in_any_order() {
         let mut cache = TextCache::default();
-        cache.set("will.png", "WILLIT\nWORK?\nwavy.khOlil 2\nhi lol\nReply", &[]);
-        cache.set("other.png", "will it blend", &[]);
+        cache.set("will.png", "WILLIT\nWORK?\nwavy.khOlil 2\nhi lol\nReply");
+        cache.set("other.png", "will it blend");
         assert_eq!(cache.matches("will it work hi lol"), vec![("will.png".to_string(), 1)], "stray text in between");
         assert_eq!(cache.matches("lol will work").len(), 1, "any order");
         assert!(cache.matches("will it work tomorrow").is_empty(), "every word must be there");
@@ -188,12 +185,11 @@ mod tests {
     #[test]
     fn cache_finds_and_forgets() {
         let mut cache = TextCache::default();
-        cache.set("a.png", "IWILL BE THERE", &[]);
-        cache.set("b.png", "nobody: absolutely nobody", &["cat".into()]);
-        cache.set("c.png", "", &[]);
+        cache.set("a.png", "IWILL BE THERE");
+        cache.set("b.png", "nobody: absolutely nobody");
+        cache.set("c.png", "");
         let hits = cache.matches("i will be there");
         assert_eq!(hits, vec![("a.png".to_string(), 0)]);
-        assert_eq!(cache.matches("cat").len(), 1, "tags count too");
         assert!(cache.matches("xy").is_empty(), "too short");
         cache.retain(&HashSet::from(["b.png".to_string()]));
         assert!(cache.matches("will be there").is_empty());
@@ -217,7 +213,7 @@ mod bench {
         for i in 0..2000 {
             // A realistic library: varied captions, few containing any given phrase.
             let text = if i % 100 == 0 { lines[0] } else { lines[1 + i % 4] };
-            cache.set(&format!("m{i}.png"), &format!("{text} {i}"), &[]);
+            cache.set(&format!("m{i}.png"), &format!("{text} {i}"));
         }
         for query in ["realize it was in production", "realise it waz in prodution", "keyboard"] {
             let started = std::time::Instant::now();

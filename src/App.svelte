@@ -2,7 +2,9 @@
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount, tick } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import Setup from "./Setup.svelte";
+  import { applyTheme, type ThemeChoice } from "./themes";
   import logo from "./assets/logo.png";
 
   type Hit = {
@@ -17,7 +19,10 @@
     version: number;
     /** Pinned to the top of the pane (synced to every device). */
     pinned: boolean;
+    /** Ids of its tags (see `tagList` for names and colours). */
+    tags: string[];
   };
+  type Tag = { id: string; name: string; color: string; count: number };
   type SearchResult = { hits: Hit[]; total: number; micros: number };
   type DriveFolder = { id: string; name: string };
   type SyncStatus = {
@@ -39,6 +44,8 @@
     client_file: string | null;
     /** What Enter / click does; Shift does the other. Set in Settings > General. */
     primary_action: "paste" | "copy";
+    /** Colour theme (Settings > Appearance). */
+    theme: ThemeChoice | null;
   };
   type OcrStatus = {
     state: "idle" | "preparing" | "reading" | "unavailable";
@@ -72,6 +79,10 @@
   /** The OS asks for less motion: GIFs only play when selected, not on hover. */
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const stage = $derived(status?.stage);
+  // Restyle whenever the theme changes (Settings emits status-changed).
+  $effect(() => {
+    if (status) applyTheme(status.theme);
+  });
   const current = $derived(hits[selected]);
 
   /**
@@ -84,6 +95,263 @@
     return `${convertFileSrc(hit.path, "thumb")}?v=${hit.version}`;
   }
   let confirmDelete = $state<Hit | null>(null);
+
+  // ---------- tags ----------
+
+  /** Every tag (synced across devices), sorted by name. */
+  let tagList = $state<Tag[]>([]);
+  const tagById = $derived(new Map(tagList.map((t) => [t.id, t])));
+  /** A meme's tags, by name. Ids of tags deleted elsewhere (not synced yet) are skipped. */
+  const tagsOf = (hit: Hit) =>
+    hit.tags
+      .map((id) => tagById.get(id))
+      .filter((t): t is Tag => !!t)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+  async function loadTags() {
+    try {
+      tagList = await invoke<Tag[]>("list_tags");
+    } catch {
+      // not set up yet: no tags to show
+    }
+  }
+
+  /** Same tidying as tags.rs `normalize`, to show what "Create" will make. */
+  const normalizeTag = (name: string) =>
+    name
+      .trim()
+      .replace(/^#+/, "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}_\s-]/gu, "")
+      .replace(/[\s-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 32)
+      .replace(/-+$/, "");
+
+  /** Searches for memes with this tag. */
+  function searchTag(tag: Tag) {
+    query = `#${tag.name} `;
+    showDetails = false;
+    input?.focus();
+    onInput();
+  }
+
+  /** Memes marked with Cmd/Ctrl+click, to tag many at once. Kept across searches. */
+  const marked = new SvelteMap<string, Hit>();
+  const isMarkClick = (e: MouseEvent) => (isMac ? e.metaKey : e.ctrlKey);
+
+  /** Where a Shift+click range starts: the meme last marked or unmarked (by path). */
+  let markAnchor: string | null = null;
+
+  function toggleMark(i: number) {
+    const hit = hits[i];
+    if (!hit) return;
+    if (marked.has(hit.path)) marked.delete(hit.path);
+    else marked.set(hit.path, hit);
+    markAnchor = hit.path;
+    select(i);
+  }
+
+  /** Marks every result from the anchor (or the selected meme) to `i`, in result order. */
+  function markRange(i: number) {
+    if (!hits[i]) return;
+    const found = markAnchor ? hits.findIndex((h) => h.path === markAnchor) : -1;
+    const from = found >= 0 ? found : selected;
+    for (let k = Math.min(from, i); k <= Math.max(from, i); k++) marked.set(hits[k].path, hits[k]);
+    markAnchor = hits[i].path;
+    select(i);
+  }
+
+  /**
+   * Cmd/Ctrl+click marks one meme; Shift+click marks a range while some are marked
+   * (Cmd/Ctrl+Shift+click always does). Returns true if the click was a marking one.
+   */
+  function markClick(e: MouseEvent, i: number) {
+    if (e.shiftKey && (isMarkClick(e) || marked.size > 0)) markRange(i);
+    else if (isMarkClick(e)) toggleMark(i);
+    else return false;
+    return true;
+  }
+
+  /** The tag picker (Cmd/Ctrl+T): tags on the marked memes, or else the selected one. */
+  let picker = $state<{ paths: string[] } | null>(null);
+  let pickerQuery = $state("");
+  let pickerSel = $state(0);
+  let pickerInput: HTMLInputElement | undefined = $state();
+  let pickerList: HTMLDivElement | undefined = $state();
+  const PICKER_W = 260;
+
+  type PickerRow = { kind: "tag"; tag: Tag; state: "all" | "some" | "none" } | { kind: "create"; name: string };
+
+  const pickerTargets = $derived(
+    (picker?.paths ?? []).map((p) => hits.find((h) => h.path === p) ?? marked.get(p)).filter((h): h is Hit => !!h),
+  );
+
+  const pickerRows = $derived.by((): PickerRow[] => {
+    const q = normalizeTag(pickerQuery);
+    const rows: PickerRow[] = tagList
+      .filter((t) => !q || t.name.includes(q))
+      .map((tag): PickerRow & { kind: "tag" } => {
+        const n = pickerTargets.filter((h) => h.tags.includes(tag.id)).length;
+        return { kind: "tag", tag, state: n === 0 ? "none" : n === pickerTargets.length ? "all" : "some" };
+      })
+      // Names starting with what's typed first.
+      .sort((a, b) => Number(!a.tag.name.startsWith(q)) - Number(!b.tag.name.startsWith(q)));
+    if (q && !tagList.some((t) => t.name === q)) rows.push({ kind: "create", name: q });
+    return rows;
+  });
+
+  $effect(() => {
+    if (pickerSel >= pickerRows.length) pickerSel = Math.max(0, pickerRows.length - 1);
+  });
+
+  // Keep the highlighted row in view while arrowing through a long list.
+  $effect(() => {
+    void pickerSel;
+    pickerList?.querySelector(".active")?.scrollIntoView({ block: "nearest" });
+  });
+
+  async function openPicker(paths?: string[]) {
+    const targets = paths ?? (marked.size ? [...marked.keys()] : current ? [current.path] : []);
+    if (!targets.length || stage !== "ready") return;
+    menu = null;
+    confirmDelete = null;
+    picker = { paths: targets };
+    pickerQuery = "";
+    pickerSel = 0;
+    await tick();
+    pickerInput?.focus();
+  }
+
+  function closePicker() {
+    picker = null;
+    input?.focus();
+  }
+
+  /** Ticks (or unticks) a tag on every target, or creates a tag and ticks it. */
+  const applyPickerRow = (row: PickerRow | undefined) =>
+    act(async () => {
+      if (!picker || !row) return;
+      const paths = picker.paths;
+      let id: string;
+      let adding: boolean;
+      if (row.kind === "create") {
+        id = (await invoke<Tag>("create_tag", { name: row.name })).id;
+        adding = true;
+        pickerQuery = "";
+      } else {
+        id = row.tag.id;
+        adding = row.state !== "all"; // some or none: add to the rest; all: take it off
+      }
+      await invoke("set_tags", { paths, add: adding ? [id] : [], remove: adding ? [] : [id] });
+      // Marked memes scrolled out of the results still show the change.
+      for (const p of paths) {
+        const h = marked.get(p);
+        if (h) marked.set(p, { ...h, tags: adding ? [...new Set([...h.tags, id])] : h.tags.filter((t) => t !== id) });
+      }
+      await Promise.all([loadTags(), runSearch(false)]);
+    });
+
+  function onPickerKey(e: KeyboardEvent) {
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (e.key === "Escape" && tagMenu) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeTagMenu();
+    } else if (e.key === "Escape" || (ctrl && e.key.toLowerCase() === "t")) {
+      e.preventDefault();
+      e.stopPropagation();
+      closePicker();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = pickerRows.length;
+      if (n) pickerSel = (pickerSel + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      applyPickerRow(pickerRows[pickerSel]);
+    }
+  }
+
+  // ---------- right-click a tag: rename it, change its colour ----------
+
+  /** Same order as tags.rs COLORS. */
+  const TAG_COLORS = ["blue", "green", "yellow", "orange", "red", "pink", "purple", "teal", "gray"];
+  const TAG_MENU_W = 232;
+  let tagMenu = $state<{ id: string; x: number; y: number; renaming: boolean } | null>(null);
+  let tagMenuDraft = $state("");
+  let tagMenuInput: HTMLInputElement | undefined = $state();
+  let tagMenuEl: HTMLDivElement | undefined = $state();
+  /** The tag the menu is for, kept current as renames/recolours come back. */
+  const tagMenuTag = $derived(tagMenu ? tagById.get(tagMenu.id) : undefined);
+
+  function openTagMenu(e: MouseEvent, tag: Tag) {
+    e.preventDefault();
+    e.stopPropagation();
+    menu = null;
+    tagMenu = { id: tag.id, x: e.clientX, y: e.clientY, renaming: false };
+  }
+
+  // Keep the menu inside the pane once its size is known.
+  $effect(() => {
+    const m = tagMenu;
+    const el = tagMenuEl;
+    if (!m || !el) return;
+    const { width, height } = el.getBoundingClientRect();
+    const x = Math.max(MENU_MARGIN, Math.min(m.x, window.innerWidth - width - MENU_MARGIN));
+    const y = Math.max(MENU_MARGIN, Math.min(m.y, window.innerHeight - height - MENU_MARGIN));
+    if (x !== m.x || y !== m.y) tagMenu = { ...m, x, y };
+  });
+
+  /** Closes the tag menu, giving focus back to the picker (if open) or the search. */
+  function closeTagMenu() {
+    tagMenu = null;
+    (picker ? pickerInput : input)?.focus();
+  }
+
+  async function startTagRename() {
+    if (!tagMenu || !tagMenuTag) return;
+    tagMenuDraft = tagMenuTag.name;
+    tagMenu = { ...tagMenu, renaming: true };
+    await tick();
+    tagMenuInput?.focus();
+    tagMenuInput?.select();
+  }
+
+  const updateTag = (changes: { name?: string; color?: string }) =>
+    act(async () => {
+      if (!tagMenu) return;
+      tagList = await invoke<Tag[]>("update_tag", { id: tagMenu.id, ...changes });
+      if (changes.name !== undefined) closeTagMenu(); // a colour pick keeps it open to try another
+    });
+
+  function onTagMenuKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (tagMenu?.renaming) tagMenu = { ...tagMenu, renaming: false };
+      else closeTagMenu();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      const name = tagMenuDraft.trim();
+      if (name && name !== tagMenuTag?.name) updateTag({ name });
+      else closeTagMenu();
+    }
+  }
+
+  /** Typing `#ta` at the end of the search: matching tags; Tab completes the first. */
+  const tagSuggestions = $derived.by(() => {
+    const m = /(?:^|\s)#([^\s#]*)$/.exec(query);
+    if (!m) return [];
+    const q = m[1].toLowerCase();
+    return tagList.filter((t) => t.name.startsWith(q) && t.name !== q).slice(0, 8);
+  });
+
+  function completeTag(tag: Tag) {
+    query = query.replace(/#[^\s#]*$/, `#${tag.name} `);
+    input?.focus();
+    onInput();
+  }
 
   // ---------- quick editor ----------
 
@@ -707,6 +975,7 @@
     if (seq !== searchSeq) return; // a newer keystroke already won
     hits = res.hits;
     total = res.total;
+    for (const h of hits) if (marked.has(h.path)) marked.set(h.path, h); // fresh tags
     selected = resetSelection ? 0 : Math.min(selected, Math.max(hits.length - 1, 0));
     if (resetSelection) (view === "list" ? list : grid)?.scrollTo({ top: 0 });
     const found = followPending();
@@ -986,6 +1255,22 @@
       danger: false,
       run: (i: number) => togglePin(i),
     },
+    {
+      label: "Tags…",
+      keys: `${MOD} T`,
+      danger: false,
+      run: (i: number) => {
+        const hit = hits[i];
+        // On a marked meme it tags them all; on any other, just that one.
+        if (hit) openPicker(marked.has(hit.path) ? undefined : [hit.path]);
+      },
+    },
+    {
+      label: hits[menu?.index ?? selected] && marked.has(hits[menu?.index ?? selected].path) ? "Deselect" : "Select",
+      keys: `${MOD} Click`,
+      danger: false,
+      run: (i: number) => toggleMark(i),
+    },
     { label: "Edit…", keys: `${MOD} E`, danger: false, run: (i: number) => openEditor(i) },
     { label: "Show in Folder", keys: `${MOD} Shift F`, danger: false, run: (i: number) => reveal(i) },
     {
@@ -1065,6 +1350,16 @@
       hideNumbers();
     }
 
+    if (tagMenu && key === "Escape") {
+      e.preventDefault();
+      closeTagMenu();
+      return;
+    }
+    if (picker && key === "Escape") {
+      e.preventDefault();
+      closePicker();
+      return;
+    }
     // Typing in an edit field (rename, text): leave the keys to it.
     const target = e.target;
     if (target instanceof HTMLTextAreaElement || (target instanceof HTMLInputElement && target !== input)) return;
@@ -1105,6 +1400,10 @@
       e.preventDefault();
       if (confirmDelete) confirmDelete = null;
       else if (showDetails) toggleDetails(false);
+      else if (marked.size) {
+        marked.clear();
+        markAnchor = null;
+      }
       else if (stage === "ready") invoke("hide"); // the setup window doesn't vanish on Esc
       return;
     }
@@ -1147,6 +1446,8 @@
       if (ctrl && key.toLowerCase() === "k") { e.preventDefault(); openActions(); return; }
       if (ctrl && key.toLowerCase() === "i") { e.preventDefault(); toggleDetails(); return; }
       if (ctrl && key.toLowerCase() === "e") { e.preventDefault(); openEditor(); return; }
+      if (ctrl && key.toLowerCase() === "t") { e.preventDefault(); openPicker(); return; }
+      if (key === "Tab" && target === input && tagSuggestions.length) { e.preventDefault(); completeTag(tagSuggestions[0]); return; }
       if (ctrl && !e.shiftKey && key.toLowerCase() === "p") { e.preventDefault(); togglePin(); return; }
       if (ctrl && e.shiftKey && key.toLowerCase() === "f") { e.preventDefault(); reveal(); return; }
       switch (key) {
@@ -1185,6 +1486,7 @@
         error = null;
         confirmDelete = null;
         menu = null;
+        picker = null;
         input?.focus();
         input?.select(); // typing replaces the last query, arrows keep it
         refresh();
@@ -1194,9 +1496,16 @@
         if (editing || stage !== "ready") return;
         confirmDelete = null;
         menu = null;
+        picker = null;
+        marked.clear();
+        markAnchor = null;
         refresh(true);
       }),
       listen("library-changed", () => refresh()),
+      listen("tags-changed", () => {
+        loadTags();
+        if (stage === "ready") runSearch(false);
+      }),
       listen("sync-status", () => refresh()),
       listen("status-changed", () => refresh()), // e.g. a new shortcut picked in Settings
       listen("ocr-status", async () => {
@@ -1210,6 +1519,7 @@
     ];
     const timer = setInterval(() => (now = Date.now()), 5000);
     refresh(true).then(() => input?.focus());
+    loadTags();
     return () => {
       clearInterval(timer);
       unlisten.forEach((p) => p.then((f) => f()));
@@ -1246,6 +1556,9 @@
   oncontextmenu={onContextMenu}
   onmousedown={(e) => {
     if (menu && !(e.target instanceof Element && e.target.closest(".menu"))) menu = null;
+    const inside = (sel: string) => e.target instanceof Element && !!e.target.closest(sel);
+    if (tagMenu && !inside(".tag-menu")) tagMenu = null;
+    if (picker && !inside(".picker, .tag-menu")) picker = null;
   }}
   onblur={() => {
     menu = null;
@@ -1277,6 +1590,38 @@
   </svg>
 {/snippet}
 
+{#snippet checkIcon()}
+  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+{/snippet}
+
+<!-- A meme's tags in the details / list preview: click one to search by it. -->
+{#snippet tagsBlock(hit: Hit)}
+  {@const list = tagsOf(hit)}
+  <div class="tags-block">
+    <div class="file-row">
+      <p class="label">Tags</p>
+      <button class="link-btn" onclick={() => openPicker([hit.path])} title={`Tags (${MOD}${isMac ? "" : "+"}T)`}>
+        {list.length ? "Edit" : "Add"}
+      </button>
+    </div>
+    {#if list.length}
+      <div class="chips">
+        {#each list as t (t.id)}
+          <button
+            class="tag-chip"
+            data-color={t.color}
+            title={`Show memes tagged ${t.name} (right-click to rename or recolour)`}
+            onclick={() => searchTag(t)}
+            oncontextmenu={(e) => openTagMenu(e, t)}
+          >
+            {t.name}
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet folderIcon()}
   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
     <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
@@ -1301,7 +1646,7 @@
         aria-autocomplete="list"
         aria-controls="results"
         aria-activedescendant={current ? `meme-${selected}` : undefined}
-        placeholder={status?.count ? `Search ${status.count} memes by name or text…` : "Search memes…"}
+        placeholder={status?.count ? `Search ${status.count} memes by name, text or #tag…` : "Search memes…"}
         spellcheck="false"
         autocomplete="off"
       />
@@ -1348,6 +1693,20 @@
         </svg>
       </button>
     </header>
+    {#if tagSuggestions.length}
+      <div class="suggest" aria-label="Matching tags">
+        {#each tagSuggestions as t (t.id)}
+          <button
+            class="tag-chip"
+            data-color={t.color}
+            onmousedown={(e) => e.preventDefault()}
+            onclick={() => completeTag(t)}
+            oncontextmenu={(e) => openTagMenu(e, t)}
+          >#{t.name}</button>
+        {/each}
+        <span class="suggest-hint"><kbd>Tab</kbd> to complete</span>
+      </div>
+    {/if}
   {/if}
 
   {#if status?.shortcut_error}
@@ -1457,6 +1816,7 @@
                 <button
                   class="row"
                   class:selected={i === selected}
+                  class:marked={marked.has(hit.path)}
                   class:doomed={confirmDelete?.path === hit.path}
                   role="option"
                   id={`meme-${i}`}
@@ -1466,18 +1826,25 @@
                   style:top="{LIST_PAD + i * ROW_H}px"
                   title={hit.rel}
                   onmousedown={(e) => pressItem(e, i)}
-                  onclick={() => {
-                    if (!clickWasDrag()) select(i);
+                  onclick={(e) => {
+                    if (clickWasDrag() || markClick(e, i)) return;
+                    select(i);
                   }}
-                  ondblclick={(e) => (e.shiftKey ? secondary(i) : primary(i))}
+                  ondblclick={(e) => {
+                    if (isMarkClick(e) || (e.shiftKey && marked.size)) return; // marking, not acting
+                    if (e.shiftKey) secondary(i);
+                    else primary(i);
+                  }}
                   oncontextmenu={(e) => openMenuAt(e, i)}
                 >
                   {#if showNumbers && i < 9}<kbd class="num">{i + 1}</kbd>{/if}
+                  {#if marked.has(hit.path)}<span class="mark-badge row-mark">{@render checkIcon()}</span>{/if}
                   <img src={tileSrc(hit, false)} alt="" loading="lazy" decoding="async" draggable="false" />
                   <span class="row-text">
                     <span class="row-name">
                       {#if hit.pinned}<span class="pin-inline" title="Pinned">{@render pinIcon()}</span>{/if}
                       {stemOf(hit.name)}
+                      {#each tagsOf(hit) as t (t.id)}<span class="tag-dot row-dot" data-color={t.color} title={t.name}></span>{/each}
                     </span>
                     <span class="row-meta">{[fileType(hit), sizeLabel(hit), folderOf(hit)].filter(Boolean).join(" · ")}</span>
                   </span>
@@ -1501,6 +1868,7 @@
               <p class="facts">
                 {[fileType(current) + (current.animated ? " (animated)" : ""), sizeLabel(current)].filter(Boolean).join(" · ")}
               </p>
+              {@render tagsBlock(current)}
               <!-- A meme with no text in it gets no text section at all (Edit Text… in the
                    actions menu can still add some). -->
               {#if !(details?.state === "read" && !details.text)}
@@ -1548,6 +1916,7 @@
                 <button
                   class="tile"
                   class:selected={i === selected}
+                  class:marked={marked.has(hit.path)}
                   class:doomed={confirmDelete?.path === hit.path}
                   data-i={i}
                   role="option"
@@ -1560,6 +1929,7 @@
                   onmousedown={(e) => pressItem(e, i)}
                   onclick={(e) => {
                     if (clickWasDrag()) return;
+                    if (markClick(e, i)) return; // marking memes to tag together
                     // GIF-picker style: one click acts, same as Enter (Shift = Shift+Enter).
                     select(i);
                     if (e.shiftKey) secondary(i);
@@ -1572,6 +1942,7 @@
                   <img src={tileSrc(hit, active)} alt={hit.name} loading="lazy" decoding="async" draggable="false" />
                   {#if showNumbers && i < 9}<kbd class="num">{i + 1}</kbd>{/if}
                   {#if hit.pinned}<span class="pin-badge" title="Pinned">{@render pinIcon()}</span>{/if}
+                  {#if marked.has(hit.path)}<span class="mark-badge" title="Selected">{@render checkIcon()}</span>{/if}
                 </button>
               {/each}
             </div>
@@ -1608,6 +1979,8 @@
               <button class="link-btn" onclick={startRename} title="Rename (F2)">Rename</button>
             </div>
           {/if}
+
+          {@render tagsBlock(current)}
 
           <div class="file-row">
             <p class="label">Text in image</p>
@@ -1668,6 +2041,18 @@
       <button class="btn ghost sm" onclick={() => (confirmDelete = null)}>Cancel <kbd>Esc</kbd></button>
       <button class="btn destructive sm" onclick={() => confirmDelete && doDelete(confirmDelete)} disabled={busy}>
         Delete <kbd>↵</kbd>
+      </button>
+    {:else if stage === "ready" && marked.size}
+      <span class="status marked-count">{marked.size} selected</span>
+      <span class="spacer"></span>
+      <button class="action" onclick={() => { marked.clear(); markAnchor = null; }}>Clear <kbd>Esc</kbd></button>
+      <span class="divider"></span>
+      <button class="action primary-action" onclick={() => openPicker()}>
+        <svg class="icon action-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z" />
+          <circle cx="7.5" cy="7.5" r=".5" fill="currentColor" />
+        </svg>
+        Tag {marked.size} <kbd>{MOD}</kbd><kbd>T</kbd>
       </button>
     {:else}
       {#if stage === "ready" && status}
@@ -1780,6 +2165,97 @@
         <span>{a.label}</span><span class="keys">{a.keys}</span>
       </button>
     {/each}
+  </div>
+{/if}
+
+{#if tagMenu && tagMenuTag}
+  <div
+    class="menu tag-menu"
+    role="dialog"
+    aria-label={`Edit tag ${tagMenuTag.name}`}
+    bind:this={tagMenuEl}
+    style:left="{tagMenu.x}px"
+    style:top="{tagMenu.y}px"
+    style:width="{TAG_MENU_W}px"
+  >
+    {#if tagMenu.renaming}
+      <input
+        class="picker-input"
+        bind:this={tagMenuInput}
+        bind:value={tagMenuDraft}
+        onkeydown={onTagMenuKey}
+        aria-label={`Rename ${tagMenuTag.name}`}
+        spellcheck="false"
+        autocomplete="off"
+        maxlength="64"
+      />
+      <p class="picker-hint"><kbd>↵</kbd> rename <kbd>Esc</kbd> cancel</p>
+    {:else}
+      <p class="picker-title"><span class="tag-chip" data-color={tagMenuTag.color}>{tagMenuTag.name}</span></p>
+      <button role="menuitem" onclick={startTagRename}><span>Rename…</span></button>
+      <div class="menu-sep"></div>
+      <p class="picker-title">Colour</p>
+      <div class="swatches" role="radiogroup" aria-label="Colour">
+        {#each TAG_COLORS as c (c)}
+          <button
+            class="swatch"
+            class:on={tagMenuTag.color === c}
+            role="radio"
+            aria-checked={tagMenuTag.color === c}
+            aria-label={c}
+            title={c}
+            onclick={() => updateTag({ color: c })}
+            disabled={busy}
+          ><span class="tag-dot" data-color={c}></span></button>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/if}
+
+{#if picker}
+  <div class="menu picker" role="dialog" aria-label="Tags" style:width="{PICKER_W}px">
+    <p class="picker-title">{picker.paths.length === 1 ? "Tags" : `Tags for ${picker.paths.length} memes`}</p>
+    <input
+      class="picker-input"
+      bind:this={pickerInput}
+      bind:value={pickerQuery}
+      oninput={() => (pickerSel = 0)}
+      onkeydown={onPickerKey}
+      placeholder={tagList.length ? "Find or create a tag…" : "Name your first tag…"}
+      aria-label="Find or create a tag"
+      spellcheck="false"
+      autocomplete="off"
+    />
+    <div class="picker-list" bind:this={pickerList} role="menu">
+      {#each pickerRows as row, n (row.kind === "tag" ? row.tag.id : `create:${row.name}`)}
+        <button
+          role="menuitemcheckbox"
+          aria-checked={row.kind === "tag" ? (row.state === "some" ? "mixed" : row.state === "all") : false}
+          class:active={n === pickerSel}
+          onmouseenter={() => (pickerSel = n)}
+          onmousedown={(e) => e.preventDefault()}
+          onclick={() => applyPickerRow(row)}
+          oncontextmenu={(e) => row.kind === "tag" && openTagMenu(e, row.tag)}
+          disabled={busy}
+        >
+          {#if row.kind === "tag"}
+            <span class="check" class:on={row.state !== "none"}>
+              {#if row.state === "all"}{@render checkIcon()}{:else if row.state === "some"}<i class="some"></i>{/if}
+            </span>
+            <span class="tag-dot" data-color={row.tag.color}></span>
+            <span class="picker-name">{row.tag.name}</span>
+            <span class="keys">{row.tag.count}</span>
+          {:else}
+            <span class="check plus">+</span>
+            <span class="picker-name">Create <b>{row.name}</b></span>
+          {/if}
+        </button>
+      {:else}
+        <p class="picker-empty">{tagList.length ? "No tags match." : "No tags yet."}</p>
+      {/each}
+    </div>
+    <p class="picker-hint"><kbd>↵</kbd> toggle <kbd>Esc</kbd> done <span class="spacer"></span> right-click to edit</p>
   </div>
 {/if}
 
@@ -2780,5 +3256,253 @@
     height: 1px;
     margin: 4px -4px;
     background: var(--border);
+  }
+
+  /* ---------- tags ---------- */
+
+  .tags-block {
+    margin: 0 0 14px;
+  }
+
+  .list-preview .tags-block {
+    margin: 0;
+  }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 2px;
+  }
+
+  button.tag-chip {
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  button.tag-chip:hover {
+    background: color-mix(in srgb, var(--c) 26%, transparent);
+  }
+
+  /* `#ta` typed in the search: the tags it could be. */
+  .suggest {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 18px;
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .suggest-hint {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    color: var(--muted-fg);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .row-dot {
+    width: 7px;
+    height: 7px;
+    margin-left: 5px;
+    vertical-align: 1px;
+  }
+
+  /* Marked with Cmd/Ctrl+click, to tag together. */
+  .mark-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--primary);
+    color: var(--primary-fg);
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+  }
+
+  .mark-badge .icon {
+    width: 13px;
+    height: 13px;
+    stroke-width: 3;
+  }
+
+  .mark-badge.row-mark {
+    top: 4px;
+    left: 4px;
+    width: 18px;
+    height: 18px;
+  }
+
+  .tile.marked {
+    outline-color: color-mix(in srgb, var(--ring) 70%, transparent);
+  }
+
+  .tile.marked img {
+    filter: brightness(0.75);
+  }
+
+  .row.marked {
+    background: color-mix(in srgb, var(--ring) 7%, transparent);
+  }
+
+  .marked-count {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  /* ---------- tag picker ---------- */
+
+  .picker {
+    right: 10px;
+    bottom: 52px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .picker-title {
+    margin: 4px 6px 6px;
+    color: var(--muted-fg);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  input.picker-input {
+    flex: none;
+    height: 30px;
+    margin: 0 2px 4px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 13px;
+    letter-spacing: 0;
+  }
+
+  input.picker-input:focus {
+    border-color: var(--border-strong);
+  }
+
+  .picker-list {
+    max-height: 232px;
+    overflow-y: auto;
+  }
+
+  .picker-list button {
+    justify-content: flex-start;
+    gap: 8px;
+  }
+
+  .picker-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .check {
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+  }
+
+  .check.on {
+    border-color: var(--primary);
+    background: var(--primary);
+    color: var(--primary-fg);
+  }
+
+  .check .icon {
+    width: 12px;
+    height: 12px;
+    stroke-width: 3;
+  }
+
+  .check .some {
+    width: 8px;
+    height: 2px;
+    border-radius: 1px;
+    background: currentColor;
+  }
+
+  .check.plus {
+    border-style: dashed;
+    color: var(--muted-fg);
+    font-size: 13px;
+    line-height: 1;
+  }
+
+  .picker-empty {
+    margin: 8px;
+    color: var(--muted-fg);
+    font-size: 12px;
+  }
+
+  .picker-hint {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 6px 6px 2px;
+    color: var(--muted-fg);
+    font-size: 11px;
+  }
+
+  .picker-hint kbd + kbd {
+    margin-left: 6px;
+  }
+
+  /* ---------- tag menu (right-click a tag) ---------- */
+
+  .tag-menu {
+    display: flex;
+    flex-direction: column;
+    z-index: 11; /* above the picker */
+  }
+
+  .tag-menu .picker-title .tag-chip {
+    max-width: 100%;
+  }
+
+  .tag-menu .swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 0 2px 2px;
+  }
+
+  .tag-menu .swatch {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .tag-menu .swatch:hover:not(:disabled) {
+    background: var(--accent);
+  }
+
+  .tag-menu .swatch.on {
+    border-color: var(--ring);
+  }
+
+  .tag-menu .swatch .tag-dot {
+    width: 12px;
+    height: 12px;
   }
 </style>

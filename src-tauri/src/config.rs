@@ -9,6 +9,18 @@ pub struct DriveFolder {
     pub name: String,
 }
 
+/// A colour theme choice. The themes themselves live in the frontend (src/themes.ts),
+/// which falls back to defaults for anything it doesn't know.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Theme {
+    pub theme: String,
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// None = the theme's default accent; "" = no accent (monochrome).
+    #[serde(default)]
+    pub accent: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Signed-in Google account, for display only. The token lives in the OS keychain.
@@ -33,6 +45,9 @@ pub struct Config {
     /// 0 = every time. None = the default (60).
     #[serde(default)]
     pub scroll_reset_secs: Option<u32>,
+    /// Colour theme (see src/themes.ts). None = memeity's own, following the system.
+    #[serde(default)]
+    pub theme: Option<Theme>,
     /// Random id for this device; names its usage file in the synced folder (usage.rs).
     #[serde(default)]
     pub device_id: Option<String>,
