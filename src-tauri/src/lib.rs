@@ -29,7 +29,7 @@ use notify::RecommendedWatcher;
 use nucleo_matcher::Matcher;
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use sync::SyncStatus;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -89,6 +89,9 @@ pub struct AppState {
     /// may refuse to focus a window (e.g. right after launch); we only hide on blur
     /// once it really had focus, so it can't vanish before you ever see it.
     had_focus: AtomicBool,
+    /// Bumped on every show and hide, so a pending background scroll reset (see
+    /// `mark_hidden`) can tell the pane was reopened in the meantime and stand down.
+    visibility_seq: AtomicU64,
     /// Which window mode is applied: Some(true) = search pane, Some(false) = setup window.
     window_mode: Mutex<Option<bool>>,
     /// The global shortcut that opens the pane (configurable in Settings).
@@ -157,6 +160,8 @@ struct Status {
     primary_action: &'static str,
     /// The pane's size, as a percentage of the default (Settings > General).
     pane_scale: u32,
+    /// Seconds closed before the pane reopens scrolled to the top (0 = every time).
+    scroll_reset_secs: u32,
     version: String,
 }
 
@@ -282,6 +287,7 @@ fn status(app: &AppHandle) -> Status {
         update: state.update.lock().unwrap().clone(),
         primary_action: settings::primary_action(app),
         pane_scale: settings::pane_scale(app),
+        scroll_reset_secs: settings::scroll_reset_secs(app),
         version: app.package_info().version.to_string(),
     }
 }
@@ -383,6 +389,8 @@ fn show_pane(app: &AppHandle) {
         }
     }
     app.state::<AppState>().had_focus.store(false, Ordering::SeqCst);
+    // Cancels a background scroll reset that hasn't fired yet.
+    app.state::<AppState>().visibility_seq.fetch_add(1, Ordering::SeqCst);
     set_window_animation(&win, true); // opening keeps the usual Windows animation
     let _ = win.show();
     let _ = win.set_focus();
@@ -448,11 +456,31 @@ fn remember_foreground(app: &AppHandle, win: &WebviewWindow) {
 #[cfg(not(windows))]
 fn remember_foreground(_app: &AppHandle, _win: &WebviewWindow) {}
 
+/// The pane just closed: once it has stayed closed for the Settings delay
+/// (`scroll_reset_secs`), scroll it back to the top while it's still hidden, so it's
+/// already there when it next opens instead of jumping in front of you.
+fn mark_hidden(app: &AppHandle) {
+    let seq = app.state::<AppState>().visibility_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let delay = std::time::Duration::from_secs(settings::scroll_reset_secs(app).into());
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let state = app.state::<AppState>();
+        let still_hidden = state.visibility_seq.load(Ordering::SeqCst) == seq
+            && !pane(&app).is_some_and(|w| w.is_visible().unwrap_or(false));
+        // Mid-edit, the pane keeps its state until the editor closes.
+        if still_hidden && !state.editing.load(Ordering::SeqCst) {
+            let _ = app.emit_to(PANE, "pane-reset", ());
+        }
+    });
+}
+
 /// Closes the pane instantly (Esc, clicking away, the hotkey, the close button).
 fn hide_pane(app: &AppHandle) {
     if let Some(win) = pane(app) {
         set_window_animation(&win, false);
         let _ = win.hide();
+        mark_hidden(app);
     }
 }
 
@@ -462,6 +490,7 @@ fn hide_pane_after_copy(app: &AppHandle) {
     if let Some(win) = pane(app) {
         set_window_animation(&win, true);
         let _ = win.hide();
+        mark_hidden(app);
     }
 }
 
@@ -1391,6 +1420,7 @@ pub fn run() {
             settings::set_autostart,
             settings::set_primary_action,
             settings::set_pane_scale,
+            settings::set_scroll_reset,
             settings::reread_all_text,
             settings::open_link,
             import::import_bytes,
@@ -1443,6 +1473,7 @@ pub fn run() {
                 dragging: AtomicBool::new(false),
                 editing: AtomicBool::new(false),
                 had_focus: AtomicBool::new(false),
+                visibility_seq: AtomicU64::new(0),
                 window_mode: Mutex::new(None),
                 shortcut: Mutex::new(settings::DEFAULT_SHORTCUT.parse().expect("default shortcut is valid")),
                 open_item: Mutex::new(None),

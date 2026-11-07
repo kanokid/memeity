@@ -29,6 +29,10 @@ pub struct Config {
     /// The search pane's size, as a percentage of the default 750×475. None = 100.
     #[serde(default)]
     pub pane_scale: Option<u32>,
+    /// Seconds the pane can stay closed before it reopens scrolled back to the top.
+    /// 0 = every time. None = the default (60).
+    #[serde(default)]
+    pub scroll_reset_secs: Option<u32>,
     /// Random id for this device; names its usage file in the synced folder (usage.rs).
     #[serde(default)]
     pub device_id: Option<String>,

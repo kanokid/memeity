@@ -1189,6 +1189,13 @@
         input?.select(); // typing replaces the last query, arrows keep it
         refresh();
       }),
+      // Closed past the Settings delay: back to the top, while it's still hidden.
+      listen("pane-reset", () => {
+        if (editing || stage !== "ready") return;
+        confirmDelete = null;
+        menu = null;
+        refresh(true);
+      }),
       listen("library-changed", () => refresh()),
       listen("sync-status", () => refresh()),
       listen("status-changed", () => refresh()), // e.g. a new shortcut picked in Settings

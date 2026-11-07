@@ -335,6 +335,24 @@ pub fn set_pane_scale(app: AppHandle, percent: u32) -> Result<Status, String> {
     Ok(status(&app))
 }
 
+/// Choices offered in Settings > General for resetting the pane's scroll, in seconds
+/// (0 = every time it opens).
+pub const SCROLL_RESETS: [u32; 5] = [0, 30, 60, 90, 180];
+
+/// How long the pane can stay closed before it reopens at the top, in seconds.
+pub fn scroll_reset_secs(app: &AppHandle) -> u32 {
+    config(app).scroll_reset_secs.filter(|s| SCROLL_RESETS.contains(s)).unwrap_or(60)
+}
+
+#[tauri::command]
+pub fn set_scroll_reset(app: AppHandle, secs: u32) -> Result<Status, String> {
+    if !SCROLL_RESETS.contains(&secs) {
+        return Err("Unknown delay.".into());
+    }
+    update_config(&app, |c| c.scroll_reset_secs = Some(secs));
+    Ok(status(&app))
+}
+
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<Status, String> {
     let launcher = app.autolaunch();

@@ -28,6 +28,7 @@
     update: string | null;
     primary_action: "paste" | "copy";
     pane_scale: number;
+    scroll_reset_secs: number;
     version: string;
   };
 
@@ -207,6 +208,18 @@
   const setPaneScale = (percent: number) =>
     act(async () => {
       status = await invoke<Status>("set_pane_scale", { percent });
+    });
+
+  const SCROLL_RESETS = [
+    { secs: 0, label: "0s" },
+    { secs: 30, label: "30s" },
+    { secs: 60, label: "1m" },
+    { secs: 90, label: "90s" },
+    { secs: 180, label: "3m" },
+  ];
+  const setScrollReset = (secs: number) =>
+    act(async () => {
+      status = await invoke<Status>("set_scroll_reset", { secs });
     });
 
   const toggleAutostart = () =>
@@ -494,6 +507,26 @@
       <div class="card">
         <div class="row">
           <div>
+            <h3>Scroll back to top</h3>
+            <p>If the pane stays closed this long, it reopens at the top of your memes.</p>
+          </div>
+          <div class="segmented" role="radiogroup" aria-label="Scroll back to top">
+            {#each SCROLL_RESETS as r (r.secs)}
+              <button
+                role="radio"
+                aria-checked={status.scroll_reset_secs === r.secs}
+                class:on={status.scroll_reset_secs === r.secs}
+                onclick={() => setScrollReset(r.secs)}
+                disabled={busy}
+              >{r.label}</button>
+            {/each}
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
             <h3>Launch at login</h3>
             <p>Start memeity quietly in the {isMac ? "menu bar" : "tray"} when you log in.</p>
           </div>
@@ -689,25 +722,31 @@
         <img src={logo} alt="memeity" width="72" height="72" />
         <h1>memeity</h1>
         <p class="muted">Version {status.version}</p>
-        <div class="update-row">
+        <div class="about-actions">
           {#if status.update}
-            <button class="btn primary sm" onclick={installUpdate} disabled={busy}>
+            <button class="btn primary sm wide" onclick={installUpdate} disabled={busy}>
               {busy ? "Updating…" : `Update to ${status.update}`}
             </button>
           {:else}
-            <button class="btn outline sm" onclick={checkUpdate} disabled={busy || checking}>
+            <button class="btn outline sm wide" onclick={checkUpdate} disabled={busy || checking}>
               {checking ? "Checking…" : "Check for Updates"}
             </button>
           {/if}
-          {#if upToDate}<span class="muted small">memeity is up to date.</span>{/if}
-        </div>
-        <div class="buttons center">
+          {#if upToDate}<span class="muted small wide">memeity is up to date.</span>{/if}
           <button class="btn outline sm" onclick={() => openLink("website")}>Website</button>
           <button class="btn outline sm" onclick={() => openLink("privacy")}>Privacy policy</button>
           <button class="btn outline sm" onclick={() => openLink("source")}>Source code</button>
-        </div>
-        <div class="buttons center">
-          <button class="btn outline sm" onclick={reportProblem} disabled={busy}>Report a Problem…</button>
+          <button class="btn outline sm wide" onclick={reportProblem} disabled={busy}>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m8 2 1.88 1.88" /><path d="M14.12 3.88 16 2" />
+              <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" />
+              <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" />
+              <path d="M12 20v-9" /><path d="M6.53 9C4.6 8.8 3 7.1 3 5" /><path d="M6 13H2" />
+              <path d="M3 21c0-2.1 1.7-3.9 3.8-4" /><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" />
+              <path d="M22 13h-4" /><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
+            </svg>
+            Report a Problem…
+          </button>
         </div>
         <div class="diagnostics">
           <button class="btn ghost sm" onclick={copyDiagnostics} disabled={busy}>
@@ -854,10 +893,6 @@
     display: flex;
     gap: 6px;
     flex-shrink: 0;
-  }
-
-  .buttons.center {
-    justify-content: center;
   }
 
   .alert {
@@ -1150,16 +1185,41 @@
   }
 
   /* The button, with "memeity is up to date" (when shown) centred underneath it. */
-  .update-row {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 6px;
-    margin: -6px 0 18px;
+  /* One block of equal-width buttons: the three links share the width of the widest,
+     and the single buttons span the whole row, so every edge lines up. */
+  .about-actions {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    width: max-content;
+    margin: 0 auto;
+  }
+
+  .about-actions .btn {
+    justify-content: center;
+  }
+
+  .about-actions .icon {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .about-actions .wide {
+    grid-column: 1 / -1;
+  }
+
+  .about .about-actions .muted {
+    margin: -2px 0 2px;
   }
 
   .about {
-    padding-top: 40px;
+    padding-top: 8px; /* on top of .content's own padding */
     text-align: center;
   }
 
