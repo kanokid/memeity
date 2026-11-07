@@ -1,6 +1,6 @@
 [package]
 name = "memeity"
-version = "1.0.0"
+version = "1.1.0"
 description = "One meme folder, everywhere, with a Raycast-style search pane"
 edition = "2024"
 
