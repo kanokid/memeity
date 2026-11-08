@@ -9,7 +9,7 @@
 <div align="center">
   <img alt="GitHub Release" src="https://img.shields.io/github/downloads/purestellenium/memeity/total">
   <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/v/release/purestellenium/memeity">
-  <img alt="GitHub License" src="https://img.shields.io/github/license/purestellenium/memeity#">
+  <img alt="GitHub License" src="https://img.shields.io/github/license/purestellenium/memeity?color=orange">
 </div>
 
 <br />
