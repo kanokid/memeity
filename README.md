@@ -9,6 +9,12 @@
 <br />
 
 <div align="center">
+  ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/purestellenium/memeity/total)
+  ![GitHub Release](https://img.shields.io/github/v/release/purestellenium/memeity)
+  ![GitHub License](https://img.shields.io/github/license/purestellenium/memeity)
+</div>
+
+<div align="center">
   <img width="759" height="486" alt="screenshot" src="https://github.com/user-attachments/assets/878e293b-878e-46af-b9c4-e4c186552451" />
 </div>
 
