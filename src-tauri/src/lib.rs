@@ -207,6 +207,7 @@ fn apply_window_mode(app: &AppHandle) {
 }
 
 /// Corner radius of the search pane on macOS, in points (Windows 11 has its own fixed one).
+/// Keep in sync with `main.pane.mac` in App.svelte.
 #[cfg(target_os = "macos")]
 const PANE_RADIUS: f64 = 16.0;
 

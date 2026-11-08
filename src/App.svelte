@@ -1628,7 +1628,7 @@
   </svg>
 {/snippet}
 
-<main class:pane={stage === "ready"}>
+<main class:pane={stage === "ready"} class:mac={isMac}>
   <!-- Screen readers hear how many memes match as you type. -->
   {#if stage === "ready"}
     <p class="sr-only" aria-live="polite">{query.trim() ? `${total} ${total === 1 ? "meme" : "memes"}` : ""}</p>
@@ -2267,11 +2267,17 @@
     height: 100%;
   }
 
-  /* The frameless pane draws its own hairline edge; Windows rounds the corners. */
+  /* The frameless pane draws its own hairline edge. Its radius has to match the native
+     corner clip (Windows 11: 8px; macOS: PANE_RADIUS in lib.rs), or the page background
+     shows as a dark band between the two curves. */
   main.pane {
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
+  }
+
+  main.pane.mac {
+    border-radius: 16px;
   }
 
   .icon {
