@@ -3475,15 +3475,18 @@
     max-width: 100%;
   }
 
+  /* One row of fixed columns: a wrapping flex row left gray alone on a second line. */
   .tag-menu .swatches {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 2px;
-    padding: 0 2px 2px;
+    display: grid;
+    grid-template-columns: repeat(9, 24px);
+    justify-content: space-between;
+    padding: 0 1px 2px;
   }
 
-  .tag-menu .swatch {
+  /* `button.swatch`, not `.swatch`: it has to outrank the menu's `.menu button` row style. */
+  .tag-menu button.swatch {
     display: grid;
+    place-content: center;
     place-items: center;
     width: 24px;
     height: 24px;
@@ -3493,12 +3496,17 @@
     cursor: pointer;
   }
 
-  .tag-menu .swatch:hover:not(:disabled) {
+  .tag-menu button.swatch:hover:not(:disabled) {
     background: var(--accent);
   }
 
-  .tag-menu .swatch.on {
+  .tag-menu button.swatch.on {
     border-color: var(--ring);
+  }
+
+  /* Keep the focus ring inside the swatch so it lines up with the selected border. */
+  .tag-menu button.swatch:focus-visible {
+    outline-offset: -2px;
   }
 
   .tag-menu .swatch .tag-dot {
