@@ -481,7 +481,7 @@
               <span class="label">Font</span>
               <div class="seg">
                 {#each FONTS as f (f)}
-                  <button class:on={ui.text.font === f} aria-pressed={ui.text.font === f} style:font-family={f} onclick={() => engine?.setTextStyle({ font: f })}>{f === "Times New Roman" ? "Times" : f}</button>
+                  <button class:on={ui.text.font === f} aria-pressed={ui.text.font === f} style:font-family={f} style:font-weight={f === "Barlow Condensed" ? 800 : null} onclick={() => engine?.setTextStyle({ font: f })}>{f === "Barlow Condensed" ? "Barlow" : f}</button>
                 {/each}
               </div>
             </div>

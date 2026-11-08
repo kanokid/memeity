@@ -9,6 +9,7 @@
 
 import {
   ActiveSelection,
+  cache,
   Canvas,
   Ellipse,
   FabricImage,
@@ -20,14 +21,29 @@ import {
   util,
   type TPointerEventInfo,
 } from "fabric";
+import "@fontsource/barlow-condensed/800.css";
+import "@fontsource/barlow-condensed/800-italic.css";
+import "@fontsource/barlow-condensed/900.css";
+import "@fontsource/barlow-condensed/900-italic.css";
 
 /** Shapes are drawn by dragging on the canvas (Shift: square / circle / 45° arrow). */
 export type ShapeKind = "rect" | "ellipse" | "arrow";
 export type Tool = "select" | "brush" | "eraser" | ShapeKind;
 export const isShapeTool = (t: Tool): t is ShapeKind => t === "rect" || t === "ellipse" || t === "arrow";
 export type Kind = "text" | "rect" | "ellipse" | "arrow" | "sticker";
-export const FONTS = ["Arial", "Impact", "Times New Roman"] as const;
+export const FONTS = ["Arial", "Impact", "Barlow Condensed"] as const;
 export type Font = (typeof FONTS)[number];
+
+/** Bundled with the app (ExtraBold, and Black for bold), so it looks the same everywhere. */
+const BARLOW = "Barlow Condensed";
+/** Regular and bold weights per font; Barlow's "regular" is already ExtraBold. */
+const WEIGHTS: Record<Font, [regular: string, bold: string]> = {
+  Arial: ["normal", "bold"],
+  Impact: ["normal", "bold"],
+  [BARLOW]: ["800", "900"],
+};
+/** Tighten Barlow a touch for captions (Fabric's charSpacing is in 1/1000 em). */
+const CHAR_SPACING: Partial<Record<Font, number>> = { [BARLOW]: -15 };
 
 /** The style of the selected object, or the one the next object of that kind gets. */
 export type TextStyle = {
@@ -158,6 +174,11 @@ export class Engine {
     });
     this.canvas.add(this.inkObj);
 
+    // The bundled faces download on first use; Fabric measures glyphs once and caches the
+    // widths, so re-measure Barlow text whenever one of its faces finishes loading.
+    document.fonts.addEventListener("loadingdone", this.onFontsLoaded);
+    document.fonts.load(`800 16px "${BARLOW}"`).catch(() => {});
+
     const c = this.canvas;
     c.on("mouse:down", (e) => (isShapeTool(this.tool) ? this.shapeStart(e) : this.strokeStart(e)));
     c.on("mouse:move", (e) => (this.creating ? this.shapeMove(e) : this.strokeMove(e)));
@@ -176,7 +197,14 @@ export class Engine {
     this.snapshot();
   }
 
+  private onFontsLoaded = () => {
+    cache.clearFontCache(BARLOW);
+    for (const o of this.canvas.getObjects()) if (o instanceof Textbox && o.fontFamily === BARLOW) o.initDimensions();
+    this.canvas.requestRenderAll();
+  };
+
   dispose() {
+    document.fonts.removeEventListener("loadingdone", this.onFontsLoaded);
     clearTimeout(this.commitTimer);
     this.canvas.dispose();
   }
@@ -366,10 +394,11 @@ export class Engine {
   private styleText(t: Textbox, s: TextStyle) {
     t.set({
       fontFamily: s.font,
+      charSpacing: CHAR_SPACING[s.font] ?? 0,
       fill: s.fill,
       stroke: s.outlineWidth > 0 ? s.outline : null,
       strokeWidth: (s.outlineWidth / 10) * OUTLINE_MAX * (t.fontSize ?? 40),
-      fontWeight: s.bold ? "bold" : "normal",
+      fontWeight: WEIGHTS[s.font][s.bold ? 1 : 0],
       fontStyle: s.italic ? "italic" : "normal",
       textAlign: s.align,
     });
@@ -439,12 +468,13 @@ export class Engine {
     const o = this.selected()[0];
     const kind = kindOf(o);
     if (o instanceof Textbox && kind === "text") {
+      const font = FONTS.find((f) => f === o.fontFamily) ?? "Arial";
       this.textStyle = {
-        font: (FONTS as readonly string[]).includes(o.fontFamily ?? "") ? (o.fontFamily as Font) : "Arial",
+        font,
         fill: String(o.fill ?? "#ffffff"),
         outline: o.stroke ? String(o.stroke) : this.textStyle.outline,
         outlineWidth: o.stroke ? Math.round((o.strokeWidth / ((o.fontSize ?? 40) * OUTLINE_MAX)) * 10) : 0,
-        bold: o.fontWeight === "bold",
+        bold: String(o.fontWeight) === WEIGHTS[font][1],
         italic: o.fontStyle === "italic",
         align: (o.textAlign as TextStyle["align"]) ?? "center",
       };
