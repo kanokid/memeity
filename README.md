@@ -6,13 +6,13 @@
 
 <p align="center"><i>hey, it's me, it's memeity</i></p>
 
-<br />
-
 <div align="center">
   <img alt="GitHub Release" src="https://img.shields.io/github/downloads/purestellenium/memeity/total">
   <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/v/release/purestellenium/memeity">
   <img alt="GitHub License" src="https://img.shields.io/github/license/purestellenium/memeity">
 </div>
+
+<br />
 
 <div align="center">
   <img width="759" height="486" alt="screenshot" src="https://github.com/user-attachments/assets/878e293b-878e-46af-b9c4-e4c186552451" />
