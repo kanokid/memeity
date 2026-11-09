@@ -725,6 +725,34 @@ fn record_use(app: &AppHandle, path: &std::path::Path) {
         log::warn!("couldn't record use: {e}");
     }
     usage::schedule_flush(app); // so other devices rank it up too
+    if !config(app).star_prompt.shown {
+        update_config(app, |c| c.star_prompt.uses = c.star_prompt.uses.saturating_add(1));
+    }
+}
+
+/// The star prompt waits until memeity has clearly earned it: a few days in, and a
+/// handful of memes actually used.
+const STAR_PROMPT_AFTER_MS: i64 = 3 * 24 * 3600 * 1000;
+const STAR_PROMPT_AFTER_USES: u32 = 10;
+
+/// Called each time the pane opens. True exactly once per device: when the star prompt
+/// is due, it's marked shown in the same step, so it never appears again.
+#[tauri::command]
+fn claim_star_prompt(app: AppHandle) -> bool {
+    let now = now_ms();
+    let mut show = false;
+    update_config(&app, |c| {
+        let p = &mut c.star_prompt;
+        if p.shown {
+            return;
+        }
+        let since = *p.since_ms.get_or_insert(now);
+        if p.uses >= STAR_PROMPT_AFTER_USES && now - since >= STAR_PROMPT_AFTER_MS {
+            p.shown = true;
+            show = true;
+        }
+    });
+    show
 }
 
 #[tauri::command]
@@ -1428,6 +1456,7 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             get_status,
+            claim_star_prompt,
             search,
             copy_meme,
             meme_text,

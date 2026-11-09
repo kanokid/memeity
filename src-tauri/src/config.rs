@@ -51,6 +51,24 @@ pub struct Config {
     /// Random id for this device; names its usage file in the synced folder (usage.rs).
     #[serde(default)]
     pub device_id: Option<String>,
+    /// The one-time "star memeity on GitHub" prompt (see `claim_star_prompt` in lib.rs).
+    #[serde(default)]
+    pub star_prompt: StarPrompt,
+}
+
+/// Tracks when the one-time star prompt is due. Per device, like the rest of the config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StarPrompt {
+    /// When this device started counting (Unix ms): the first time the pane opened
+    /// after setup, or after updating to a version with the prompt.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    /// Memes copied, pasted or dragged out since then.
+    #[serde(default)]
+    pub uses: u32,
+    /// Set the moment it's shown, so it never appears again.
+    #[serde(default)]
+    pub shown: bool,
 }
 
 impl Config {

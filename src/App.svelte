@@ -911,6 +911,29 @@
       await refresh(true);
     });
 
+  // ---------- star prompt ----------
+
+  /**
+   * A one-time "star the repo" nudge. The backend decides when it's due (a few days in,
+   * after some memes have been used) and marks it shown as it hands it out, so it
+   * appears exactly once per device. It stays up until dismissed or the pane reopens.
+   */
+  let starPrompt = $state(false);
+
+  async function checkStarPrompt() {
+    starPrompt = false;
+    try {
+      starPrompt = await invoke<boolean>("claim_star_prompt");
+    } catch {
+      // just a nudge; never worth an error
+    }
+  }
+
+  function starRepo() {
+    invoke("open_link", { target: "source" }).catch(() => {});
+    starPrompt = false;
+  }
+
   // ---------- library folder ----------
 
   /** Set once we've tried, so a failure shows a Retry button instead of looping. */
@@ -1483,6 +1506,7 @@
         draggingOut = false;
         if (editing) return; // reopened mid-edit: leave the editor as it was
         checkDuplicates();
+        if (stage === "ready") checkStarPrompt();
         error = null;
         confirmDelete = null;
         menu = null;
@@ -1715,6 +1739,15 @@
       <span class="banner-actions">
         <button class="btn sm" onclick={() => invoke("open_settings")}>Choose another…</button>
         <button class="btn ghost sm" onclick={retryShortcut} disabled={busy}>Try again</button>
+      </span>
+    </div>
+  {/if}
+  {#if stage === "ready" && starPrompt}
+    <div class="banner shortcut-banner" role="status">
+      <span>If you're enjoying memeity, a star on GitHub helps others find it :3</span>
+      <span class="banner-actions">
+        <button class="btn sm" onclick={starRepo}>★ Star on GitHub</button>
+        <button class="btn ghost sm" onclick={() => (starPrompt = false)}>No thanks</button>
       </span>
     </div>
   {/if}
