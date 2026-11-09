@@ -32,7 +32,7 @@ memeity aims to fix this issue by hosting all of your memes on Google Drive - sy
 - **Quickly add memes**: drag and drop, or paste your memes into the pane to instantly process new images!
 - **Quick & powerful built-in editor**: edit and markup your memes & templates in an instant, right inside the memeity pane.
 - **Automatic updates**: memeity handles all of its own updates, so you'll never have to worry about keeping up to date again.
-- **Cross-platform**: memeity is supported on Windows, MacOS, with plans to expand to Linux + a web-based client!
+- **Cross-platform**: memeity is supported on Windows and macOS, with plans to expand to Linux + a web-based client!
 - **No telemetry**: memeity never phones home - I don't need your data, silly!
 
 ## Installation
