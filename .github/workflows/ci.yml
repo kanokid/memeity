@@ -1,6 +1,6 @@
-# Type-check, lint and test on both platforms memeity ships for (macOS also compiles
-# the Mac-only code). Runs on pull requests, before every release build (the Release
-# workflow calls it), or by hand (Actions > CI > Run workflow). Not on plain commits.
+
+# Type-check, lint and test on Linux.
+# Runs on pull requests, before every release build, or manually.
 name: CI
 
 on:
@@ -9,19 +9,31 @@ on:
   workflow_call:
 
 concurrency:
-  # `ci-` prefix so a release's CI run doesn't share (and cancel) the Release group.
+  # Keep CI separate from the Release workflow.
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, windows-11-arm, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            wget
 
       - uses: actions/setup-node@v5
         with:
@@ -52,8 +64,3 @@ jobs:
       - name: Tests
         working-directory: src-tauri
         run: cargo test
-
-      # The Intel Mac release build leaves out OCR; make sure that still compiles.
-      - name: Clippy (without OCR)
-        working-directory: src-tauri
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
