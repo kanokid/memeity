@@ -946,8 +946,9 @@ async fn rename_meme(app: AppHandle, path: String, name: String) -> Result<Strin
 
 /// Replaces a meme's recognized text with what the user typed. Stored in its sidecar
 /// (so it syncs everywhere) and marked as edited, so OCR never overwrites it.
+/// `edited` is false only when Undo puts back text OCR read, so OCR may update it again.
 #[tauri::command(async)]
-fn set_meme_text(app: AppHandle, path: String, text: String) -> Result<(), String> {
+fn set_meme_text(app: AppHandle, path: String, text: String, edited: Option<bool>) -> Result<(), String> {
     let path = PathBuf::from(path);
     let (root, rel) = library_rel(&app, &path)?;
     let state = app.state::<AppState>();
@@ -968,7 +969,7 @@ fn set_meme_text(app: AppHandle, path: String, text: String) -> Result<(), Strin
         engine: engine.clone(),
         lang: None,
         at: Some(humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()),
-        edited: true,
+        edited: edited.unwrap_or(true),
     });
     sidecar::write(&root, &md5, &sc).map_err(|e| format!("Couldn't save the text: {e}"))?;
     let sidecar_mtime = std::fs::metadata(sidecar::path(&root, &md5))
@@ -1128,6 +1129,51 @@ async fn delete_meme(app: AppHandle, path: String) -> Result<String, String> {
     let token = sync::delete(&app, &path).await?;
     refresh_library(&app);
     Ok(token)
+}
+
+/// What `delete_memes` managed: undo tokens for everything it deleted, and the first
+/// error if it stopped early (the ones already deleted stay undoable).
+#[derive(Serialize)]
+struct DeleteResult {
+    tokens: Vec<String>,
+    error: Option<String>,
+}
+
+/// Deletes several memes, like `delete_meme` one after another.
+#[tauri::command]
+async fn delete_memes(app: AppHandle, paths: Vec<String>) -> Result<DeleteResult, String> {
+    let mut tokens = Vec::new();
+    let mut error = None;
+    for path in paths {
+        let path = PathBuf::from(path);
+        let known = app.state::<AppState>().library.read().unwrap().contains(&path);
+        if !known {
+            continue; // already gone (deleted elsewhere, or listed twice)
+        }
+        match sync::delete(&app, &path).await {
+            Ok(token) => tokens.push(token),
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+    refresh_library(&app);
+    Ok(DeleteResult { tokens, error })
+}
+
+/// Undoes a `delete_memes`: restores every meme it can, then reports the first failure.
+#[tauri::command]
+async fn undo_deletes(app: AppHandle, tokens: Vec<String>) -> Result<(), String> {
+    let mut first_err = None;
+    for token in tokens {
+        if let Err(e) = sync::undo_delete(&app, &token).await {
+            first_err.get_or_insert(e);
+        }
+    }
+    refresh_library(&app);
+    sync::trigger(&app);
+    first_err.map_or(Ok(()), Err)
 }
 
 #[tauri::command]
@@ -1457,6 +1503,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             claim_star_prompt,
+            delete_memes,
+            undo_deletes,
             search,
             copy_meme,
             meme_text,

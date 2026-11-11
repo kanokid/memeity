@@ -78,10 +78,17 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSWi
 objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
 objc2-foundation = { version = "0.3", features = ["NSData"] }
 
+# Debug info is most of a dev build's size on disk. Keep just enough of it for file:line
+# in panics and backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
 # `tauri dev` builds are unoptimized, which makes image decoding/encoding ~50x slower
 # (seconds per copy for big memes). Optimize dependencies only; our own code stays debuggable.
+# No debug info for them either: nobody steps through dependency code.
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 
 [profile.release]
 codegen-units = 1

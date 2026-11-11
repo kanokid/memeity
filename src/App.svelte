@@ -94,7 +94,9 @@
     if (hit.animated && active) return `${convertFileSrc(hit.path, "thumb")}?full=1&v=${hit.version}`;
     return `${convertFileSrc(hit.path, "thumb")}?v=${hit.version}`;
   }
-  let confirmDelete = $state<Hit | null>(null);
+  /** Memes waiting for the user to confirm deleting them (one, or every selected one). */
+  let confirmDelete = $state<Hit[] | null>(null);
+  const isDoomed = (hit: Hit) => !!confirmDelete?.some((h) => h.path === hit.path);
 
   // ---------- tags ----------
 
@@ -228,28 +230,50 @@
     input?.focus();
   }
 
-  /** Ticks (or unticks) a tag on every target, or creates a tag and ticks it. */
+  /** Adds or removes one tag on some memes, and shows it everywhere it's on screen. */
+  async function setTag(paths: string[], id: string, adding: boolean) {
+    await invoke("set_tags", { paths, add: adding ? [id] : [], remove: adding ? [] : [id] });
+    // Marked memes scrolled out of the results still show the change.
+    for (const p of paths) {
+      const h = marked.get(p);
+      if (h) marked.set(p, { ...h, tags: adding ? [...new Set([...h.tags, id])] : h.tags.filter((t) => t !== id) });
+    }
+    await Promise.all([loadTags(), runSearch(false)]);
+  }
+
+  /** Ticks (or unticks) a tag on every target, or creates a tag and ticks it. Undoable. */
   const applyPickerRow = (row: PickerRow | undefined) =>
     act(async () => {
       if (!picker || !row) return;
-      const paths = picker.paths;
       let id: string;
+      let name: string;
       let adding: boolean;
       if (row.kind === "create") {
-        id = (await invoke<Tag>("create_tag", { name: row.name })).id;
-        adding = true;
+        const tag = await invoke<Tag>("create_tag", { name: row.name });
+        [id, name, adding] = [tag.id, tag.name, true];
         pickerQuery = "";
       } else {
-        id = row.tag.id;
+        [id, name] = [row.tag.id, row.tag.name];
         adding = row.state !== "all"; // some or none: add to the rest; all: take it off
       }
-      await invoke("set_tags", { paths, add: adding ? [id] : [], remove: adding ? [] : [id] });
-      // Marked memes scrolled out of the results still show the change.
-      for (const p of paths) {
-        const h = marked.get(p);
-        if (h) marked.set(p, { ...h, tags: adding ? [...new Set([...h.tags, id])] : h.tags.filter((t) => t !== id) });
-      }
-      await Promise.all([loadTags(), runSearch(false)]);
+      // Only the memes this actually changes, so Undo leaves the others as they were.
+      const changed = adding
+        ? picker.paths.filter((p) => !pickerTargets.find((h) => h.path === p)?.tags.includes(id))
+        : picker.paths;
+      await setTag(changed, id, adding);
+      const undo = () =>
+        act(async () => {
+          lastUndo = null;
+          toast = null;
+          await setTag(changed, id, !adding);
+          showToast({ message: adding ? `Removed #${name} again` : `Put #${name} back` }, 2000);
+        });
+      offerUndo(undo, UNDO_MS);
+      const many = changed.length > 1 ? ` ${adding ? "to" : "from"} ${changed.length} memes` : "";
+      showToast(
+        { message: `${adding ? "Added" : "Removed"} #${name}${many}`, action: { label: "Undo", run: undo } },
+        DELETED_TOAST_MS,
+      );
     });
 
   function onPickerKey(e: KeyboardEvent) {
@@ -269,6 +293,12 @@
     } else if (e.key === "Enter") {
       e.preventDefault();
       applyPickerRow(pickerRows[pickerSel]);
+    } else if (ctrl && e.key.toLowerCase() === "z" && !e.shiftKey && !pickerQuery && lastUndo) {
+      // Nothing typed to undo: undo the last tag change instead.
+      e.preventDefault();
+      const undo = lastUndo;
+      lastUndo = null;
+      undo.run();
     }
   }
 
@@ -381,7 +411,23 @@
     if (saved) {
       await showMeme(saved.rel);
       const name = saved.rel.split("/").pop();
-      showToast({ message: saved.duplicate ? `${name} is already in your library` : `Saved as ${name}` }, 4000);
+      if (saved.duplicate || !status?.local_folder) {
+        showToast({ message: saved.duplicate ? `${name} is already in your library` : `Saved as ${name}` }, 4000);
+        return;
+      }
+      // Undo removes the new copy (the original was never touched).
+      const sep = navigator.userAgent.includes("Windows") ? "\\" : "/";
+      const path = `${status.local_folder}${sep}${saved.rel.split("/").join(sep)}`;
+      const undo = () =>
+        act(async () => {
+          lastUndo = null;
+          toast = null;
+          await invoke("delete_memes", { paths: [path] });
+          await refresh();
+          showToast({ message: `Removed ${name}` }, 2000);
+        });
+      offerUndo(undo, UNDO_MS);
+      showToast({ message: `Saved as ${name}`, action: { label: "Undo", run: undo } }, DELETED_TOAST_MS);
     }
   }
   let searchSeq = 0;
@@ -527,10 +573,23 @@
     act(async () => {
       if (!editingText || !current) return;
       const path = current.path; // fixed before any await: the selection may change meanwhile
+      const before = details;
       await invoke("set_meme_text", { path, text: textDraft });
       stopEditing();
       loaded = { path, text: await invoke<MemeText>("meme_text", { path }) };
       await runSearch(false); // the new text is searchable right away
+      if (before?.state !== "read" || (before.text ?? "") === textDraft.trim()) return;
+      const undo = () =>
+        act(async () => {
+          lastUndo = null;
+          toast = null;
+          await invoke("set_meme_text", { path, text: before.text ?? "", edited: before.edited });
+          if (loaded?.path === path) loaded = { path, text: await invoke<MemeText>("meme_text", { path }) };
+          await runSearch(false);
+          showToast({ message: "Text put back" }, 2000);
+        });
+      offerUndo(undo, UNDO_MS);
+      showToast({ message: "Text saved", action: { label: "Undo", run: undo } }, DELETED_TOAST_MS);
     });
 
   /** Enter/Esc inside the edit fields (they handle their own keys). */
@@ -1077,7 +1136,10 @@
       if (hit) await invoke("reveal_meme", { path: hit.path });
     });
 
-  /** The most recent delete or rename, undoable with Ctrl+Z (or its toast's button) for a while. */
+  /**
+   * The most recent delete, rename, tag change or edit, undoable with Ctrl+Z (or its
+   * toast's button) for a while.
+   */
   let lastUndo: { id: number; run: () => void } | null = null;
   let undoSeq = 0;
 
@@ -1088,31 +1150,107 @@
       if (lastUndo?.id === id) lastUndo = null;
     }, ms);
   }
-  /** Ctrl+Z works this long after a delete (matches the backend's undo window)... */
+  /** Ctrl+Z works this long after a change (matches the backend's delete undo window)... */
   const UNDO_MS = 10_000;
   /** ...while the "Deleted" notice itself gets out of the way sooner. */
   const DELETED_TOAST_MS = 5_000;
 
-  const doDelete = (hit: Hit) =>
+  function askDelete(list: Hit[]) {
+    if (!list.length) return;
+    menu = null;
+    confirmDelete = list;
+  }
+
+  const doDelete = (list: Hit[]) =>
     act(async () => {
       confirmDelete = null;
-      const token = await invoke<string>("delete_meme", { path: hit.path });
-      offerUndo(() => undoDelete(token), UNDO_MS);
-      showToast(
-        { message: `Deleted ${hit.name}`, danger: true, action: { label: "Undo", run: () => undoDelete(token) } },
-        DELETED_TOAST_MS,
-      );
+      const result = await invoke<{ tokens: string[]; error: string | null }>("delete_memes", {
+        paths: list.map((h) => h.path),
+      });
+      const { tokens } = result;
+      // All gone: clear them from the selection. If it stopped partway, the selection
+      // stays as it was so the rest can be retried (ones already deleted just drop out).
+      if (!result.error) list.forEach((h) => marked.delete(h.path));
+      if (!marked.size) markAnchor = null;
+      if (tokens.length) {
+        const undo = () => undoDelete(tokens);
+        offerUndo(undo, UNDO_MS);
+        const what = list.length === 1 ? list[0].name : `${tokens.length} meme${tokens.length === 1 ? "" : "s"}`;
+        showToast({ message: `Deleted ${what}`, danger: true, action: { label: "Undo", run: undo } }, DELETED_TOAST_MS);
+      }
       await refresh();
+      if (result.error) error = `Deleted ${tokens.length} of ${list.length}: ${result.error}`;
     });
 
-  const undoDelete = (token: string) =>
+  const undoDelete = (tokens: string[]) =>
     act(async () => {
       lastUndo = null;
       toast = null;
-      await invoke("undo_delete", { token });
+      await invoke("undo_deletes", { tokens });
       await refresh();
       showToast({ message: "Restored" }, 2000);
     });
+
+  // ---------- keyboard shortcuts sheet ----------
+
+  /** The cheat sheet (Ctrl+/, or ? in an empty search box). */
+  let showKeys = $state(false);
+
+  function openKeys() {
+    menu = null;
+    picker = null;
+    confirmDelete = null;
+    showKeys = true;
+  }
+
+  const keySections = $derived.by(() => {
+    const pastes = status?.primary_action !== "copy"; // what Enter does (Settings > General)
+    return [
+      {
+        title: "Use a meme",
+        rows: [
+          ["↵", pastes ? "Paste into the app you were in" : "Copy to the clipboard"],
+          ["Shift ↵", pastes ? "Copy to the clipboard" : "Paste into the app you were in"],
+          [`${MOD} 1–9`, "Use one of the first nine (hold " + MOD + " to see the numbers)"],
+          ["Drag", "Drop a meme straight into another app"],
+        ],
+      },
+      {
+        title: "Move and select",
+        rows: [
+          ["← ↑ → ↓", "Move between memes"],
+          ["PgUp PgDn", "Jump a few rows"],
+          [`${MOD} Click`, "Select several memes"],
+          ["Shift Click", "Select a range"],
+          ["Esc", "Clear the selection, or close memeity"],
+        ],
+      },
+      {
+        title: "The selected meme (or memes)",
+        rows: [
+          [`${MOD} K`, "All actions"],
+          [`${MOD} T`, "Tags"],
+          [`${MOD} P`, "Pin to the top"],
+          [`${MOD} E`, "Edit"],
+          [`${MOD} I`, "Show its text"],
+          ["F2", "Rename"],
+          [`${MOD} Shift F`, "Show in folder"],
+          [`${MOD} ⌫`, "Delete"],
+          [`${MOD} Z`, "Undo the last change"],
+        ],
+      },
+      {
+        title: "Search and more",
+        rows: [
+          ["#tag", "Only memes with that tag (Tab completes it)"],
+          [`${MOD} V`, "Add a copied image or link as a meme"],
+          [`${MOD} L`, "Switch between grid and list"],
+          [`${MOD} ,`, "Settings"],
+          [`${MOD} /`, "This list"],
+        ],
+      },
+    ];
+  });
 
   // ---------- toast ----------
 
@@ -1322,11 +1460,22 @@
       },
     },
     {
-      label: "Delete Meme…",
+      label: "Keyboard Shortcuts",
+      keys: `${MOD} /`,
+      danger: false,
+      run: () => openKeys(),
+    },
+    {
+      label: (() => {
+        const hit = hits[menu?.index ?? selected];
+        return hit && marked.has(hit.path) && marked.size > 1 ? `Delete ${marked.size} Memes…` : "Delete Meme…";
+      })(),
       keys: `${MOD} ⌫`,
       danger: true,
       run: (i: number) => {
-        confirmDelete = hits[i];
+        const hit = hits[i];
+        // On a selected meme it deletes them all; on any other, just that one.
+        if (hit) askDelete(marked.has(hit.path) ? [...marked.values()] : [hit]);
       },
     },
   ]);
@@ -1371,6 +1520,19 @@
       numbersTimer = setTimeout(() => (showNumbers = true), 250); // only when held, not for Ctrl+K etc.
     } else if (!isModKey(key)) {
       hideNumbers();
+    }
+
+    if (showKeys) {
+      // Any key closes the sheet; the ones that open it (and Esc) stop there.
+      showKeys = false;
+      if (key === "Escape" || key === "?" || (ctrl && key === "/")) {
+        e.preventDefault();
+        return;
+      }
+    } else if (stage === "ready" && !editing && ((ctrl && key === "/") || (key === "?" && e.target === input && !query))) {
+      e.preventDefault();
+      openKeys();
+      return;
     }
 
     if (tagMenu && key === "Escape") {
@@ -1484,7 +1646,10 @@
         case "Backspace":
           // Ctrl+Backspace deletes the selected meme (after confirming). This replaces the
           // search box's delete-a-word shortcut; plain Backspace still edits the search.
-          if (ctrl && current) { e.preventDefault(); confirmDelete = current; }
+          if (ctrl && (marked.size || current)) {
+            e.preventDefault();
+            askDelete(marked.size ? [...marked.values()] : [current!]);
+          }
           break;
       }
     }
@@ -1511,6 +1676,7 @@
         confirmDelete = null;
         menu = null;
         picker = null;
+        showKeys = false;
         input?.focus();
         input?.select(); // typing replaces the last query, arrows keep it
         refresh();
@@ -1850,7 +2016,7 @@
                   class="row"
                   class:selected={i === selected}
                   class:marked={marked.has(hit.path)}
-                  class:doomed={confirmDelete?.path === hit.path}
+                  class:doomed={isDoomed(hit)}
                   role="option"
                   id={`meme-${i}`}
                   aria-selected={i === selected}
@@ -1950,7 +2116,7 @@
                   class="tile"
                   class:selected={i === selected}
                   class:marked={marked.has(hit.path)}
-                  class:doomed={confirmDelete?.path === hit.path}
+                  class:doomed={isDoomed(hit)}
                   data-i={i}
                   role="option"
                   id={`meme-${i}`}
@@ -2069,7 +2235,9 @@
 
   <footer>
     {#if confirmDelete}
-      <span class="danger-text">Delete “{confirmDelete.name}” from Drive and every device?</span>
+      <span class="danger-text">
+        Delete {confirmDelete.length === 1 ? `“${confirmDelete[0].name}”` : `${confirmDelete.length} memes`} from Drive and every device?
+      </span>
       <span class="spacer"></span>
       <button class="btn ghost sm" onclick={() => (confirmDelete = null)}>Cancel <kbd>Esc</kbd></button>
       <button class="btn destructive sm" onclick={() => confirmDelete && doDelete(confirmDelete)} disabled={busy}>
@@ -2079,6 +2247,10 @@
       <span class="status marked-count">{marked.size} selected</span>
       <span class="spacer"></span>
       <button class="action" onclick={() => { marked.clear(); markAnchor = null; }}>Clear <kbd>Esc</kbd></button>
+      <span class="divider"></span>
+      <button class="action danger-action" onclick={() => askDelete([...marked.values()])}>
+        Delete {marked.size} <kbd>{MOD}</kbd><kbd>⌫</kbd>
+      </button>
       <span class="divider"></span>
       <button class="action primary-action" onclick={() => openPicker()}>
         <svg class="icon action-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2243,6 +2415,28 @@
         {/each}
       </div>
     {/if}
+  </div>
+{/if}
+
+{#if showKeys}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="keys-backdrop" onclick={() => (showKeys = false)}>
+    <div class="menu keys-sheet" role="dialog" aria-label="Keyboard shortcuts" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="keys-head">
+        <span>Keyboard shortcuts</span>
+        <span class="keys">Esc to close</span>
+      </div>
+      <div class="keys-cols">
+        {#each keySections as section (section.title)}
+          <section>
+            <p class="picker-title">{section.title}</p>
+            {#each section.rows as [keys, what] (keys)}
+              <div class="keys-row"><span>{what}</span><span class="keys">{keys}</span></div>
+            {/each}
+          </section>
+        {/each}
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -3070,6 +3264,11 @@
     color: var(--fg);
   }
 
+  .action.danger-action,
+  .action.danger-action:hover {
+    color: var(--destructive);
+  }
+
   .action-icon {
     width: 14px;
     height: 14px;
@@ -3395,6 +3594,54 @@
   .marked-count {
     color: var(--fg);
     font-weight: 500;
+  }
+
+  /* ---------- keyboard shortcuts sheet ---------- */
+
+  .keys-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.35);
+  }
+
+  .menu.keys-sheet {
+    position: static;
+    width: min(640px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    padding: 10px 12px 12px;
+  }
+
+  .keys-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin: 2px 6px 8px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .keys-cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 4px 16px;
+  }
+
+  .keys-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 26px;
+    padding: 0 6px;
+    font-size: 12.5px;
+  }
+
+  .keys-row .keys {
+    flex-shrink: 0;
   }
 
   /* ---------- tag picker ---------- */
