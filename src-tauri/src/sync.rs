@@ -2044,8 +2044,8 @@ mod tests {
         assert_eq!(merged.ocr.unwrap().text, "ocr v2", "and this device's text is kept");
 
         // The merged copy goes up on the next pass, once it has settled.
-        let settled = SystemTime::now() - SETTLE - Duration::from_secs(1);
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(settled).unwrap();
+        let merged_bytes = std::fs::read(&path).unwrap();
+        write_settled(&path, &merged_bytes);
         let r = cycle(&g, "root", &root, &data).await;
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         let on_drive: sidecar::Sidecar = serde_json::from_slice(&g.get(&id).bytes).unwrap();
