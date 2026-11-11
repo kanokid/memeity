@@ -476,10 +476,13 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
                     // Both sides already have the same bytes.
                     st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
                     false
-                } else if (local.is_some() && local == s.md5) || backed_up(&local) {
-                    true // only Drive changed (or ours is on Drive anyway): take its copy
+                } else if (local.is_some() && local == s.md5) || (!is_sidecar && backed_up(&local)) {
+                    // Only Drive changed (or ours is on Drive anyway): take its copy. Not for
+                    // sidecars: two can have the same bytes, and this meme's edits would be lost.
+                    true
                 } else if is_sidecar {
-                    match merge_sidecar(g, item, &path).await {
+                    let base = s.md5.as_deref().and_then(|m| load_base(data_dir, m));
+                    match merge_sidecar(g, item, &path, base.as_ref(), data_dir).await {
                         Ok(true) => {
                             // Kept text the user typed here; it uploads once settled.
                             st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
@@ -511,7 +514,7 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
             } else if is_sidecar {
                 // Two devices wrote the same sidecar: take Drive's, no "(this device)" copy,
                 // but keep what the user did here (e.g. tagged it before Drive's arrived).
-                match merge_sidecar(g, item, &path).await {
+                match merge_sidecar(g, item, &path, None, data_dir).await {
                     Ok(true) => {
                         st.files.insert(rel.clone(), Synced { id: item.id.clone(), md5: item.md5_checksum.clone() });
                         report.retry_soon = true;
@@ -665,48 +668,39 @@ async fn cycle<D: Drive>(g: &D, folder_id: &str, root: &Path, data_dir: &Path) -
         st.page_token = fresh_token;
     }
     st.last_scan = Some(started);
+    remember_bases(root, data_dir, &st).await;
     if let Err(e) = st.save(data_dir) {
         report.errors.push(e);
     }
     report
 }
 
-/// A sidecar changed on Drive *and* here. Drive's copy wins, except for what the user
-/// did on this device: text they typed is kept (unless it was also retyped elsewhere),
-/// a pin is kept, and tags added here are added to Drive's. Returns true if the merged sidecar was written locally (and still
-/// needs uploading), false if Drive's copy should simply be downloaded.
-async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result<bool, String> {
+/// A sidecar changed on Drive *and* here. Merges the two against `base`, the copy both
+/// started from (the last one synced), so a change on either side survives: tags added
+/// *or removed* here, a pin or unpin, retyped text. Drive's copy wins where both sides
+/// changed the same thing, except that text the user typed beats text OCR read.
+/// Without a base (first sync, or older sync state), nothing here can count as a
+/// removal: tags and pins from both sides are kept.
+/// Returns true if the merged sidecar was written locally (and still needs uploading),
+/// false if Drive's copy should simply be downloaded.
+async fn merge_sidecar<D: Drive>(
+    g: &D,
+    item: &DriveItem,
+    path: &Path,
+    base: Option<&sidecar::Sidecar>,
+    data_dir: &Path,
+) -> Result<bool, String> {
     let local: Option<sidecar::Sidecar> =
         tokio::fs::read(path).await.ok().and_then(|b| serde_json::from_slice(&b).ok());
     let Some(local) = local else { return Ok(false) };
-    let typed = local.ocr.filter(|o| o.edited);
-    if typed.is_none() && !local.pinned && local.tags.is_empty() {
-        return Ok(false); // nothing of ours to keep
-    }
     let bytes = g.download(&item.id).await?;
-    let Ok(mut merged) = serde_json::from_slice::<sidecar::Sidecar>(&bytes) else {
+    let Ok(drive) = serde_json::from_slice::<sidecar::Sidecar>(&bytes) else {
         return Ok(false); // Drive's copy is unreadable; downloading it as-is changes nothing
     };
-    let mut kept = false;
-    // Retyped on another device too: the newest edit (Drive's) wins.
-    if let Some(typed) = typed
-        && !merged.ocr.as_ref().is_some_and(|o| o.edited)
-    {
-        merged.ocr = Some(typed);
-        kept = true;
-    }
-    if local.pinned && !merged.pinned {
-        merged.pinned = true;
-        kept = true;
-    }
-    for tag in local.tags {
-        if !merged.tags.contains(&tag) {
-            merged.tags.push(tag);
-            kept = true;
-        }
-    }
-    if !kept {
-        return Ok(false);
+    let Some(merged) = merge_sidecars(&local, &drive, base) else { return Ok(false) };
+    // Drive's copy is what the merged one will next be compared against.
+    if let Some(md5) = &item.md5_checksum {
+        save_base(data_dir, md5, &bytes);
     }
     let json = serde_json::to_vec_pretty(&merged).map_err(|e| e.to_string())?;
     let path = path.to_path_buf();
@@ -719,6 +713,95 @@ async fn merge_sidecar<D: Drive>(g: &D, item: &DriveItem, path: &Path) -> Result
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// Three-way merge of one meme's sidecar (see `merge_sidecar`). None if the result is
+/// just Drive's copy.
+fn merge_sidecars(
+    local: &sidecar::Sidecar,
+    drive: &sidecar::Sidecar,
+    base: Option<&sidecar::Sidecar>,
+) -> Option<sidecar::Sidecar> {
+    let mut merged = drive.clone();
+
+    let typed = |sc: &sidecar::Sidecar| sc.ocr.as_ref().is_some_and(|o| o.edited);
+    let ocr_here = base.is_none_or(|b| b.ocr != local.ocr);
+    let ocr_there = base.is_none_or(|b| b.ocr != drive.ocr);
+    if ocr_here && (!ocr_there || (typed(local) && !typed(drive))) {
+        merged.ocr = local.ocr.clone();
+    }
+
+    match base {
+        Some(b) if b.pinned != local.pinned => merged.pinned = local.pinned,
+        Some(_) => {}
+        None => merged.pinned |= local.pinned,
+    }
+
+    let added_here = |t: &String| base.is_none_or(|b| !b.tags.contains(t));
+    let removed_here = |t: &String| base.is_some_and(|b| b.tags.contains(t)) && !local.tags.contains(t);
+    merged.tags.retain(|t| !removed_here(t));
+    for t in local.tags.iter().filter(|t| added_here(t)) {
+        if !merged.tags.contains(t) {
+            merged.tags.push(t.clone());
+        }
+    }
+
+    (merged != *drive).then_some(merged)
+}
+
+// ---------- sidecars as last synced ----------
+//
+// A copy of each sidecar as it was last synced, so a conflict can tell what changed on
+// which side. Kept per device in the app-data dir, named by the copy's md5.
+
+const BASE_DIR: &str = "sidecar-base";
+
+fn base_path(data_dir: &Path, md5: &str) -> PathBuf {
+    data_dir.join(BASE_DIR).join(format!("{md5}.json"))
+}
+
+fn load_base(data_dir: &Path, md5: &str) -> Option<sidecar::Sidecar> {
+    serde_json::from_slice(&std::fs::read(base_path(data_dir, md5)).ok()?).ok()
+}
+
+fn save_base(data_dir: &Path, md5: &str, bytes: &[u8]) {
+    let path = base_path(data_dir, md5);
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(data_dir.join(BASE_DIR)).and_then(|_| crate::config::write_atomic(&path, bytes));
+    }
+}
+
+/// After a pass: keeps a copy of every sidecar that matches what Drive has, and forgets
+/// copies nothing refers to anymore. Only files without a copy yet are read.
+async fn remember_bases(root: &Path, data_dir: &Path, st: &SyncState) {
+    let wanted: Vec<(String, String)> = st
+        .files
+        .iter()
+        .filter(|(rel, _)| sidecar::is_sidecar_rel(rel))
+        .filter_map(|(rel, s)| Some((rel.clone(), s.md5.clone()?)))
+        .collect();
+    let (root, data_dir) = (root.to_path_buf(), data_dir.to_path_buf());
+    let _ = tokio::task::spawn_blocking(move || {
+        let keep: HashSet<String> = wanted.iter().map(|(_, md5)| format!("{md5}.json")).collect();
+        for (rel, md5) in &wanted {
+            if base_path(&data_dir, md5).exists() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(rel_path(&root, rel))
+                && format!("{:x}", Md5::digest(&bytes)) == *md5
+            {
+                save_base(&data_dir, md5, &bytes);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(data_dir.join(BASE_DIR)) {
+            for entry in entries.flatten() {
+                if !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    })
+    .await;
 }
 
 /// Sends a file to the Recycle Bin / Trash (tests delete it outright, so they don't
@@ -1908,5 +1991,99 @@ mod tests {
         assert!(local.pinned, "the pin is kept");
         assert_eq!(local.ocr.unwrap().text, "ocr v2", "and the other device's text is taken");
         cleanup(&root);
+    }
+
+    fn tagged(text: &str, tags: &[&str]) -> Vec<u8> {
+        let sc = sidecar::Sidecar {
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ocr: Some(sidecar::Ocr { text: text.into(), engine: "test".into(), lang: None, at: None, edited: false }),
+            ..Default::default()
+        };
+        serde_json::to_vec_pretty(&sc).unwrap()
+    }
+
+    fn read_sidecar(path: &Path) -> sidecar::Sidecar {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tag_removed_here_stays_removed_when_drive_also_changed() {
+        let (root, data) = dirs("untag-here");
+        let g = FakeDrive::default();
+        let meta = g.create_folder("root", META_DIR).await.unwrap();
+        let id = g.add(&meta, "abc.json", &tagged("ocr v1", &["cat", "dog"]));
+        cycle(&g, "root", &root, &data).await;
+
+        // "dog" taken off here; meanwhile another device tagged it "frog".
+        let path = root.join(META_DIR).join("abc.json");
+        write_settled(&path, &tagged("ocr v1", &["cat"]));
+        g.set_bytes(&id, &tagged("ocr v1", &["cat", "dog", "frog"]));
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_sidecar(&path).tags, ["cat", "frog"]);
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn tag_removed_elsewhere_stays_removed_when_this_device_also_changed() {
+        let (root, data) = dirs("untag-there");
+        let g = FakeDrive::default();
+        let meta = g.create_folder("root", META_DIR).await.unwrap();
+        let id = g.add(&meta, "abc.json", &tagged("ocr v1", &["cat", "dog"]));
+        cycle(&g, "root", &root, &data).await;
+
+        // OCR re-read the text here; another device took "dog" off.
+        let path = root.join(META_DIR).join("abc.json");
+        write_settled(&path, &tagged("ocr v2", &["cat", "dog"]));
+        g.set_bytes(&id, &tagged("ocr v1", &["cat"]));
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let merged = read_sidecar(&path);
+        assert_eq!(merged.tags, ["cat"], "the removal isn't undone");
+        assert_eq!(merged.ocr.unwrap().text, "ocr v2", "and this device's text is kept");
+
+        // The merged copy goes up on the next pass, once it has settled.
+        let settled = SystemTime::now() - SETTLE - Duration::from_secs(1);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(settled).unwrap();
+        let r = cycle(&g, "root", &root, &data).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let on_drive: sidecar::Sidecar = serde_json::from_slice(&g.get(&id).bytes).unwrap();
+        assert_eq!((on_drive.tags, on_drive.ocr.unwrap().text), (vec!["cat".to_string()], "ocr v2".to_string()));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn unpin_survives_a_sidecar_changed_on_both_devices() {
+        let (root, data) = dirs("unpin-merge");
+        let g = FakeDrive::default();
+        let meta = g.create_folder("root", META_DIR).await.unwrap();
+        let mut pinned: sidecar::Sidecar = serde_json::from_slice(&tagged("ocr v1", &[])).unwrap();
+        pinned.pinned = true;
+        let id = g.add(&meta, "abc.json", &serde_json::to_vec_pretty(&pinned).unwrap());
+        cycle(&g, "root", &root, &data).await;
+
+        let path = root.join(META_DIR).join("abc.json");
+        let mut here = pinned.clone();
+        here.pinned = false;
+        write_settled(&path, &serde_json::to_vec_pretty(&here).unwrap());
+        let mut there = pinned.clone();
+        there.tags.push("cat".into());
+        g.set_bytes(&id, &serde_json::to_vec_pretty(&there).unwrap());
+        let r = cycle(&g, "root", &root, &data).await;
+
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let merged = read_sidecar(&path);
+        assert!(!merged.pinned, "unpinned here stays unpinned");
+        assert_eq!(merged.tags, ["cat"]);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn without_a_base_both_sides_tags_are_kept() {
+        let local: sidecar::Sidecar = serde_json::from_slice(&tagged("x", &["a"])).unwrap();
+        let drive: sidecar::Sidecar = serde_json::from_slice(&tagged("x", &["b"])).unwrap();
+        assert_eq!(merge_sidecars(&local, &drive, None).unwrap().tags, ["b", "a"]);
+        assert!(merge_sidecars(&drive, &drive, None).is_none(), "nothing new: take Drive's");
     }
 }

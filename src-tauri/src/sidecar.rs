@@ -24,7 +24,7 @@ pub const VERSION: u32 = 1;
 /// Scratch space for atomic writes. Dot-prefixed, so it's never indexed or synced.
 const TMP_DIR: &str = ".memeity-tmp";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sidecar {
     #[serde(default = "current_version")]
     pub version: u32,
@@ -42,7 +42,7 @@ pub struct Sidecar {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ocr {
     pub text: String,
     pub engine: String,

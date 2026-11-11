@@ -134,6 +134,9 @@ fn run(
     // 2. Work out what needs (re)indexing. Library order is newest first.
     let mut pending = Vec::new();
     let mut changed = false;
+    // Some meme's tags may have changed (e.g. a sidecar from another device): the tag
+    // list's counts need refreshing too.
+    let mut tags_touched = false;
     for (rel, path) in memes {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         let (size, mtime) = (meta.len() as i64, meta.modified().map(millis).unwrap_or(0));
@@ -170,6 +173,8 @@ fn run(
         if let Some(sc) = &sc {
             // Pinned/unpinned or tagged on any device.
             with_index(app, |idx| idx.set_pinned(&md5, sc.pinned).and_then(|_| idx.set_meme_tags(&md5, &sc.tags)))?;
+            changed = true;
+            tags_touched = true;
         }
         match sc {
             Some(sc) if sc.ocr.is_some() => {
@@ -197,6 +202,9 @@ fn run(
     }
     if changed {
         let _ = app.emit("library-changed", ());
+    }
+    if tags_touched {
+        let _ = app.emit("tags-changed", ());
     }
 
     if let Some(when) = wait_until {

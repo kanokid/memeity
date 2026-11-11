@@ -394,7 +394,11 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     }
     if version < 3 {
         add_column("phash", "INTEGER")?; // perceptual hash, for the duplicate finder
-        conn.execute_batch("PRAGMA user_version = 3")?;
+    }
+    if version < 4 {
+        // Tags and pins are mirrored from sidecars, but only when a sidecar changes. Ones
+        // read before tags/pins existed (1.0.x) were never read for them: read all again.
+        conn.execute_batch("UPDATE memes SET sidecar_mtime = NULL; PRAGMA user_version = 4")?;
     }
     Ok(())
 }
@@ -460,6 +464,26 @@ mod tests {
         init(&conn).unwrap();
         assert!(conn.prepare("SELECT engine FROM memes").is_ok());
         init(&conn).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn sidecars_read_before_tags_existed_are_read_again() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO memes (rel, size, mtime, md5, indexed, sidecar_mtime, engine) VALUES ('a.png', 1, 1, 'aaa', 1, 5, 'x');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        let idx = Index { conn };
+        let e = idx.lookup("a.png").unwrap().unwrap();
+        assert!(e.indexed && e.sidecar_mtime.is_none(), "text stays, sidecar is re-read");
+
+        // Only once: later opens keep what's been read since.
+        idx.conn.execute_batch("UPDATE memes SET sidecar_mtime = 7").unwrap();
+        init(&idx.conn).unwrap();
+        assert_eq!(idx.lookup("a.png").unwrap().unwrap().sidecar_mtime, Some(7));
     }
 
     #[test]
