@@ -1,116 +1,44 @@
-# Builds installers for Windows and macOS (Apple Silicon + Intel) when a version tag
-# like v0.1.0 is pushed, and attaches them to a DRAFT GitHub Release. Review the draft,
-# then publish it: only published releases are offered by the in-app updater.
-#
-# Required repository secrets (Settings > Secrets and variables > Actions):
-#   MEMEITY_GOOGLE_CLIENT_ID / MEMEITY_GOOGLE_CLIENT_SECRET   built-in Google sign-in
-#   TAURI_SIGNING_PRIVATE_KEY                                  signs updates (~/.tauri/memeity-updater.key)
-#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD             Developer ID Application cert (.p12, base64)
-#   APPLE_SIGNING_IDENTITY                                     e.g. "Developer ID Application: Name (TEAMID)"
-#   APPLE_API_KEY / APPLE_API_ISSUER / APPLE_API_PRIVATE_KEY   notarization: App Store Connect API key ID,
-#                                                              issuer ID, and the AuthKey_<ID>.p8 contents
-# See RELEASING.md.
-name: Release
+
+name: Build & Release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 permissions:
-  contents: write # create the release and upload assets
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # Type-check, lint and test first (ci.yml): a release is only built if they pass.
+
+  # ----------------------------------------
+  # 1. CI: Type-check, lint and test
+  # ----------------------------------------
   ci:
-    uses: ./.github/workflows/ci.yml
+    runs-on: ubuntu-24.04
 
-  # One draft release up front, which every build uploads into. (If each build created
-  # its own, parallel builds race and you get duplicate drafts.)
-  create-release:
-    needs: ci
-    runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.create.outputs.result }}
-    steps:
-      - id: create
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const tag = context.ref.replace("refs/tags/", "");
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: tag,
-              name: `memeity ${tag}`,
-              draft: true,
-              prerelease: false,
-              body: [
-                "Download the installer for your computer below.",
-                "",
-                "- **Windows:** `memeity_*_x64-setup.exe`",
-                "- **Windows on ARM** (e.g. Snapdragon laptops): `memeity_*_arm64-setup.exe`",
-                "- **Mac (Apple Silicon):** `memeity_*_aarch64.dmg`",
-                "- **Mac (Intel):** `memeity_*_x64.dmg` (no text recognition: search by name, plus text read on your other devices)",
-                "",
-                "The Mac builds are signed and notarized by Apple. The Windows builds aren't code-signed, so Windows may show \"Windows protected your PC\": click **More info → Run anyway**.",
-              ].join("\n"),
-            });
-            return data.id;
-
-  build:
-    needs: create-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows-latest
-            args: ""
-          # Windows on ARM (Snapdragon laptops etc.), built natively on an ARM runner.
-          # ONNX Runtime ships prebuilt ARM64 Windows binaries, so text recognition stays in.
-          - platform: windows-11-arm
-            args: ""
-          - platform: macos-latest
-            args: --target aarch64-apple-darwin
-          # Intel Macs: ONNX Runtime has no prebuilt binaries for them, so this build
-          # leaves out text recognition (the `ocr` feature). See src-tauri/src/ocr.rs.
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin -- --no-default-features
-    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check required secrets
-        shell: bash
-        env:
-          CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
-          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+      - name: Install Linux dependencies
         run: |
-          names="CLIENT_ID CLIENT_SECRET SIGNING_KEY"
-          # Mac builds are signed and notarized: never ship an unsigned one by accident.
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            names="$names APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_PRIVATE_KEY"
-          fi
-          missing=0
-          for name in $names; do
-            if [ -z "${!name}" ]; then echo "::error::Missing secret for $name (see RELEASING.md)"; missing=1; fi
-          done
-          exit $missing
-
-      - name: Check the tag matches the app version
-        shell: bash
-        run: |
-          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match tauri.conf.json version $version"
-            exit 1
-          fi
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            wget
 
       - uses: actions/setup-node@v5
         with:
@@ -119,71 +47,245 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-          key: ${{ matrix.args }}
 
       - run: npm ci
 
-      # Tauri's notarization reads the App Store Connect API key from a file.
-      - name: Write the notarization API key
-        if: runner.os == 'macOS'
+      - name: Type-check frontend
+        run: npm run check
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        working-directory: src-tauri
+        run: cargo test
+
+  # ----------------------------------------
+  # 2. Create draft GitHub release
+  # ----------------------------------------
+  create-release:
+    needs: ci
+    runs-on: ubuntu-24.04
+
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check version
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag does not match app version"
+            exit 1
+          fi
+
+      - id: create
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `memeity ${tag}`,
+              draft: true,
+              prerelease: false,
+              body: [
+                "## Linux Downloads",
+                "",
+                "| Format | Package |",
+                "|---|---|",
+                "| AppImage | Portable Linux application |",
+                "| Debian | .deb |",
+                "| Fedora | .rpm |",
+                "| Arch Linux | .pkg.tar.zst |",
+                "",
+                "Linux builds only. No Windows or macOS releases.",
+                "",
+                "These builds are not OS-code-signed."
+              ].join("\n")
+            });
+
+            return data.id;
+
+  # ----------------------------------------
+  # 3. Build Linux packages
+  # ----------------------------------------
+  build-linux:
+    needs: create-release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            jq \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm \
+            wget
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Check required secrets
         shell: bash
         env:
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          key_path="$RUNNER_TEMP/AuthKey.p8"
-          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$key_path"
-          chmod 600 "$key_path"
-          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+          for name in CLIENT_ID CLIENT_SECRET SIGNING_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing secret: $name"
+              exit 1
+            fi
+          done
 
-      # v1+: v0 silently ignores uploadUpdaterSignatures (below).
-      - uses: tauri-apps/tauri-action@v1
+      # Build AppImage, DEB and RPM.
+      - name: Build Linux packages
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
           MEMEITY_GOOGLE_CLIENT_ID: ${{ secrets.MEMEITY_GOOGLE_CLIENT_ID }}
           MEMEITY_GOOGLE_CLIENT_SECRET: ${{ secrets.MEMEITY_GOOGLE_CLIENT_SECRET }}
+
+          # Tauri updater signatures only, not OS code signing.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS: Tauri imports the certificate into a temporary keychain, signs with the
-          # hardened runtime, then notarizes and staples. Unset on Windows (ignored there).
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          # APPLE_API_KEY_PATH comes from the step above.
-        with:
-          # Upload into the draft made by `create-release` (also merges each platform
-          # into one latest.json for the updater).
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          # The updater reads signatures from latest.json; separate .sig files would just
-          # clutter the release's download list.
-          uploadUpdaterSignatures: false
-          # Windows ships only the setup.exe (no MSI): point updates at it.
-          updaterJsonPreferNsis: true
-          args: ${{ matrix.args }}
 
-      # Tauri notarizes the .app inside the DMG but not the DMG itself, which Gatekeeper
-      # then rejects as "Unnotarized Developer ID". Notarize + staple it and re-upload.
-      - name: Notarize the DMG
-        if: runner.os == 'macOS'
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          uploadUpdaterSignatures: false
+          args: "--bundles appimage,deb,rpm"
+
+      # ----------------------------------------
+      # 4. Build Arch Linux package
+      # ----------------------------------------
+      - name: Build application binary
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+
+      - name: Prepare Arch package
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           set -euo pipefail
-          for dmg in src-tauri/target/*/release/bundle/dmg/*.dmg; do
-            xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" \
-              --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait --timeout 30m \
-              | tee notary.log
-            grep -q "status: Accepted" notary.log
-            xcrun stapler staple "$dmg"
-            spctl -a -t open --context context:primary-signature -v "$dmg"
-            gh release upload "$GITHUB_REF_NAME" "$dmg" --clobber
-          done
+
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+
+          BIN_NAME=$(cargo metadata \
+            --manifest-path src-tauri/Cargo.toml \
+            --no-deps \
+            --format-version 1 |
+            jq -r '.packages[] |
+              select(.manifest_path | endswith("/src-tauri/Cargo.toml")) |
+              .targets[] |
+              select(.kind | index("bin")) |
+              .name' | head -n 1)
+
+          if [ -z "$BIN_NAME" ]; then
+            echo "::error::Could not find application binary"
+            exit 1
+          fi
+
+          mkdir -p dist/arch
+
+          cp "src-tauri/target/release/$BIN_NAME" dist/arch/memeity
+
+          cat > dist/arch/PKGBUILD <<EOF
+          pkgname=memeity
+          pkgver=$VERSION
+          pkgrel=1
+          pkgdesc="Memeity desktop application"
+          arch=('x86_64')
+          url="https://github.com/purestellenium/memeity"
+          license=('custom')
+          depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3')
+          source=('memeity')
+          sha256sums=('SKIP')
+
+          package() {
+            install -Dm755 "\$srcdir/memeity" "\$pkgdir/usr/bin/memeity"
+
+            install -Dm644 /dev/stdin "\$pkgdir/usr/share/applications/memeity.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Name=Memeity
+          Comment=Memeity desktop application
+          Exec=memeity
+          Terminal=false
+          Type=Application
+          Categories=Utility;
+          DESKTOP
+          }
+          EOF
+
+      - name: Build .pkg.tar.zst
+        run: |
+          docker run --rm \
+            -v "$PWD/dist/arch:/build" \
+            archlinux:latest \
+            bash -c '
+              set -e
+              pacman -Syu --noconfirm
+              pacman -S --needed --noconfirm base-devel
+
+              useradd -m builder
+              chown -R builder:builder /build
+
+              su builder -c "cd /build && makepkg --cleanbuild --nodeps --noconfirm"
+            '
+
+      - name: Upload Arch package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/arch/*.pkg.tar.zst \
+            --clobber
+
+      # ----------------------------------------
+      # 5. Release summary
+      # ----------------------------------------
+      - name: List release packages
+        run: |
+          echo "## Linux release packages" >> "$GITHUB_STEP_SUMMARY"
+
+          find src-tauri/target/release/bundle dist/arch \
+            -type f \
+            \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \) \
+            -printf '- %f\n' >> "$GITHUB_STEP_SUMMARY"
